@@ -1,0 +1,162 @@
+name: Code Quality
+
+on:
+  pull_request:
+    branches: ["main", "mainline", "release", "patch_*"]
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: ["main", "mainline"]
+  workflow_call:
+    inputs:
+      branch:
+        required: false
+        type: string
+      tag:
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  Readiness:
+    name: Python project readiness
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      ready: ${{ steps.project.outputs.ready }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || inputs.branch || github.sha }}
+          persist-credentials: false
+
+      - name: Check shared Python build prerequisites
+        id: project
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import tomllib
+
+          def nonempty_string(value):
+              return isinstance(value, str) and bool(value.strip())
+
+          missing = []
+          manifest = Path("pyproject.toml")
+          config = (
+              tomllib.loads(manifest.read_text(encoding="utf-8"))
+              if manifest.is_file()
+              else {}
+          )
+          if not nonempty_string(config.get("project", {}).get("name")):
+              missing.append("pyproject.toml with project.name")
+          if not nonempty_string(config.get("build-system", {}).get("build-backend")):
+              missing.append("pyproject.toml with build-system.build-backend")
+          source_present = any(path.is_file() for path in Path("src").rglob("*.py"))
+          if not source_present:
+              missing.append("Python product source under src/")
+          if not any(
+              path.is_file()
+              for directory in ("test", "tests")
+              for pattern in ("test_*.py", "*_test.py")
+              for path in Path(directory).rglob(pattern)
+          ):
+              missing.append("Python tests under test/ or tests/")
+
+          # Hatch uses hatch.toml when present; otherwise its configuration is
+          # read from [tool.hatch] in pyproject.toml.
+          hatch_file = Path("hatch.toml")
+          hatch = (
+              tomllib.loads(hatch_file.read_text(encoding="utf-8"))
+              if hatch_file.is_file()
+              else config.get("tool", {}).get("hatch", {})
+          )
+          scripts = hatch.get("envs", {}).get("default", {}).get("scripts", {})
+          for command in ("lint", "test"):
+              value = scripts.get(command)
+              if not (
+                  nonempty_string(value)
+                  or (
+                      isinstance(value, list)
+                      and bool(value)
+                      and all(nonempty_string(item) for item in value)
+                  )
+              ):
+                  missing.append(f"Hatch default environment script: {command}")
+
+          ready = not missing
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"ready={str(ready).lower()}\n")
+          message = (
+              "Python project is ready for the shared lint, build, and test jobs."
+              if ready
+              else (
+                  "Python CI prerequisites are incomplete. Missing: "
+                  if source_present
+                  else "Python lint, build, and tests are skipped. Missing: "
+              )
+              + "; ".join(missing)
+              + ". No product tests have run."
+          )
+          print(message)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(message + "\n")
+          if source_present and missing:
+              raise SystemExit(1)
+          PY
+
+  Test:
+    name: Python
+    needs: Readiness
+    if: >-
+      needs.Readiness.outputs.ready == 'true' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.draft != true)
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    uses: aws-deadline/.github/.github/workflows/reusable_python_build.yml@mainline
+    with:
+      os: ${{ matrix.os }}
+      python-version: ${{ matrix.python-version }}
+      ref: ${{ inputs.tag || inputs.branch || github.sha }}
+
+  Check:
+    name: Python CI
+    needs: [Readiness, Test]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    env:
+      PROJECT_READY: ${{ needs.Readiness.outputs.ready }}
+      READINESS_RESULT: ${{ needs.Readiness.result }}
+      TEST_RESULT: ${{ needs.Test.result }}
+    steps:
+      - name: Require successful Python CI
+        shell: bash
+        run: |
+          if [[ "$READINESS_RESULT" != "success" ]]; then
+            echo "::error::Python project readiness did not succeed."
+            exit 1
+          fi
+          if [[ "$PROJECT_READY" == "true" ]]; then
+            if [[ "$TEST_RESULT" != "success" ]]; then
+              echo "::error::The required Python lint, build, and test matrix did not succeed."
+              exit 1
+            fi
+            echo "Python lint, build, and tests passed across the required matrix."
+          elif [[ "$PROJECT_READY" == "false" ]]; then
+            echo "Python CI infrastructure is ready. No product tests have run: no Python source under src/."
+          else
+            echo "::error::Python project readiness returned an invalid result."
+            exit 1
+          fi

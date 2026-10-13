@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://hackerone.com/aws_vdp
+    about: Report security concerns privately to the AWS Vulnerability Disclosure Program.

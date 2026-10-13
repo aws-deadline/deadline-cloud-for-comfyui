@@ -1,0 +1,16 @@
+name: Maintenance
+description: Propose dependency, tooling, or repository maintenance.
+title: "Maintenance: "
+body:
+  - type: textarea
+    id: change
+    attributes:
+      label: Proposed maintenance
+      description: Explain the change, its reason, and the affected files or tools.
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation and compatibility
+      description: Describe how the change can be checked and any compatibility concerns.

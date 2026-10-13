@@ -1,0 +1,32 @@
+name: Claude PR Review
+
+on: # zizmor: ignore[dangerous-triggers] -- The default-branch workflow reads PR content without executing it and validates trusted run metadata.
+  workflow_run:
+    workflows: ["Claude PR Review (collect)"]
+    types:
+      - completed
+
+concurrency:
+  group: claude-pr-review-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  review:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request' }}
+    uses: aws-deadline/.github/.github/workflows/reusable_claude_pr_review.yml@mainline
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    with:
+      head_repository: ${{ github.event.workflow_run.head_repository.full_name }}
+      head_sha: ${{ github.event.workflow_run.head_sha }}
+    secrets:
+      bedrock_role_arn: ${{ secrets.AWS_CLAUDE_PR_REVIEW_ROLE }}

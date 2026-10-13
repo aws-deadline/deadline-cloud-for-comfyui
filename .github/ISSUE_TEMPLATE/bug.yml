@@ -1,0 +1,39 @@
+name: Bug report
+description: Report a reproducible integration or repository problem.
+title: "Bug: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Report suspected vulnerabilities privately through the AWS disclosure
+        channels in [SECURITY.md](https://github.com/aws-deadline/deadline-cloud-for-comfyui/blob/main/SECURITY.md).
+        Remove credentials and sensitive customer data
+        from logs and examples before sharing them.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest reproducible example.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        Include the repository revision, OS, and relevant ComfyUI, Python,
+        custom-node, or Deadline Cloud versions. Include fleet OS and GPU
+        details if they affect the problem.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs or examples
+      description: Include only the excerpts needed to explain the problem.
+      render: text

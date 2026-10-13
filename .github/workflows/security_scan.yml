@@ -1,0 +1,24 @@
+name: "Security Scan"
+
+on:
+  push:
+    branches: ["main", "feature_*", "patch_*"]
+  pull_request:
+    branches: ["main", "feature_*", "patch_*"]
+  schedule:
+    - cron: "0 8 * * MON"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  Scan:
+    name: Scan
+    uses: aws-deadline/.github/.github/workflows/reusable_security_scan.yml@mainline
+    permissions:
+      # The shared scan reports to logs and annotations and only reads contents.
+      contents: read

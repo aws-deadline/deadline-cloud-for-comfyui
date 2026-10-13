@@ -1,0 +1,18 @@
+name: Documentation
+description: Report missing, incorrect, or unclear documentation.
+title: "Docs: "
+body:
+  - type: input
+    id: location
+    attributes:
+      label: Documentation location
+      description: Link the page or name the file.
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and suggested clarification
+      description: Explain what was confusing or incorrect.
+    validations:
+      required: true

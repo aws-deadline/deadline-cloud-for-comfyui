@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose an improvement to the ComfyUI integration.
+title: "Feature: "
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: User need
+      description: Describe the workflow or problem this feature would support.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain the expected behavior and any alternatives considered.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Relevant context
+      description: Include compatibility or deployment constraints without sensitive data.

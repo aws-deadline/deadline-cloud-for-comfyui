@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+
+.DS_Store
+.aws/
+.env
+.env.*
+!.env.example
+!.env.sample

@@ -1,0 +1,32 @@
+version: 2
+updates:
+  # Python dependency updates start when root dependency manifests are added.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    commit-message:
+      prefix: "chore(deps):"
+    groups:
+      pip-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    # Let new versions age before adoption. Security updates remain immediate.
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(deps):"
+    groups:
+      github-actions-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"

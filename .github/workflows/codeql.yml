@@ -1,0 +1,78 @@
+name: CodeQL
+
+on:
+  push:
+    branches: ["main", "mainline"]
+  pull_request:
+    branches: ["main", "mainline"]
+  schedule:
+    - cron: "0 8 * * MON"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  Readiness:
+    name: Python source readiness
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      ready: ${{ steps.source.outputs.ready }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check for Python product source
+        id: source
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          ready = any(path.is_file() for path in Path("src").rglob("*.py"))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"ready={str(ready).lower()}\n")
+          message = (
+              "Python source is ready for CodeQL analysis."
+              if ready
+              else "CodeQL analysis is skipped: no Python product source under src/. "
+              "No product code has been scanned."
+          )
+          print(message)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(message + "\n")
+          PY
+
+  Analysis:
+    name: Analysis
+    needs: Readiness
+    if: needs.Readiness.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      # Private repositories require workflow metadata and checkout access.
+      actions: read
+      contents: read
+      security-events: write
+    # Match the shared workflow's analysis while retaining private-repo reads.
+    # Its job-level permissions currently clear these read permissions.
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          queries: +security-and-quality
+          languages: python
+          build-mode: none
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
