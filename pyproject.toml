@@ -1,0 +1,105 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "deadline-cloud-for-comfyui"
+dynamic = ["version"]
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+description = "AWS Deadline Cloud for ComfyUI"
+authors = [
+  {name = "Amazon Web Services"},
+]
+# https://pypi.org/classifiers/
+classifiers = [
+  "Development Status :: 1 - Planning",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: MacOS",
+  "License :: OSI Approved :: Apache Software License",
+  "Intended Audience :: Developers",
+  "Intended Audience :: End Users/Desktop",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/aws-deadline/deadline-cloud-for-comfyui"
+Source = "https://github.com/aws-deadline/deadline-cloud-for-comfyui"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+version_scheme = "post-release"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/*",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = [
+  "src/deadline",
+]
+
+[tool.mypy]
+check_untyped_defs = true
+show_error_codes = true
+pretty = true
+files = ["src/**/*.py"]
+ignore_missing_imports = true
+# Tell mypy that there's a namespace package src/deadline
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = "src"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+  "deadline",
+]
+
+[tool.black]
+line-length = 100
+
+[tool.pytest.ini_options]
+xfail_strict = true
+addopts = [
+  "--durations=5",
+  "--color=yes",
+  "--cov=src/deadline/comfyui_submitter",
+  "--cov-report=html:build/coverage",
+  "--cov-report=xml:build/coverage/coverage.xml",
+  "--cov-report=term-missing",
+]
+testpaths = ["test"]
+
+[tool.coverage.run]
+source_pkgs = ["deadline.comfyui_submitter"]
+branch = true
+parallel = true
+omit = [
+  "**/__main__.py",
+  "**/_version.py",
+]
+
+[tool.coverage.paths]
+source = [
+  "src/",
+]
+
+[tool.coverage.report]
+show_missing = true

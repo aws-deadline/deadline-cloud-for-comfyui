@@ -8,3 +8,12 @@ __pycache__/
 .env.*
 !.env.example
 !.env.sample
+
+/build/
+/dist/
+*.egg-info/
+.coverage
+.coverage.*
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
