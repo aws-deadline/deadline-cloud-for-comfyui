@@ -12,6 +12,14 @@ Keep changes focused and inspect the staged file list before committing.
 Local experiments and generated files may be present outside the tracked
 integration.
 
+Start each source file with
+`# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.`; a unit
+test enforces this. ComfyUI is licensed under the GPL-3.0 and is an external
+dependency: do not bundle, vendor, or redistribute ComfyUI. Do not add model
+weights, sample images, or other third-party assets, or code that downloads
+them. Reference workflows may name the models they need; users supply those
+files.
+
 Declare GitHub Actions permissions explicitly. Third-party actions use full
 commit SHA pins. Shared AWS Deadline Cloud workflows use
 organization-maintained references.

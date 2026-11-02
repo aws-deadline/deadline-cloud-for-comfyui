@@ -12,3 +12,15 @@ policies, and workflow automation.
 - [Contributing](CONTRIBUTING.md): DCO sign-offs and conventional PR titles and commits.
 - [Code of conduct](CODE_OF_CONDUCT.md).
 - [Security reporting](SECURITY.md).
+
+## License
+
+This project is licensed under the [Apache-2.0 License](LICENSE). See also
+[NOTICE](NOTICE).
+
+### External Dependencies
+
+This project integrates with [ComfyUI](https://github.com/Comfy-Org/ComfyUI),
+which is licensed under the GPL-3.0. ComfyUI is not bundled with or
+distributed by this project. Install ComfyUI separately from its upstream
+source.
