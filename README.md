@@ -13,6 +13,10 @@ policies, and workflow automation.
 - [Code of conduct](CODE_OF_CONDUCT.md).
 - [Security reporting](SECURITY.md).
 
+To contribute, fork this repository and open a pull request against `main`.
+Follow the [contribution guidelines](CONTRIBUTING.md) for commit sign-offs and
+pull request conventions.
+
 ## License
 
 This project is licensed under the [Apache-2.0 License](LICENSE). See also
