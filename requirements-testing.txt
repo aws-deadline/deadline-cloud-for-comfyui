@@ -1,6 +1,13 @@
+# ComfyUI's server framework, for the route tests. ComfyUI 0.38.0 requires aiohttp>=3.11.8.
+aiohttp == 3.*
 black == 26.*
 coverage[toml] == 7.*
 mypy == 2.*
+# Validates the job templates that the submitter generates.
+openjd-model == 0.*
 pytest == 9.*
 pytest-cov == 7.*
+# Reads the job templates in the template script tests. ComfyUI depends on PyYAML too.
+pyyaml == 6.*
 ruff == 0.17.*
+types-PyYAML == 6.*

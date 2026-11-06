@@ -1,8 +1,7 @@
 # Agent guide
 
-This repository establishes the policies and automation for an AWS Deadline
-Cloud integration with ComfyUI. The Python package under `src/` is a
-placeholder until the product implementation is added.
+This repository contains an AWS Deadline Cloud integration with ComfyUI: the
+submitter extension under `src/` and its policies and automation.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md) before
 preparing changes. Use conventional commit messages and PR titles, and sign

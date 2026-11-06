@@ -14,7 +14,7 @@ authors = [
 ]
 # https://pypi.org/classifiers/
 classifiers = [
-  "Development Status :: 1 - Planning",
+  "Development Status :: 3 - Alpha",
   "Programming Language :: Python",
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.10",
@@ -28,6 +28,10 @@ classifiers = [
   "Intended Audience :: Developers",
   "Intended Audience :: End Users/Desktop",
 ]
+# No runtime dependencies. The extension runs inside ComfyUI's Python environment and calls the
+# Deadline Cloud library through the `deadline` CLI's own Python. Installing deadline[gui] (PySide6,
+# boto3) into ComfyUI's environment is what this design avoids, so the CLI is installed
+# separately. See the README.
 dependencies = []
 
 [project.urls]
@@ -66,6 +70,11 @@ line-length = 100
 
 [tool.ruff.lint]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# ComfyUI loads the repository directory itself as the custom-node module, so the root __init__.py
+# makes every package below it part of a module named after the (hyphenated) checkout directory.
+"__init__.py" = ["N999"]
 
 [tool.ruff.lint.isort]
 known-first-party = [

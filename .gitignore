@@ -17,3 +17,7 @@ __pycache__/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+
+# Created by install_submitter.py when the extension runs from this checkout
+.deadline-cli/
+deadline_cloud_submitter.json
