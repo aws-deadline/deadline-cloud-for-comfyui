@@ -1,0 +1,334 @@
+specificationVersion: 'jobtemplate-2023-09'
+name: ComfyUI Workflow (comfy-cli)
+description: >
+  Runs a ComfyUI workflow headlessly with comfy-cli, once per seed. A job environment
+  starts ComfyUI once per session with comfy launch, loading models from a cache, so every
+  task in the session reuses the warm server. Each task sets its seed in the workflow and
+  runs it with comfy run.
+
+parameterDefinitions:
+
+# Workflow Parameters
+- name: WorkflowFile
+  type: PATH
+  objectType: FILE
+  dataFlow: IN
+  userInterface:
+    control: CHOOSE_INPUT_FILE
+    label: Workflow File
+    groupLabel: Workflow Parameters
+    fileFilters:
+    - label: ComfyUI workflow
+      patterns: ["*.json"]
+    - label: All Files
+      patterns: ["*"]
+  default: workflows/sd15_txt2img_api.json
+  description: >
+    Choose a ComfyUI workflow, either saved normally or exported with Workflow > Export (API).
+    comfy-cli converts normal workflows to API format.
+- name: Seeds
+  type: STRING
+  userInterface:
+    control: LINE_EDIT
+    label: Seeds
+    groupLabel: Workflow Parameters
+  default: 1-4
+  description: >
+    The seeds to run, one task per seed, for example "1-4" or "7,42,100". Each task
+    sets every "seed" and "noise_seed" input in the workflow to its seed.
+- name: OutputDir
+  type: PATH
+  objectType: DIRECTORY
+  dataFlow: OUT
+  userInterface:
+    control: CHOOSE_DIRECTORY
+    label: Output Directory
+    groupLabel: Workflow Parameters
+  default: "./output"
+  description: >
+    Choose the output directory. ComfyUI writes the outputs of Save nodes here, with
+    the seed added to each file name prefix.
+
+# Model Parameters
+- name: ModelDownloads
+  type: STRING
+  userInterface:
+    control: LINE_EDIT
+    label: Model Downloads
+    groupLabel: Model Parameters
+  default: >-
+    checkpoints/v1-5-pruned-emaonly-fp16.safetensors=https://huggingface.co/Comfy-Org/stable-diffusion-v1-5-archive/resolve/main/v1-5-pruned-emaonly-fp16.safetensors#sha256=e9476a13728cd75d8279f6ec8bad753a66a1957ca375a1464dc63b37db6e3916
+  description: >
+    A space-separated list of models to download into the model cache before ComfyUI
+    starts, each as FOLDER/FILE=URL with an optional #sha256=HEX suffix to verify the
+    download. FOLDER is a ComfyUI model folder such as checkpoints, loras, vae,
+    text_encoders or diffusion_models. Models already in the cache aren't downloaded
+    again. Leave empty if your models are already in the cache or in an extra model
+    paths config.
+- name: ModelCacheDir
+  type: STRING
+  userInterface:
+    control: LINE_EDIT
+    label: Model Cache Directory
+    groupLabel: Model Parameters
+  default: ""
+  description: >
+    Where downloaded models are cached on the worker. Leave empty to use the fleet's
+    persistent volume when it has one, located through the DEADLINE_PERSISTENT_MOUNT
+    variable that Deadline Cloud sets on workers, and otherwise /var/tmp on the root
+    volume. Only the persistent volume survives worker replacement. This is a STRING
+    rather than a PATH so that models stay out of job attachments.
+- name: ExtraModelPathsConfig
+  type: STRING
+  userInterface:
+    control: LINE_EDIT
+    label: Extra Model Paths Config
+    groupLabel: Model Parameters
+  default: ""
+  description: >
+    Optional path, on the worker, to an extra_model_paths.yaml file that points
+    ComfyUI at more model folders or custom_nodes folders, for example on shared
+    storage. ComfyUI also searches the model cache.
+
+# Advanced Parameters
+- name: ComfyUIArgs
+  type: STRING
+  userInterface:
+    control: LINE_EDIT
+    label: Extra ComfyUI Arguments
+    groupLabel: Advanced Parameters
+  default: ""
+  description: >
+    Extra command line arguments for the ComfyUI server, for example "--lowvram".
+- name: ServerStartTimeout
+  type: INT
+  userInterface:
+    control: SPIN_BOX
+    label: Server Start Timeout (seconds)
+    groupLabel: Advanced Parameters
+  default: 600
+  minValue: 30
+  description: How long to wait for the ComfyUI server to start.
+
+# Software Environment
+- name: CondaPackages
+  type: STRING
+  userInterface:
+    # This parameter is for a queue environment, not used directly in the job,
+    # so leave the GUI for the queue environment to display.
+    control: HIDDEN
+  default: comfy
+  description: >
+    If you have a Queue Environment that creates a Conda environment from a parameter called CondaPackages, this
+    will set the default packages to use for the job. The comfy package provides ComfyUI and comfy-cli.
+
+jobEnvironments:
+- name: ComfyUIServer
+  description: >
+    Downloads the models into the cache, then starts ComfyUI in the background with
+    comfy launch, for the tasks in the session to share.
+  variables:
+    COMFY_NO_TELEMETRY: "1"
+  script:
+    actions:
+      onEnter:
+        command: bash
+        args: ['{{Env.File.Enter}}']
+        timeout: 7200
+      onExit:
+        command: bash
+        args: ['{{Env.File.Exit}}']
+        timeout: 120
+    embeddedFiles:
+    - name: Enter
+      filename: enter-comfyui-server.sh
+      type: TEXT
+      data: |
+        #!/bin/env bash
+        set -euo pipefail
+
+        CACHE_DIR='{{Param.ModelCacheDir}}'
+        if [ -z "$CACHE_DIR" ]; then
+            if [ -n "${DEADLINE_PERSISTENT_MOUNT:-}" ]; then
+                CACHE_DIR="$DEADLINE_PERSISTENT_MOUNT/comfyui-models"
+            else
+                CACHE_DIR=/var/tmp/comfyui-models
+            fi
+        fi
+        mkdir -p "$CACHE_DIR"
+        echo "Model cache directory: $CACHE_DIR"
+
+        for ENTRY in {{Param.ModelDownloads}}; do
+            DEST="${ENTRY%%=*}"
+            URL="${ENTRY#*=}"
+            SHA256=""
+            if [[ "$URL" == *"#sha256="* ]]; then
+                SHA256="${URL##*#sha256=}"
+                URL="${URL%%#sha256=*}"
+            fi
+            TARGET="$CACHE_DIR/$DEST"
+            if [ -f "$TARGET" ]; then
+                echo "Cached: $DEST"
+                continue
+            fi
+            echo "openjd_status: Downloading $DEST"
+            mkdir -p "$(dirname "$TARGET")"
+            curl -fL --retry 5 --retry-delay 5 --no-progress-meter -o "$TARGET.partial" "$URL"
+            if [ -n "$SHA256" ]; then
+                echo "$SHA256  $TARGET.partial" | sha256sum --check --quiet \
+                    || { echo "openjd_fail: Checksum mismatch for $DEST"; rm -f "$TARGET.partial"; exit 1; }
+            fi
+            mv "$TARGET.partial" "$TARGET"
+        done
+
+        MODEL_PATHS='{{Session.WorkingDirectory}}/extra_model_paths.yaml'
+        cat > "$MODEL_PATHS" <<EOF
+        model_cache:
+            base_path: $CACHE_DIR
+            checkpoints: checkpoints/
+            clip_vision: clip_vision/
+            controlnet: controlnet/
+            diffusion_models: diffusion_models/
+            embeddings: embeddings/
+            loras: loras/
+            text_encoders: text_encoders/
+            upscale_models: upscale_models/
+            vae: vae/
+        EOF
+        MODEL_PATH_ARGS=(--extra-model-paths-config "$MODEL_PATHS")
+        if [ -n '{{Param.ExtraModelPathsConfig}}' ]; then
+            MODEL_PATH_ARGS+=('{{Param.ExtraModelPathsConfig}}')
+        fi
+
+        # Keep ComfyUI's data out of the shared conda environment: use a base directory
+        # in the session. ComfyUI can fail to start on one without custom_nodes/.
+        BASE_DIR='{{Session.WorkingDirectory}}/comfyui'
+        mkdir -p "$BASE_DIR/custom_nodes" '{{Param.OutputDir}}'
+
+        PORT=$(python -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+        echo "openjd_status: Starting ComfyUI with comfy launch"
+        comfy --skip-prompt --workspace "$COMFYUI_LOCATION" launch --background -- \
+            --listen 127.0.0.1 --port "$PORT" \
+            --base-directory "$BASE_DIR" \
+            --output-directory '{{Param.OutputDir}}' \
+            "${MODEL_PATH_ARGS[@]}" \
+            {{Param.ComfyUIArgs}}
+        echo "openjd_env: COMFYUI_PORT=$PORT"
+
+        for (( i = 0; i < {{Param.ServerStartTimeout}}; i++ )); do
+            if curl -sf "http://127.0.0.1:$PORT/system_stats" > /dev/null; then
+                echo "ComfyUI server is ready after ${i}s"
+                curl -s "http://127.0.0.1:$PORT/system_stats"; echo
+                exit 0
+            fi
+            sleep 1
+        done
+        echo "openjd_fail: The ComfyUI server didn't start within {{Param.ServerStartTimeout}}s"
+        exit 1
+    - name: Exit
+      filename: exit-comfyui-server.sh
+      type: TEXT
+      data: |
+        #!/bin/env bash
+        set -uo pipefail
+        comfy --skip-prompt stop --port "$COMFYUI_PORT"
+
+steps:
+- name: RunWorkflow
+  parameterSpace:
+    taskParameterDefinitions:
+    - name: Seed
+      type: INT
+      range: "{{Param.Seeds}}"
+  script:
+    actions:
+      onRun:
+        command: python
+        args: ['{{Task.File.Run}}']
+        timeout: 3600
+    embeddedFiles:
+    - name: Run
+      filename: run-workflow.py
+      type: TEXT
+      data: |
+        import json
+        import os
+        import subprocess
+        import sys
+
+        PORT = os.environ["COMFYUI_PORT"]
+        SEED = {{Task.Param.Seed}}
+        OUTPUT_DIR = r"{{Param.OutputDir}}"
+        SERVER = ["--where", "local", "--host", "127.0.0.1", "--port", PORT]
+
+
+        def fail(message):
+            print(f"openjd_fail: {message}", flush=True)
+            sys.exit(1)
+
+
+        def comfy_run(*args):
+            result = subprocess.run(
+                ["comfy", "--skip-prompt", "run", *args, *SERVER, "--json"],
+                capture_output=True, text=True,
+            )
+            envelope = None
+            for line in result.stdout.splitlines():
+                print(line, flush=True)
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(event, dict) and event.get("type") == "envelope":
+                    envelope = event
+            if result.stderr:
+                print(result.stderr, file=sys.stderr, flush=True)
+            if result.returncode != 0 or not envelope or not envelope.get("ok"):
+                error = (envelope or {}).get("error") or {}
+                fail(f"comfy run failed: {error.get('code', result.returncode)} {error.get('message', '')}")
+            return envelope
+
+
+        # Convert the workflow to API format. comfy-cli accepts both formats, and converts
+        # UI-format workflows using the running server's node definitions.
+        print("openjd_status: Preparing the workflow", flush=True)
+        preview = comfy_run("--workflow", r"{{Param.WorkflowFile}}", "--print-prompt")
+        workflow = (preview.get("data") or {}).get("prompt")
+        if not isinstance(workflow, dict) or not workflow:
+            fail("comfy run --print-prompt returned no workflow")
+
+        # Apply the task's seed, and add it to output file names so tasks don't overwrite each other.
+        prefix_suffix = f"_seed{SEED}"
+        for node in workflow.values():
+            inputs = node.get("inputs", {})
+            for key in ("seed", "noise_seed"):
+                if key in inputs and not isinstance(inputs[key], list):
+                    inputs[key] = SEED
+            if isinstance(inputs.get("filename_prefix"), str):
+                inputs["filename_prefix"] += prefix_suffix
+
+        task_workflow = os.path.abspath(f"workflow_seed{SEED}_api.json")
+        with open(task_workflow, "w", encoding="utf-8") as f:
+            json.dump(workflow, f, indent=2)
+
+        print(f"openjd_status: Running the workflow with seed {SEED}", flush=True)
+        before = {os.path.join(root, name) for root, _, names in os.walk(OUTPUT_DIR) for name in names}
+        comfy_run("--workflow", task_workflow, "--wait")
+        outputs = sorted(
+            os.path.relpath(path, OUTPUT_DIR)
+            for root, _, names in os.walk(OUTPUT_DIR) for name in names
+            if (path := os.path.join(root, name)) not in before
+        )
+        print(f"Finished seed {SEED}. Outputs in {OUTPUT_DIR}:")
+        for path in outputs:
+            print(f"  {path}")
+        if not outputs:
+            fail("The workflow produced no output files. Add a Save node, such as SaveImage.")
+  hostRequirements:
+    attributes:
+    - name: attr.worker.os.family
+      anyOf:
+      - linux
+    amounts:
+    - name: amount.worker.gpu
+      min: 1
