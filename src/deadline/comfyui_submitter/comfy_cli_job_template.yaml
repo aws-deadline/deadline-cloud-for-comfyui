@@ -1,0 +1,626 @@
+specificationVersion: 'jobtemplate-2023-09'
+name: ComfyUI Workflow (comfy-cli)
+description: >
+  Runs a ComfyUI workflow headlessly with comfy-cli, once per combination of its work
+  items. A job environment starts ComfyUI once per session with comfy launch, loading
+  models from a cache, so every task in the session reuses the warm server. Each task sets
+  its items in the workflow and runs it with comfy run.
+extensions: ["EXPR"]
+
+parameterDefinitions:
+
+# Workflow Parameters
+- name: WorkflowFile
+  type: PATH
+  objectType: FILE
+  dataFlow: IN
+  userInterface:
+    control: CHOOSE_INPUT_FILE
+    label: Workflow File
+    groupLabel: Workflow Parameters
+    fileFilters:
+    - label: ComfyUI workflow
+      patterns: ["*.json"]
+    - label: All Files
+      patterns: ["*"]
+  description: >
+    Choose a ComfyUI workflow, either saved normally or exported with Workflow > Export (API).
+    comfy-cli converts normal workflows to API format.
+- name: InputDir
+  type: PATH
+  objectType: DIRECTORY
+  dataFlow: NONE
+  userInterface:
+    control: CHOOSE_DIRECTORY
+    label: Input Directory
+    groupLabel: Workflow Parameters
+  default: ""
+  description: >
+    ComfyUI's input directory, which load nodes such as LoadImage read from. Only the
+    files the workflow uses are attached to the job, not the whole directory, and
+    ComfyUI on the worker reads them from where they're mapped. Leave empty to use an
+    empty input directory in the session.
+- name: OutputDir
+  type: PATH
+  objectType: DIRECTORY
+  dataFlow: OUT
+  userInterface:
+    control: CHOOSE_DIRECTORY
+    label: Output Directory
+    groupLabel: Workflow Parameters
+  default: "./output"
+  description: >
+    Choose the output directory. ComfyUI writes the outputs of Save nodes here, with
+    each task's work items added to each file name prefix.
+
+# Model Parameters
+- name: ModelDirectory
+  type: PATH
+  objectType: DIRECTORY
+  dataFlow: NONE
+  userInterface:
+    control: HIDDEN
+  default: ""
+  description: >
+    A directory of model files, laid out like ComfyUI's models folder with
+    subfolders such as checkpoints, loras and vae. Only files the workflow
+    loads that have no usable download link, or whose link names a different
+    file, are attached to the job, not the whole directory. ComfyUI on the
+    worker reads them from where they're mapped. Leave empty when every model
+    is downloaded through Model Downloads, already in the cache, or in an
+    extra model paths config.
+- name: ModelDownloads
+  type: STRING
+  userInterface:
+    control: LINE_EDIT
+    label: Model Downloads
+    groupLabel: Model Parameters
+  default: ""
+  description: >
+    A space-separated list of models to download into the model cache before ComfyUI
+    starts, each as FOLDER/FILE=URL with an optional #sha256=HEX suffix to verify the
+    download. FOLDER is a ComfyUI model folder such as checkpoints, loras, vae,
+    text_encoders or diffusion_models. Models already in the cache aren't downloaded
+    again. Leave empty if your models are already in the cache or in an extra model
+    paths config.
+- name: ModelCacheDir
+  type: STRING
+  userInterface:
+    control: LINE_EDIT
+    label: Model Cache Directory
+    groupLabel: Model Parameters
+  default: ""
+  description: >
+    Where downloaded models are cached on the worker. Leave empty to use the fleet's
+    persistent volume when it has one, located through the DEADLINE_PERSISTENT_MOUNT
+    variable that Deadline Cloud sets on workers, and otherwise /var/tmp on the root
+    volume. Only the persistent volume survives worker replacement. This is a STRING
+    rather than a PATH so that models stay out of job attachments.
+- name: ExtraModelPathsConfig
+  type: STRING
+  userInterface:
+    control: LINE_EDIT
+    label: Extra Model Paths Config
+    groupLabel: Model Parameters
+  default: ""
+  description: >
+    Optional path, on the worker, to an extra_model_paths.yaml file that points
+    ComfyUI at more model folders or custom_nodes folders, for example on shared
+    storage. ComfyUI also searches the model cache.
+
+# Custom Node Parameters
+- name: AttachCustomNodes
+  type: BOOL
+  userInterface:
+    control: CHECK_BOX
+    label: Attach Custom Nodes
+    groupLabel: Custom Node Parameters
+  default: "true"
+  description: >
+    Install the custom nodes the workflow needs on the worker: the Comfy Registry packs in
+    Custom Nodes, the packs attached under Custom Nodes Directory, and their Python
+    dependencies. Turn off when the workers already provide every custom node and its
+    dependencies, for example from a custom nodes conda package; the Custom Nodes and Custom
+    Nodes Directory parameters are then ignored.
+- name: CustomNodes
+  type: STRING
+  userInterface:
+    control: LINE_EDIT
+    label: Custom Nodes
+    groupLabel: Custom Node Parameters
+  default: ""
+  description: >
+    A space-separated list of Comfy Registry node packs to install for the job, each
+    as ID or ID@VERSION, for example "comfyui-kjnodes@1.1.9". They're installed into
+    the session with comfy-cli, and their Python dependencies into a session virtual
+    environment layered on the conda environment, which they can't change. Packs
+    already in a custom nodes package in the conda environment are skipped. The
+    ComfyUI Submitter fills this in from the workflow.
+- name: CustomNodesDirectory
+  type: PATH
+  objectType: DIRECTORY
+  dataFlow: NONE
+  userInterface:
+    control: HIDDEN
+  default: ""
+
+# Advanced Parameters
+- name: ComfyUIArgs
+  type: STRING
+  userInterface:
+    control: LINE_EDIT
+    label: Extra ComfyUI Arguments
+    groupLabel: Advanced Parameters
+  default: ""
+  description: >
+    Extra command line arguments for the ComfyUI server, for example "--lowvram".
+- name: ServerStartTimeout
+  type: INT
+  userInterface:
+    control: SPIN_BOX
+    label: Server Start Timeout (seconds)
+    groupLabel: Advanced Parameters
+  default: 600
+  minValue: 30
+  description: How long to wait for the ComfyUI server to start.
+
+# Software Environment
+- name: CondaPackages
+  type: STRING
+  userInterface:
+    # This parameter is for a queue environment, not used directly in the job,
+    # so leave the GUI for the queue environment to display.
+    control: HIDDEN
+  default: comfy
+  description: >
+    If you have a Queue Environment that creates a Conda environment from a parameter called CondaPackages, this
+    will set the default packages to use for the job. The comfy package provides ComfyUI and comfy-cli.
+
+jobEnvironments:
+- name: ComfyUIServer
+  description: >
+    Downloads the models into the cache, then starts ComfyUI in the background with
+    comfy launch, reading inputs from the mapped InputDir, for the tasks in the session
+    to share.
+  variables:
+    COMFY_NO_TELEMETRY: "1"
+  script:
+    actions:
+      onEnter:
+        command: bash
+        args: ['{{Env.File.Enter}}']
+        timeout: 7200
+      onExit:
+        command: bash
+        args: ['{{Env.File.Exit}}']
+        timeout: 120
+    embeddedFiles:
+    - name: Enter
+      filename: enter-comfyui-server.sh
+      type: TEXT
+      data: |
+        #!/bin/env bash
+        set -euo pipefail
+
+        CACHE_DIR='{{Param.ModelCacheDir}}'
+        if [ -z "$CACHE_DIR" ]; then
+            if [ -n "${DEADLINE_PERSISTENT_MOUNT:-}" ]; then
+                CACHE_DIR="$DEADLINE_PERSISTENT_MOUNT/comfyui-models"
+            else
+                CACHE_DIR=/var/tmp/comfyui-models
+            fi
+        fi
+        mkdir -p "$CACHE_DIR"
+        echo "Model cache directory: $CACHE_DIR"
+
+        for ENTRY in {{Param.ModelDownloads}}; do
+            DEST="${ENTRY%%=*}"
+            URL="${ENTRY#*=}"
+            SHA256=""
+            if [[ "$URL" == *"#sha256="* ]]; then
+                SHA256="${URL##*#sha256=}"
+                URL="${URL%%#sha256=*}"
+            fi
+            TARGET="$CACHE_DIR/$DEST"
+            if [ -f "$TARGET" ]; then
+                echo "Cached: $DEST"
+                continue
+            fi
+            echo "openjd_status: Downloading $DEST"
+            mkdir -p "$(dirname "$TARGET")"
+            rm -f "$TARGET.partial"
+            # The cache is the workspace so comfy-cli's download records stay out of the conda
+            # environment. comfy-cli reads HF_API_TOKEN and CIVITAI_API_TOKEN for gated models.
+            comfy --skip-prompt --workspace "$CACHE_DIR" model download \
+                --url "$URL" --relative-path "$(dirname "$DEST")" \
+                --filename "$(basename "$DEST").partial" \
+                || { echo "openjd_fail: Couldn't download $DEST"; exit 1; }
+            if [ -n "$SHA256" ]; then
+                echo "$SHA256  $TARGET.partial" | sha256sum --check --quiet \
+                    || { echo "openjd_fail: Checksum mismatch for $DEST"; rm -f "$TARGET.partial"; exit 1; }
+            fi
+            mv "$TARGET.partial" "$TARGET"
+        done
+
+        MODEL_PATHS='{{Session.WorkingDirectory}}/extra_model_paths.yaml'
+        cat > "$MODEL_PATHS" <<EOF
+        model_cache:
+            base_path: $CACHE_DIR
+            checkpoints: checkpoints/
+            clip_vision: clip_vision/
+            controlnet: controlnet/
+            diffusion_models: diffusion_models/
+            embeddings: embeddings/
+            loras: loras/
+            text_encoders: text_encoders/
+            upscale_models: upscale_models/
+            vae: vae/
+        EOF
+        if [ -n "${COMFYUI_CUSTOM_NODES_DIR:-}" ] && [ -d "$COMFYUI_CUSTOM_NODES_DIR" ]; then
+            echo "    custom_nodes: $COMFYUI_CUSTOM_NODES_DIR" >> "$MODEL_PATHS"
+            echo "Custom nodes from the conda environment: $(ls "$COMFYUI_CUSTOM_NODES_DIR" | xargs)"
+        fi
+        # Path mapping turns ModelDirectory into the folder where the model files were attached.
+        if [ -n '{{Param.ModelDirectory}}' ]; then
+            cat >> "$MODEL_PATHS" <<EOF
+        model_directory:
+            base_path: '{{Param.ModelDirectory}}'
+            checkpoints: checkpoints/
+            clip_vision: clip_vision/
+            controlnet: controlnet/
+            diffusion_models: diffusion_models/
+            embeddings: embeddings/
+            loras: loras/
+            text_encoders: text_encoders/
+            upscale_models: upscale_models/
+            vae: vae/
+        EOF
+        fi
+        # Path mapping turns CustomNodesDirectory into the folder where the packs that aren't
+        # from the registry were attached. Skipped when AttachCustomNodes is off: the workers
+        # then provide every custom node themselves, for example from a conda package.
+        ATTACHED_NODES=()
+        if [ '{{Param.AttachCustomNodes}}' = true ] \
+            && [ -n '{{Param.CustomNodesDirectory}}' ] && [ -d '{{Param.CustomNodesDirectory}}' ]; then
+            cat >> "$MODEL_PATHS" <<EOF
+        attached_custom_nodes:
+            custom_nodes: '{{Param.CustomNodesDirectory}}'
+        EOF
+            for NODE_DIR in '{{Param.CustomNodesDirectory}}'/*/; do
+                if [ -d "$NODE_DIR" ]; then
+                    ATTACHED_NODES+=("${NODE_DIR%/}")
+                fi
+            done
+            echo "Attached custom nodes: $(ls '{{Param.CustomNodesDirectory}}' | xargs)"
+        fi
+        MODEL_PATH_ARGS=(--extra-model-paths-config "$MODEL_PATHS")
+        if [ -n '{{Param.ExtraModelPathsConfig}}' ]; then
+            MODEL_PATH_ARGS+=('{{Param.ExtraModelPathsConfig}}')
+        fi
+
+        # Keep ComfyUI's data out of the shared conda environment: use a base directory
+        # in the session. ComfyUI 0.38.0 fails to start on one without custom_nodes/.
+        BASE_DIR='{{Session.WorkingDirectory}}/comfyui'
+
+        # Path mapping turns InputDir into the folder where the job's input files were attached.
+        INPUT_DIR='{{Param.InputDir}}'
+        if [ -z "$INPUT_DIR" ]; then
+            INPUT_DIR="$BASE_DIR/input"
+        fi
+        echo "Input directory: $INPUT_DIR"
+        mkdir -p "$BASE_DIR/custom_nodes" '{{Param.OutputDir}}' "$INPUT_DIR"
+
+        # Registry packs install into the session. Their pip dependencies go into a virtual
+        # environment layered on the conda environment, which comfy-cli and comfy launch use
+        # because VIRTUAL_ENV is set, constrained so they can't change packages such as torch.
+        # AttachCustomNodes off skips all of this: the workers provide the custom nodes.
+        NODE_PACKS=()
+        if [ '{{Param.AttachCustomNodes}}' = true ]; then
+            for PACK in {{Param.CustomNodes}}; do
+                if [ -n "${COMFYUI_CUSTOM_NODES_DIR:-}" ] && [ -d "$COMFYUI_CUSTOM_NODES_DIR/${PACK%%@*}" ]; then
+                    echo "In the conda environment: ${PACK%%@*}"
+                else
+                    NODE_PACKS+=("$PACK")
+                fi
+            done
+        fi
+        if [ ${#NODE_PACKS[@]} -gt 0 ] || [ ${#ATTACHED_NODES[@]} -gt 0 ]; then
+            VENV='{{Session.WorkingDirectory}}/node-venv'
+            python -m venv --system-site-packages "$VENV" \
+                || { echo "openjd_fail: Couldn't create a virtual environment for the custom nodes"; exit 1; }
+            export VIRTUAL_ENV="$VENV" PATH="$VENV/bin:$PATH"
+            # The comfy package records its pip packages at build time, because the conda
+            # environment has no pip of its own. The virtual environment's pip is the fallback.
+            if [ -f "$COMFYUI_LOCATION/pip-freeze.txt" ]; then
+                grep -v ' @ ' "$COMFYUI_LOCATION/pip-freeze.txt" > '{{Session.WorkingDirectory}}/constraints.txt'
+            else
+                "$VENV/bin/python" -m pip freeze | grep -v ' @ ' > '{{Session.WorkingDirectory}}/constraints.txt'
+            fi
+            export PIP_CONSTRAINT='{{Session.WorkingDirectory}}/constraints.txt'
+            export PIP_CACHE_DIR="$CACHE_DIR/.pip-cache"
+            for PACK in "${NODE_PACKS[@]}"; do
+                echo "openjd_status: Installing custom node $PACK"
+                INSTALL=(comfy --skip-prompt --workspace "$BASE_DIR" node registry-install "${PACK%%@*}")
+                if [[ "$PACK" == *@* ]]; then
+                    INSTALL+=(--version "${PACK#*@}")
+                fi
+                "${INSTALL[@]}" || { echo "openjd_fail: Couldn't install custom node $PACK"; exit 1; }
+                # comfy-cli reports success even when extracting the archive or installing
+                # requirements fails, so check both.
+                NODE_DIR="$BASE_DIR/custom_nodes/${PACK%%@*}"
+                if [ ! -f "$NODE_DIR/__init__.py" ]; then
+                    echo "openjd_fail: Custom node $PACK wasn't extracted to $NODE_DIR"
+                    exit 1
+                fi
+                if [ -f "$NODE_DIR/requirements.txt" ]; then
+                    "$VENV/bin/python" -m pip install -r "$NODE_DIR/requirements.txt" \
+                        || { echo "openjd_fail: Couldn't install the requirements of $PACK"; exit 1; }
+                fi
+            done
+            for NODE_DIR in "${ATTACHED_NODES[@]}"; do
+                if [ -f "$NODE_DIR/requirements.txt" ]; then
+                    echo "openjd_status: Installing the requirements of $(basename "$NODE_DIR")"
+                    "$VENV/bin/python" -m pip install -r "$NODE_DIR/requirements.txt" \
+                        || { echo "openjd_fail: Couldn't install the requirements of $(basename "$NODE_DIR")"; exit 1; }
+                fi
+            done
+            "$VENV/bin/python" -m pip check \
+                || { echo "openjd_fail: The custom nodes' dependencies conflict"; exit 1; }
+        fi
+
+        PORT=$(python -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+        echo "openjd_status: Starting ComfyUI with comfy launch"
+        comfy --skip-prompt --workspace "$COMFYUI_LOCATION" launch --background -- \
+            --listen 127.0.0.1 --port "$PORT" \
+            --base-directory "$BASE_DIR" \
+            --input-directory "$INPUT_DIR" \
+            --output-directory '{{Param.OutputDir}}' \
+            "${MODEL_PATH_ARGS[@]}" \
+            {{Param.ComfyUIArgs}}
+        echo "openjd_env: COMFYUI_PORT=$PORT"
+
+        for (( i = 0; i < {{Param.ServerStartTimeout}}; i++ )); do
+            if curl -sf "http://127.0.0.1:$PORT/system_stats" > /dev/null; then
+                echo "ComfyUI server is ready after ${i}s"
+                curl -s "http://127.0.0.1:$PORT/system_stats"; echo
+                # ComfyUI starts even when a custom node fails to import, then fails each
+                # workflow that uses it, so fail here with the import error instead.
+                LOG=$(comfy --skip-prompt --json --workspace "$COMFYUI_LOCATION" logs --port "$PORT" --tail 5000 2>/dev/null \
+                    | python -c 'import json, sys; print("".join(json.load(sys.stdin)["data"]["lines"]))' || true)
+                if grep -q "(IMPORT FAILED)" <<< "$LOG"; then
+                    grep -A20 "Traceback\|Cannot import\|(IMPORT FAILED)" <<< "$LOG" || true
+                    comfy --skip-prompt stop --port "$PORT" || true
+                    echo "openjd_fail: A custom node failed to import"
+                    exit 1
+                fi
+                exit 0
+            fi
+            sleep 1
+        done
+        echo "openjd_fail: The ComfyUI server didn't start within {{Param.ServerStartTimeout}}s"
+        exit 1
+    - name: Exit
+      filename: exit-comfyui-server.sh
+      type: TEXT
+      data: |
+        #!/bin/env bash
+        set -uo pipefail
+        # onEnter sets COMFYUI_PORT only once it starts the server.
+        if [ -z "${COMFYUI_PORT:-}" ]; then
+            exit 0
+        fi
+        comfy --skip-prompt stop --port "$COMFYUI_PORT"
+
+steps:
+- name: RunWorkflow
+  # The ComfyUI Submitter adds a task parameter for each source of work items in the workflow.
+  # Without one, the workflow runs once.
+  script:
+    actions:
+      onRun:
+        command: python
+        args: ['{{Task.File.Run}}']
+        timeout: 3600
+    embeddedFiles:
+    - name: Run
+      filename: run-workflow.py
+      type: TEXT
+      data: |
+        import json
+        import os
+        import random
+        import re
+        import subprocess
+        import sys
+
+        PORT = os.environ["COMFYUI_PORT"]
+        # The task's item of each source of work items, or value for a Deadline Integer Values
+        # node, by task parameter. The ComfyUI Submitter fills this in. A source without one runs
+        # whole, or outputs its preview item.
+        ITEMS = {}
+        OUTPUT_DIR = r"{{Param.OutputDir}}"
+        SERVER = ["--where", "local", "--host", "127.0.0.1", "--port", PORT]
+
+
+        def fail(message):
+            print(f"openjd_fail: {message}", flush=True)
+            sys.exit(1)
+
+
+        def comfy_run(*args):
+            result = subprocess.run(
+                ["comfy", "--skip-prompt", "run", *args, *SERVER, "--json"],
+                capture_output=True, text=True,
+            )
+            envelope = None
+            for line in result.stdout.splitlines():
+                print(line, flush=True)
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(event, dict) and event.get("type") == "envelope":
+                    envelope = event
+            if result.stderr:
+                print(result.stderr, file=sys.stderr, flush=True)
+            if result.returncode != 0 or not envelope or not envelope.get("ok"):
+                error = (envelope or {}).get("error") or {}
+                fail(f"comfy run failed: {error.get('code', result.returncode)} {error.get('message', '')}")
+            return envelope
+
+
+        # Convert the workflow to API format. comfy-cli accepts both formats, and converts
+        # UI-format workflows using the running server's node definitions.
+        print("openjd_status: Preparing the workflow", flush=True)
+        preview = comfy_run("--workflow", r"{{Param.WorkflowFile}}", "--print-prompt")
+        workflow = (preview.get("data") or {}).get("prompt")
+        if not isinstance(workflow, dict) or not workflow:
+            fail("comfy run --print-prompt returned no workflow")
+
+        # Select this task's item of each source, which the ComfyUI Submitter marks with _meta keys.
+        # Item 0 runs the source whole. The submitter has its own copy of expand_dynamic_prompt.
+        MAX_LIST_ITEMS = 1000
+        VALUE_NODES = ("DeadlineStringValues", "DeadlineIntegerValues", "DeadlineImageValues")
+
+
+        def expand_dynamic_prompt(text):
+            """Lists every prompt that a dynamic prompt such as "a {red|white} fox" can choose."""
+            text = re.sub(r"/\*[\s\S]*?\*/|//.*", "", text)
+            results = [""]
+            i = 0
+            while i < len(text):
+                char = text[i]
+                i += 1
+                if char == "\\":
+                    piece = "\\" + text[i : i + 1]
+                    i += 1
+                    results = [result + piece for result in results]
+                elif char == "{":
+                    choices, current, depth = [], "", 0
+                    while i < len(text):
+                        char = text[i]
+                        i += 1
+                        if char == "\\":
+                            current += "\\" + text[i : i + 1]
+                            i += 1
+                            continue
+                        if char == "{":
+                            depth += 1
+                        elif char == "}":
+                            if not depth:
+                                break
+                            depth -= 1
+                        elif char == "|" and not depth:
+                            choices.append(current)
+                            current = ""
+                            continue
+                        current += char
+                    choices.append(current)
+                    expanded = [option for choice in choices for option in expand_dynamic_prompt(choice)]
+                    results = [result + option for result in results for option in expanded]
+                    if len(results) > MAX_LIST_ITEMS:
+                        return results[: MAX_LIST_ITEMS + 1]
+                else:
+                    results = [result + char for result in results]
+            return [re.sub(r"\\([{}|])", r"\1", result) for result in results]
+
+
+        def item(name, count, what):
+            index = ITEMS.get(name, 0)
+            if index > count:
+                fail(f"Item {index} of {name} doesn't exist. {what} has {count} items.")
+            return index
+
+
+        def replace_node(node_id, value):
+            """Replaces a node with the value of its first output."""
+            del workflow[node_id]
+            for other in workflow.values():
+                for key, link in other.get("inputs", {}).items():
+                    if link == [node_id, 0]:
+                        other["inputs"][key] = value
+
+
+        # Choose dynamic prompts the task doesn't split at random, but the same way each time it
+        # runs.
+        chooser = random.Random(json.dumps(ITEMS, sort_keys=True))
+        # The value nodes' values, which go in output file names, even when they're 0.
+        values = set()
+        for node_id, node in list(workflow.items()):
+            class_type = node.get("class_type")
+            inputs = node.get("inputs", {})
+            meta = node.get("_meta") or {}
+            name = meta.get("deadline_item")
+            if class_type in VALUE_NODES and "deadline_preview" not in meta:
+                fail(f"Node {node_id} is a {class_type} node that the ComfyUI Submitter didn't prepare.")
+            # Replace the value nodes, so the worker doesn't need them installed.
+            if class_type == "DeadlineIntegerValues":
+                values.add(name)
+                replace_node(node_id, ITEMS[name] if name in ITEMS else meta["deadline_preview"])
+            elif class_type == "DeadlineStringValues":
+                lines = [line.strip() for line in str(inputs.get("values")).splitlines() if line.strip()]
+                index = item(name, len(lines), f"Deadline String Values {node_id}")
+                replace_node(node_id, lines[index - 1] if index else meta["deadline_preview"])
+            elif class_type in ("DeadlineImageValues", "LoadImageDataSetFromFolder") and name:
+                # Load just the task's image. Load Image has the same first output.
+                files = meta["deadline_files"]
+                index = item(name, len(files), f"The folder of node {node_id}")
+                if index:
+                    node.update(class_type="LoadImage", inputs={"image": files[index - 1]})
+                elif class_type == "DeadlineImageValues":
+                    node.update(class_type="LoadImage", inputs={"image": meta["deadline_preview"]})
+            elif class_type == "DeadlineImageValues":
+                node.update(class_type="LoadImage", inputs={"image": meta["deadline_preview"]})
+            elif class_type == "CreateList" and name:
+                # The node takes its items from inputs named input0, input1 and so on, in order.
+                items = sorted(
+                    (key for key in inputs if re.fullmatch(r"(inputs\.)?input\d+", key)),
+                    key=lambda key: int(re.search(r"\d+$", key).group()),
+                )
+                index = item(name, len(items), "A Create List")
+                if index:
+                    chosen = inputs[items[index - 1]]
+                    for key in items:
+                        del inputs[key]
+                    inputs[items[0]] = chosen
+            for key, prompt_name in meta.get("deadline_dynamic_prompts", {}).items():
+                prompts = expand_dynamic_prompt(inputs[key])
+                index = item(prompt_name, len(prompts), "A dynamic prompt")
+                inputs[key] = prompts[index - 1] if index else chooser.choice(prompts)
+
+        # Add the task's items to output file names so tasks don't overwrite each other.
+        chosen_items = {
+            name: value for name, value in ITEMS.items() if value or name in values
+        }
+        prefix_suffix = "".join(f"_{name}-{value}" for name, value in chosen_items.items())
+        for node in workflow.values():
+            inputs = node.get("inputs", {})
+            if isinstance(inputs.get("filename_prefix"), str):
+                inputs["filename_prefix"] += prefix_suffix
+
+        task_workflow = os.path.abspath(f"workflow{prefix_suffix}_api.json")
+        with open(task_workflow, "w", encoding="utf-8") as f:
+            json.dump(workflow, f, indent=2)
+
+        label = ", ".join(f"{name} {value}" for name, value in chosen_items.items()) or "the workflow"
+        print(f"openjd_status: Running the workflow with {label}", flush=True)
+        before = {os.path.join(root, name) for root, _, names in os.walk(OUTPUT_DIR) for name in names}
+        comfy_run("--workflow", task_workflow, "--wait")
+        outputs = sorted(
+            os.path.relpath(path, OUTPUT_DIR)
+            for root, _, names in os.walk(OUTPUT_DIR) for name in names
+            if (path := os.path.join(root, name)) not in before
+        )
+        print(f"Finished {label}. Outputs in {OUTPUT_DIR}:")
+        for path in outputs:
+            print(f"  {path}")
+        if not outputs:
+            fail("The workflow produced no output files. Add a Save node, such as SaveImage.")
+  hostRequirements:
+    attributes:
+    - name: attr.worker.os.family
+      anyOf:
+      - linux
+    amounts:
+    - name: amount.worker.gpu
+      min: 1
