@@ -243,6 +243,173 @@ if (scenario === "edited-before-replanning") {
   const message = "Downloaded 2 files";
   api.emit("deadline.download", { jobId: "job-1", status: "DOWNLOADED", message, fileCount: 2, directory });
   result.toasts = app.toasts.map(({ detail }) => detail);
+} else if (scenario.startsWith("task-lists")) {
+  // A Create List and a folder of images, which run in every combination.
+  const source = (name, kind, values) => ({
+    name,
+    parameter: `${name}Items`,
+    label: name,
+    title: name,
+    kind,
+    values,
+    count: values.length,
+    range: `1-${values.length}`,
+  });
+  const sources = [
+    source("List1", "list", ["fox", "cat", "owl"]),
+    source("Folder2", "folder", ["a.png", "b.png", "c.png", "d.png", "e.png"]),
+  ];
+  // A workflow runs as one task until the artist chooses to split its lists into tasks.
+  result.splitByDefault = ui.splitsTasks();
+  ui.setSplit(true);
+  result.counts = ["1-4", "1-20:2", "7, 42, 99", "4-1", "x", "0", ""].map(ui.countRange);
+  // OpenJD refuses overlapping parts and empty parts, so the panel does too.
+  result.openjdCounts = ["1-3,2", "2,2", "1-5:2,2", "1,,2", "1,", "3,1", "1-5:2,6"].map(ui.countRange);
+  result.tasks = ui.taskCount(sources, (item) => item.range);
+  result.previews = ["2-5", "0", "x", "3,1"].map((value) => ui.itemsPreview(sources[1], value));
+  // A field holds item numbers from 1 to the list's count, or 0 to run that list whole in each task.
+  result.listCounts = ["1-3", "2,3", "0", "2-5", "-1", "0,1", "1-3:2", "1-4:3"].map((value) =>
+    ui.taskCount([sources[0]], () => value)
+  );
+  // The panel sends each field's range as its job parameter, and won't submit a bad one.
+  state.plan.sources = sources;
+  state.plan.parameters = sources.map(({ parameter, range }) => ({
+    name: parameter,
+    type: "STRING",
+    default: range,
+    userInterface: { groupLabel: "Tasks" },
+  }));
+  state.edits.Folder2Items = "x";
+  result.canSubmitBadRange = Boolean(ui.canSubmit());
+  state.edits.Folder2Items = "1-2";
+  result.canSubmit = Boolean(ui.canSubmit());
+  await ui.submit();
+  await settle();
+  result.parameters = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body.parameters;
+  result.splitRequest = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body.splitTasks;
+  // One task: the job gets no list parameters, and the panel says not to split.
+  state.submission = null;
+  ui.setSplit(false);
+  result.wholeTasks = ui.taskCount(sources, (item) => state.edits[item.parameter] ?? item.range);
+  await ui.submit();
+  await settle();
+  const whole = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body;
+  result.wholeParameters = whole.parameters;
+  result.wholeRequest = whole.splitTasks;
+  ui.setSplit(true);
+  result.splitAgain = ui.taskCount(sources, (item) => state.edits[item.parameter] ?? item.range);
+  // An edit follows its list until the list's items change.
+  state.submission = null;
+  const replan = async (values) => {
+    api.handlers["/deadline/plan"] = async (body) => ({
+      ...planFor(body),
+      sources: [source("List1", "list", values)],
+    });
+    await ui.loadPlan(true);
+    return state.edits.List1Items ?? null;
+  };
+  await replan(["fox", "cat", "owl"]);
+  state.edits.List1Items = "2";
+  state.itemEditBases.List1Items = ui.__itemEditBase(state.plan.sources[0]);
+  result.editKept = await replan(["fox", "cat", "owl"]);
+  result.editAfterChange = await replan(["fox", "cat", "hare"]);
+  // Each workflow keeps its own choice: switching back to one keeps Multiple tasks, and another
+  // workflow starts as one task.
+  ui.setSplit(true);
+  ui.workflowLoaded();
+  result.splitWhileLoading = ui.splitsTasks();
+  await ui.loadPlan(true);
+  result.splitAfterSwitch = ui.splitsTasks();
+  api.handlers["/deadline/plan"] = async (body) => ({ ...planFor(body), name: "hare" });
+  ui.workflowLoaded();
+  await ui.loadPlan(true);
+  result.splitOtherWorkflow = ui.splitsTasks();
+} else if (scenario.startsWith("value-pairs")) {
+  // Width and Height are paired, so they run together, and Seed runs with each pair.
+  const source = (name, pairWith, count, kind = "integer") => ({
+    name,
+    parameter: `${name}Items`,
+    label: name,
+    title: name,
+    kind,
+    values: [],
+    count,
+    range: `1-${count}`,
+    pairWith,
+  });
+  const sources = [source("Width", "frame", 3), source("Height", "frame", 3), source("Seed", "", 4)];
+  result.counts = ["1-4", "1-20:2", "7, 42, 99", "4-1", "x", "0", ""].map(ui.countRange);
+  result.tasks = ui.taskCount(sources, (item) => item.range);
+  result.pairErrors = ui
+    .taskGroups(sources, (item) => (item.name === "Height" ? "1-2" : item.range))
+    .map(({ error }) => error);
+  // An Integer Values field holds the numbers themselves, which can be any numbers.
+  result.integerCounts = ["-3--1", "0", "7, 42", "4-1", "1," + "9".repeat(21)].map((value) =>
+    ui.taskCount([sources[2]], () => value)
+  );
+  const words = { ...source("Words", "", 5, "string"), values: ["a", "b", "c", "d", "e"] };
+  result.previews = ["2-5", "0", "x"].map((value) => ui.itemsPreview(words, value));
+  // The panel sends each field's range as its job parameter, and won't submit a bad one.
+  state.plan.sources = sources;
+  state.plan.parameters = sources.map(({ parameter, range }) => ({
+    name: parameter,
+    type: "STRING",
+    default: range,
+    userInterface: { groupLabel: "Tasks" },
+  }));
+  state.edits.SeedItems = "x";
+  result.canSubmitBadRange = Boolean(ui.canSubmit());
+  state.edits.SeedItems = "1-2";
+  result.canSubmit = Boolean(ui.canSubmit());
+  await ui.submit();
+  await settle();
+  result.parameters = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body.parameters;
+}
+if (scenario === "value-node-one-task") {
+  // In One task, a value node still runs its items as tasks, and a Create List runs whole.
+  const source = (name, kind, count) => ({
+    name,
+    parameter: `${name}Items`,
+    label: name,
+    title: name,
+    kind,
+    values: [],
+    count,
+    range: `1-${count}`,
+    pairWith: "",
+  });
+  const sources = [source("String10", "string", 3), source("List11", "list", 2)];
+  state.plan.sources = sources;
+  state.plan.parameters = sources.map(({ parameter, range }) => ({
+    name: parameter,
+    type: "STRING",
+    default: range,
+    userInterface: { groupLabel: "Tasks" },
+  }));
+  result.split = ui.splitsTasks();
+  result.splitsSource = sources.map(ui.splitsSource);
+  result.tasks = ui.taskCount(sources, (item) => item.range);
+  await ui.submit();
+  await settle();
+  const body = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body;
+  result.parameters = body.parameters;
+  result.splitTasks = body.splitTasks;
+}
+if (scenario === "parse-bool") {
+  // The panel reads a BOOL parameter as OpenJD and the submitter do.
+  result.values = [true, "true", "Yes", " ON ", "1", 1, false, "FALSE", "no", "off", "0", 0, "", "garbage", 2].map(
+    ui.parseBool
+  );
+}
+if (scenario === "item-range-contract") {
+  // The cases that test_submit.py also checks against the submitter's check_item_range.
+  const { readFileSync } = await import("node:fs");
+  const cases = JSON.parse(readFileSync(new URL("./item_ranges.json", import.meta.url), "utf8"));
+  ui.setSplit(true);
+  const list = { name: "List5", parameter: "List5Items", label: "List5", title: "List5", kind: "list" };
+  result.counts = cases.map(({ value, items }) =>
+    ui.taskCount([{ ...list, values: [], count: items, range: `1-${items}` }], () => value)
+  );
 }
 console.log(JSON.stringify(result));
 process.exit(0);

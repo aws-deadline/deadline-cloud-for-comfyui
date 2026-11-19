@@ -7,26 +7,28 @@
 
 A ComfyUI extension that submits the open workflow to [AWS Deadline Cloud](https://aws.amazon.com/deadline-cloud/),
 from a **Deadline** panel and dialog inside ComfyUI. The job runs the workflow on Deadline Cloud
-GPU workers, with the models and input files it uses attached to the job.
+GPU workers, with the models, input files and custom nodes it uses attached to the job.
 
 ## What it adds
 
 - A **Deadline** tab in ComfyUI's sidebar, with:
   - your login status, with **Log in** for Deadline Cloud monitor profiles
   - the farm, queue and storage profile, saved as your Deadline Cloud defaults
+  - the workflow's [items to run as tasks](#splitting-a-workflow-into-tasks), with the number of
+    tasks as you change them or the workflow
   - job settings: name, description, priority, initial state, max failed tasks, retries and
     workers, how workers read attachments, and whether every input path has to exist
   - [host requirements](#host-requirements), starting from the job template's
   - the job template's parameters, such as Workflow Timeout, and the queue's, such as Conda Channels
-  - the input files and folders, and the models, to attach, which you can remove, or add to with a
-    file dialog on the ComfyUI machine
+  - the input files and folders, models and custom nodes to attach. You can remove files, folders
+    and models, or add more with a file dialog on the ComfyUI machine
   - upload progress, the status of your recent jobs, and **Download** for their outputs, which
     go back into the output directory they were submitted with. Each job shows that directory.
   - **Save job bundle**, which creates the job bundle without submitting it, to submit later with
     `deadline bundle submit`. The bundle keeps the parameters, host requirements, priority,
     initial state, and the failed task, retry and worker limits. Pass the job name with `--name`.
 - A **Deadline** button next to **Run**, and **Workflow > Submit to Deadline Cloud…**, which open a
-  short dialog: farm, queue and **Submit**.
+  short dialog: farm, queue, tasks and **Submit**.
 
 When you submit, the extension:
 
@@ -46,6 +48,7 @@ When you submit, the extension:
    | Output Directory | ComfyUI's output directory |
    | Input Directory | ComfyUI's input directory, so load nodes on the worker find the attached input files |
    | Model Directory | The bundle's folder of attached models, so ComfyUI on the worker finds them |
+   | Custom Nodes Directory | The bundle's folder of attached custom node packs |
 
 4. Shows the hashing and upload progress, asks you to confirm when Deadline Cloud would (for
    example, to upload files outside the storage profile), and then shows the job ID.
@@ -134,7 +137,7 @@ the environment that starts ComfyUI.
 | `COMFYUI_DEADLINE_CLI` | `deadline_cli` in the config, then `deadline` on the `PATH` | The Deadline Cloud CLI executable. |
 | `COMFYUI_DEADLINE_CONDA_CHANNELS` | `conda_channels` in the config | Optional **Conda Channels** to fill in. When neither is set, the queue's default, the Deadline Cloud channels, is used. |
 | `COMFYUI_DEADLINE_CONFIG` | `deadline_cloud_submitter.json` in the extension folder | Another config file to read. |
-| `COMFYUI_DEADLINE_JOB_TEMPLATE` | The extension's job template | A job template file, YAML or JSON, to submit instead, such as your studio's version of the extension's template. It needs the same parameters, such as `WorkflowFile`, `InputDir` and `OutputDir`. Local models are attached only when the template also defines `ModelDirectory`, and it has to point ComfyUI at that folder. The extension's template does. |
+| `COMFYUI_DEADLINE_JOB_TEMPLATE` | The extension's job template | A job template file, YAML or JSON, to submit instead, such as your studio's version of the extension's template. It needs the same parameters, such as `WorkflowFile`, `InputDir` and `OutputDir`. Local models are attached only when the template also defines `ModelDirectory`, and it has to point ComfyUI at that folder. Custom node packs are attached only when the template defines `CustomNodesDirectory`, and it has to add that folder to ComfyUI's `custom_nodes` paths. The extension's template does both. A template whose task script has an `ITEMS = {}` line runs its lists as tasks like the extension's job. |
 | `COMFYUI_DEADLINE_ALLOW_REMOTE` | unset | Set it to `1` to accept submit requests from browsers on other machines or through a reverse proxy. See [Security](#security) first. |
 
 ## The job
@@ -153,8 +156,10 @@ Each task runs the workflow for up to **Workflow Timeout**, an hour by default. 
 waits that long for ComfyUI to report progress, since loading a large model can take minutes
 without any. Raise it for long video workflows.
 
-The job runs the workflow once, as one task. Input files and models are attached to the job,
-uploaded from this machine. The workers have to provide the custom nodes:
+The job runs as one task, or a task for each combination of the workflow's
+[items](#splitting-a-workflow-into-tasks), and when you split them, the submitter adds their
+parameters to its copy of the template. Workers get everything the workflow uses as job attachments,
+uploaded from this machine:
 
 - **Input files.** The submitter lists the files in ComfyUI's input directory that the workflow
   loads, such as Load Image's image, in the job bundle's `asset_references.yaml`, with the whole
@@ -173,10 +178,86 @@ uploaded from this machine. The workers have to provide the custom nodes:
   **Attachments** lists the models it will attach. The panel lists each model by its folder and
   name, such as `loras/style.safetensors`, since two folders can hold files of the same name. Remove
   one with its **✕** when the workers already have it, and it isn't uploaded.
-- **Custom nodes.** Workers load the custom nodes in the job's conda environment, such as a
-  custom nodes conda package added to **Conda Packages**, or in a `custom_nodes` folder that
-  **Extra Model Paths Config** lists. The job fails with the import error when a custom node
-  doesn't load.
+- **Custom nodes.** The submitter attaches the custom node pack of every custom node the workflow
+  runs, however it was installed: from the Comfy Registry, a git checkout or your studio's own. It
+  takes each pack from the folder ComfyUI loaded it from and places it under **Custom Nodes
+  Directory**, without its `.git`, `__pycache__` or virtual environment folders. A single-file
+  custom node is attached as its one `.py` file. On the worker, ComfyUI loads the packs from where
+  they're mapped, and the job installs each pack's `requirements.txt` into a virtual environment
+  layered on the conda environment, which they can't change. When a pack's files can't be found
+  on this machine, the panel warns about it. The job fails with the import error when a custom
+  node doesn't load.
+
+  Turn off **Attach Custom Nodes** when the workers already provide every custom node and its
+  dependencies, such as through a custom nodes conda package added to **Conda Packages**, or a
+  `custom_nodes` folder that **Extra Model Paths Config** lists. The job then ignores **Custom
+  Nodes Directory**, and the panel doesn't upload the packs it lists under **Attachments**.
+
+## Splitting a workflow into tasks
+
+A workflow runs as one task by default, as ComfyUI does locally, with each list's items in that
+task. To run them as separate tasks, choose **Multiple tasks** in the panel's **Tasks** section. The
+submitter then gives each source of items below a task parameter and a field, and the job runs a
+task for each combination of them. The Deadline value nodes always run their items as separate
+tasks, since that's what they're for, so a workflow with one doesn't need **Multiple tasks**:
+
+| In the workflow | One task per | Field by default |
+|---|---|---|
+| **Deadline String Values** node | Line of text, or text between lines of `---` | Every value, such as `1-3` |
+| **Deadline Integer Values** node | Number, such as `1-100`, `1-20:2` or `7, 42, 99` | The node's numbers |
+| **Deadline Image Values** node | Image in a folder of ComfyUI's input directory, in name order | Every image |
+| **Create List** | Item wired into it | Every item |
+| **Load Image (from Folder)** | Image in its folder, in name order | Every image |
+
+Each combination of the fields runs as one task. A Create List with 3 items and a Deadline Integer
+Values node with `1-4` make 12 tasks. The panel shows the count as you change them, such as
+"3 × 4 = 12 tasks". Lists can have different numbers of items. Each task adds its items to the Save
+nodes' file names, such as `_List64-3_Seed-42`. A split folder's task loads its one image with
+**Load Image**, which applies the image's EXIF rotation and loads every frame of an animated image,
+unlike the folder loader.
+
+In the panel, narrow a field to run only some of its items, such as `2,3`. Set a Create List's or
+folder's field to `0` to run that list whole in each task while the other lists split. A step can
+have at most 16 task parameters. Value nodes take the first of them, and a workflow can have at most
+16 value nodes with more than one item. Lists and folders past the first 16 fields run whole in one
+task, and the panel warns about them.
+The number in a label such as **Create List #64** is the node's ID, which ComfyUI shows with
+**Settings > Lite Graph > Node ID badge**. Lists that a workflow builds while it runs, such as
+Rebatch Images, always run whole in one task, because Deadline Cloud sets a job's tasks when you
+submit it. Wire single values, such as prompts or numbers, into a Create List. If one of its inputs
+is a list itself, ComfyUI runs each of that list's items, so the panel's count is wrong.
+
+Each list's task parameter is named after its node: `List64` for Create List #64, `Folder7` for a
+folder loader or `Integer5` for Deadline Integer Values #5. Rename the node, such as to **Subject**,
+and that name is used instead: the **Subject** column in Deadline Cloud monitor, the
+**SubjectItems** job parameter and the `_Subject-2` suffix on output files. A list whose name
+another list already has gets its node ID added, such as `Subject_70`.
+
+The value nodes connect to any input of their type: a prompt or LoRA name, a seed or steps, an
+image. In ComfyUI each outputs its **preview_item**. The job replaces each with the task's value, so
+workers don't need this extension. An Integer node's field holds its numbers, so Deadline Cloud
+monitor shows each task's number. Other fields hold item numbers, and so does a paired Integer
+node's, so that its numbers stay in the order you typed them. Each value of a String Values node
+that's a model file, such as one LoRA per task, is attached like any other model.
+
+A String Values node takes one value per line. For values longer than a line, such as prompts with
+paragraphs, set its **split_by** to `--- lines` and put a line of `---` between the values:
+
+```
+a red fox in the snow
+---
+a cat on a windowsill at dawn.
+
+Soft light, film grain.
+```
+
+The panel previews each value by its first line.
+
+To run value nodes' items together rather than in every combination, give them the same
+**pair_with**, such as a prompt list and a LoRA list that go together. Paired nodes need the same
+number of items, and each task runs the items at one position across the paired lists. A paired
+Integer node can repeat a number, such as Width `768,512,512` paired with Height `512,512,768`.
+Paired nodes with different numbers of items run every combination, with a warning.
 
 ## Host requirements
 
@@ -232,10 +313,14 @@ the same machine.
 - Job bundles in `ComfyUI/user/deadline_submissions/` hold your workflows, prompts and file paths.
   On Linux and macOS that folder and each bundle in it can only be opened by the user that runs
   ComfyUI (mode `0700`), and the files the extension writes there can only be read by that user
-  (`0600`), whatever the umask. Models staged in a bundle are often links to your files, so
-  their permissions stay as they are, but they can only be reached through the bundle, which is
-  deleted once its job is created. On Windows, bundles inherit the permissions of the ComfyUI
+  (`0600`), whatever the umask. Models and custom nodes staged in a bundle are often links to
+  your files and keep their permissions, but they can only be reached through the bundle, which
+  is deleted once its job is created. On Windows, bundles inherit the permissions of the ComfyUI
   user folder. The `deadline_cloud_submitter.json` config file is also `0600`.
+- Custom node packs are uploaded with their files to the queue's job attachments bucket, where
+  anyone who can use the queue can read them. Credential files, such as `.env`, `*.key` and `*.pem`,
+  are left out. A pack's settings files, such as `config.json`, are attached as they are, so keep
+  API keys in environment variables on the workers instead.
 
 **Sharing a server.** `COMFYUI_DEADLINE_ALLOW_REMOTE=1` turns off the local-only check, including
 for requests through a proxy. Only set it when every person who can reach ComfyUI may submit with
@@ -249,9 +334,9 @@ don't check who's calling.
 - Adding attachments opens a file dialog on the ComfyUI machine's desktop: osascript on macOS,
   PowerShell on Windows and zenity on Linux.
 - Deadline Cloud monitor login opens on the ComfyUI server's desktop, not in the browser.
-- Each job runs the workflow once. To render variations, such as two seeds, submit a job for
-  each.
-- Custom nodes aren't attached. The workers have to provide them.
+- Custom nodes are attached from this machine. Each job uploads your local copy, and the worker
+  runs it. A single-file node's own imports still have to exist on the worker, since it has no
+  `requirements.txt` to install.
 - The workflow must have at least one Save node, such as **SaveImage**.
 
 ## Development

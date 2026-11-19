@@ -21,4 +21,12 @@ try:
 except Exception:  # Never break ComfyUI startup.
     logger.exception("Deadline Cloud Submitter: failed to register the /deadline routes")
 
+try:
+    from deadline.comfyui_submitter import nodes
+
+    NODE_CLASS_MAPPINGS.update(nodes.NODE_CLASS_MAPPINGS)
+    NODE_DISPLAY_NAME_MAPPINGS.update(nodes.NODE_DISPLAY_NAME_MAPPINGS)
+except Exception:  # Never break ComfyUI startup.
+    logger.exception("Deadline Cloud Submitter: failed to register the Deadline value nodes")
+
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]

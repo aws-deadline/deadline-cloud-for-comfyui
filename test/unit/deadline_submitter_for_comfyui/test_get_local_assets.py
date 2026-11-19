@@ -1,5 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+import os
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -12,6 +14,7 @@ from deadline.comfyui_submitter.get_local_assets import (
     find_workflow_local_models,
     get_local_assets,
     stage_local_models,
+    stage_local_node_packs,
     write_asset_references,
 )
 from deadline.comfyui_submitter.submit import MODEL_EXTENSIONS
@@ -229,6 +232,80 @@ def test_stage_local_models_uses_comfy_folder_layout(comfy, tmp_path):
     assert expected.read_bytes() == source.read_bytes()
     assert expected.stat().st_ino == source.stat().st_ino
     assert not (dest / "checkpoints" / "secret.safetensors").exists()
+
+
+def test_stage_local_node_packs_copies_the_pack_code(comfy, tmp_path):
+    pack = comfy["custom_nodes"] / "studio-nodes"
+    init = touch(pack / "__init__.py")
+    touch(pack / "nodes" / "resize.py")
+    touch(pack / "requirements.txt")
+    for skipped in (
+        ".git/HEAD",
+        "__pycache__/x.pyc",
+        "nodes/old.pyc",
+        ".venv/lib/x.py",
+        "node_modules/pkg/index.js",
+    ):
+        touch(pack / skipped)
+    touch(pack / ".venv" / "pyvenv.cfg")
+    dest = tmp_path / "local_nodes"
+    staged = stage_local_node_packs({"studio-nodes": pack}, dest)
+    assert staged == {"studio-nodes": dest / "studio-nodes"}
+    files = sorted(p.relative_to(dest).as_posix() for p in dest.rglob("*") if p.is_file())
+    assert files == [
+        "studio-nodes/__init__.py",
+        "studio-nodes/nodes/resize.py",
+        "studio-nodes/requirements.txt",
+    ]
+    assert (dest / "studio-nodes" / "__init__.py").stat().st_ino == init.stat().st_ino
+
+
+def test_stage_local_node_packs_links_a_single_file_node(comfy, tmp_path):
+    source = touch(comfy["custom_nodes"] / "single.py")
+    dest = tmp_path / "local_nodes"
+    staged = stage_local_node_packs({"single.py": source}, dest)
+    assert staged == {"single.py": dest / "single.py"}
+    assert (dest / "single.py").stat().st_ino == source.stat().st_ino
+
+
+def test_stage_local_node_packs_refuses_unsafe_names_and_missing_folders(comfy, tmp_path):
+    pack = comfy["custom_nodes"] / "pack"
+    touch(pack / "__init__.py")
+    script = touch(comfy["custom_nodes"] / "single.py")
+    notes = touch(comfy["custom_nodes"] / "notes.txt")
+    dest = tmp_path / "local_nodes"
+    staged = stage_local_node_packs(
+        {
+            "..": pack,
+            "a/b": pack,
+            "": pack,
+            "gone": comfy["custom_nodes"] / "gone",
+            "renamed.py": script,  # The key must be the file's own name.
+            "notes.txt": notes,  # Only .py files are attached.
+        },
+        dest,
+    )
+    assert staged == {}
+    assert not dest.exists()
+
+
+def test_stage_local_node_packs_skips_a_pack_that_cannot_be_copied(comfy, tmp_path, monkeypatch):
+    kept = comfy["custom_nodes"] / "kept"
+    touch(kept / "__init__.py")
+    dropped = comfy["custom_nodes"] / "dropped"
+    touch(dropped / "__init__.py")
+    copy_tree = shutil.copytree
+
+    def fail_copy(source, target, **kwargs):
+        if Path(source).name == "dropped":
+            raise OSError("disk full")
+        return copy_tree(source, target, **kwargs)
+
+    monkeypatch.setattr("deadline.comfyui_submitter.get_local_assets.shutil.copytree", fail_copy)
+    dest = tmp_path / "local_nodes"
+    staged = stage_local_node_packs({"kept": kept, "dropped": dropped}, dest)
+    assert staged == {"kept": dest / "kept"}
+    assert not (dest / "dropped").exists()
 
 
 def test_find_workflow_local_models_reads_extensions_under_nodes(tmp_path):
@@ -458,3 +535,158 @@ def test_models_with_the_same_name_in_different_folders_are_each_attached(tmp_pa
         "checkpoints/shared.safetensors": dest / "checkpoints" / "shared.safetensors",
         "loras/shared.safetensors": dest / "loras" / "shared.safetensors",
     }
+
+
+def test_stage_local_node_packs_leaves_out_files_that_can_hold_credentials(comfy, tmp_path, caplog):
+    """An API-backed pack can keep its keys in its folder, and anyone who can use the queue can
+    read job attachments."""
+    pack = comfy["custom_nodes"] / "api-nodes"
+    # The pack's own code stays, even when it's named like a credentials file.
+    kept_files = (
+        "__init__.py",
+        "config.json",
+        "keys/README.md",
+        ".env.py/__init__.py",
+        "credentials.py",
+        "auth/Credentials.py",
+        "auth/.env.py",
+        "web/credentials.js",
+    )
+    for kept in kept_files:
+        touch(pack / kept)
+    for secret in (
+        ".env",
+        ".env.local",
+        "certs/client.pem",
+        "api.KEY",
+        "credentials",
+        "credentials.json",
+        "credentials.cfg",
+        "auth/Credentials.TXT",
+        "secrets.json",
+    ):
+        touch(pack / secret)
+    dest = tmp_path / "local_nodes"
+    stage_local_node_packs({"api-nodes": pack}, dest)
+    files = sorted(
+        p.relative_to(dest / "api-nodes").as_posix() for p in dest.rglob("*") if p.is_file()
+    )
+    assert files == sorted(kept_files)
+    assert "can hold credentials" in caplog.text
+
+
+def _symlink(link: Path, target: Path) -> None:
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(target, target_is_directory=target.is_dir())
+    except OSError:
+        pytest.skip("This system can't create symbolic links.")
+
+
+def _staged_files(dest: Path, name: str) -> list[str]:
+    return sorted(
+        p.relative_to(dest / name).as_posix() for p in (dest / name).rglob("*") if p.is_file()
+    )
+
+
+def test_stage_local_node_packs_keeps_links_inside_the_pack_only(comfy, tmp_path, caplog):
+    """A link's content is attached, so a link out of the pack, or to a credentials file, isn't."""
+    pack = comfy["custom_nodes"] / "linked-nodes"
+    touch(pack / "__init__.py")
+    touch(pack / "data" / "styles.csv")
+    touch(pack / ".env")
+    outside = touch(tmp_path / "home" / "secret.txt")
+    touch(tmp_path / "shared" / "models" / "big.safetensors")
+    _symlink(pack / "notes.txt", outside)
+    _symlink(pack / "models", tmp_path / "shared" / "models")
+    _symlink(pack / "config.txt", pack / ".env")
+    _symlink(pack / "styles.csv", pack / "data" / "styles.csv")
+    _symlink(pack / "data" / "loop", pack)
+    dest = tmp_path / "local_nodes"
+    stage_local_node_packs({"linked-nodes": pack}, dest)
+    assert _staged_files(dest, "linked-nodes") == ["__init__.py", "data/styles.csv", "styles.csv"]
+    assert caplog.text.count("it links outside the pack") == 2
+    assert "config.txt out of the job: it can hold credentials" in caplog.text
+    assert "it links to a folder that holds it" in caplog.text
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Named pipes are POSIX only.")
+def test_stage_local_node_packs_leaves_out_special_files(comfy, tmp_path, caplog):
+    """Copying a named pipe would wait for a writer forever."""
+    pack = comfy["custom_nodes"] / "pipe-nodes"
+    touch(pack / "__init__.py")
+    # Windows has no os.mkfifo, and mypy checks this file for Windows too.
+    if sys.platform != "win32":
+        os.mkfifo(pack / "events")
+    dest = tmp_path / "local_nodes"
+    stage_local_node_packs({"pipe-nodes": pack}, dest)
+    assert _staged_files(dest, "pipe-nodes") == ["__init__.py"]
+    assert "events out of the job: it isn't a file or a folder" in caplog.text
+
+
+def test_stage_local_node_packs_links_the_file_a_link_points_to(comfy, tmp_path, monkeypatch):
+    """Windows would hard link the link itself, so the bundle would hold a link, not the file."""
+    pack = comfy["custom_nodes"] / "linked-nodes"
+    nodes = touch(pack / "nodes.py")
+    _symlink(pack / "nodes_link.py", nodes)
+    linked = []
+    real_link = os.link
+
+    def link(source, target):
+        linked.append((Path(source), Path(target).name))
+        real_link(source, target)
+
+    monkeypatch.setattr("deadline.comfyui_submitter.get_local_assets.os.link", link)
+    stage_local_node_packs({"linked-nodes": pack}, tmp_path / "local_nodes")
+    assert sorted(linked, key=lambda item: item[1]) == [
+        (nodes.resolve(), "nodes.py"),
+        (nodes.resolve(), "nodes_link.py"),
+    ]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Directory junctions are Windows only.")
+def test_stage_local_node_packs_leaves_out_junctions_outside_the_pack(comfy, tmp_path, caplog):
+    """Python doesn't count a directory junction as a symbolic link, so it's resolved as well."""
+    pack = comfy["custom_nodes"] / "junction-nodes"
+    touch(pack / "__init__.py")
+    shared = tmp_path / "shared" / "models"
+    touch(shared / "big.safetensors")
+    if sys.platform == "win32":
+        import _winapi
+
+        _winapi.CreateJunction(str(shared), str(pack / "models"))
+    dest = tmp_path / "local_nodes"
+    stage_local_node_packs({"junction-nodes": pack}, dest)
+    assert _staged_files(dest, "junction-nodes") == ["__init__.py"]
+    assert "models out of the job: it links outside the pack" in caplog.text
+
+
+def test_stage_local_node_packs_follows_a_pack_that_is_a_link(comfy, tmp_path):
+    """A pack installed as a link to a checkout elsewhere is attached from the checkout."""
+    checkout = tmp_path / "dev" / "studio-nodes"
+    touch(checkout / "__init__.py")
+    touch(checkout / "nodes" / "fox.py")
+    _symlink(comfy["custom_nodes"] / "studio-nodes", checkout)
+    dest = tmp_path / "local_nodes"
+    stage_local_node_packs({"studio-nodes": comfy["custom_nodes"] / "studio-nodes"}, dest)
+    assert _staged_files(dest, "studio-nodes") == ["__init__.py", "nodes/fox.py"]
+
+
+def test_stage_local_node_packs_warns_when_it_copies_a_file(comfy, tmp_path, monkeypatch, caplog):
+    """A copy, such as of a pack on another drive, takes time and space, so it's logged."""
+    pack = comfy["custom_nodes"] / "studio-nodes"
+    touch(pack / "__init__.py")
+    touch(pack / "nodes.py")
+
+    def fail_link(source, target):
+        raise OSError("Invalid cross-device link")
+
+    monkeypatch.setattr("deadline.comfyui_submitter.get_local_assets.os.link", fail_link)
+    dest = tmp_path / "local_nodes"
+    assert stage_local_node_packs({"studio-nodes": pack}, dest) == {
+        "studio-nodes": dest / "studio-nodes"
+    }
+    assert (dest / "studio-nodes" / "__init__.py").is_file()
+    # Once for the pack, not for each file.
+    [record] = [r for r in caplog.records if "Copied" in r.getMessage()]
+    assert "Copied 2 files of custom node pack 'studio-nodes'" in record.getMessage()

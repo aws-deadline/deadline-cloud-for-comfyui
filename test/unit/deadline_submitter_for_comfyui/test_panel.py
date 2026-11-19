@@ -48,6 +48,7 @@ def _run_scenario(tmp_path: Path, ui_source: str, scenario: str) -> dict:
     for name in ("app.js", "api.js"):
         shutil.copy(PANEL / name, tmp_path / "scripts" / name)
     shutil.copy(PANEL / "harness.mjs", tmp_path / "harness.mjs")
+    shutil.copy(PANEL / "item_ranges.json", tmp_path / "item_ranges.json")
     web = tmp_path / "extension" / "web"
     web.mkdir(parents=True)
     # The harness reads the panel's state, and what a queue field shows, through these exports,
@@ -57,7 +58,7 @@ def _run_scenario(tmp_path: Path, ui_source: str, scenario: str) -> dict:
         "\nexport { state as __state, queueParameterValue as __queueParameterValue,"
         " parameterControl as __parameterControl, RENDERERS as __renderers,"
         " pollJobs as __pollJobs, formFromRequirements as __formFromRequirements,"
-        " requirementsFromForm as __requirementsFromForm };\n"
+        " requirementsFromForm as __requirementsFromForm, itemEditBase as __itemEditBase };\n"
     )
     (web / "deadline_ui.js").write_text(ui_source + exports, encoding="utf-8")
     (tmp_path / "package.json").write_text('{"type": "module"}')
@@ -201,3 +202,76 @@ def test_a_submitted_job_remembers_where_its_outputs_download_to(run_scenario):
 )
 def test_a_finished_download_says_where_the_files_are(run_scenario, scenario, destination):
     assert run_scenario(scenario)["toasts"] == [f"Downloaded 2 files from fox {destination}."]
+
+
+def test_bool_parameters_are_read_as_openjd_reads_them(run_scenario):
+    """So the Attach Custom Nodes checkbox and the attachments agree with what the job does."""
+    assert run_scenario("parse-bool")["values"] == [True] * 6 + [False] * 6 + [None] * 3
+
+
+def test_task_lists_count_tasks_and_send_their_ranges(run_scenario):
+    result = run_scenario("task-lists")
+    # OpenJD ranges, as the job's task parameters take them. "0" runs a list whole, as one item.
+    assert result["counts"] == [4, 10, 3, None, None, 1, None]
+    # Every combination: 3 list items × 5 images.
+    assert result["tasks"] == 15
+    # Previews follow the order the tasks run in.
+    assert result["previews"] == [
+        "b.png, c.png, d.png, …",
+        "All of them, in each task",
+        "",
+        "a.png, c.png",
+    ]
+    # A 3-item list: numbers past the end or below 1 can't be submitted. 0 runs it whole.
+    assert result["listCounts"] == [3, 2, 1, None, None, None, 2, None]
+    assert result["openjdCounts"] == [None, None, None, None, None, 2, 4]
+    assert result["splitByDefault"] is False
+    assert result["splitRequest"] is True
+    # One task: no list parameters, and the edited ranges come back when splitting again.
+    assert result["wholeTasks"] == 1
+    assert result["wholeParameters"] == {}
+    assert result["wholeRequest"] is False
+    assert result["splitAgain"] == 6
+    assert result["editKept"] == "2"
+    assert result["editAfterChange"] is None
+    assert result["splitWhileLoading"] is False
+    assert result["splitAfterSwitch"] is True
+    assert result["splitOtherWorkflow"] is False
+    assert result["canSubmitBadRange"] is False
+    assert result["canSubmit"] is True
+    assert result["parameters"] == {"List1Items": "1-3", "Folder2Items": "1-2"}
+
+
+def test_list_fields_take_the_same_ranges_as_the_submitter(run_scenario):
+    """item_ranges.json is shared with test_submit.py, so the panel and the submitter agree."""
+    cases = json.loads((PANEL / "item_ranges.json").read_text())
+    assert run_scenario("item-range-contract")["counts"] == [case["count"] for case in cases]
+
+
+def test_paired_value_nodes_count_once_and_send_their_ranges(run_scenario):
+    result = run_scenario("value-pairs")
+    # OpenJD ranges, as the job's task parameters take them. "0" runs a list whole, as one item.
+    assert result["counts"] == [4, 10, 3, None, None, 1, None]
+    # Paired fields count once: 3 frame sizes × 4 seeds.
+    assert result["tasks"] == 12
+    assert result["pairErrors"] == [
+        "Paired fields need the same number of items: Width has 3, Height has 2.",
+        None,
+    ]
+    # 0 is a number, such as a seed, and numbers have at most 20 digits, as in the submitter.
+    assert result["integerCounts"] == [3, 1, 2, None, None]
+    # A value node has no whole list to run, so "0" isn't one of its items.
+    assert result["previews"] == ["b, c, d, …", "", ""]
+    assert result["canSubmitBadRange"] is False
+    assert result["canSubmit"] is True
+    assert result["parameters"] == {"WidthItems": "1-3", "HeightItems": "1-3", "SeedItems": "1-2"}
+
+
+def test_value_nodes_run_as_tasks_when_the_workflow_runs_as_one(run_scenario):
+    """In ComfyUI a value node outputs only its preview item, so One task only covers the lists."""
+    result = run_scenario("value-node-one-task")
+    assert result["split"] is False
+    assert result["splitsSource"] == [True, False]
+    assert result["tasks"] == 3
+    assert result["parameters"] == {"String10Items": "1-3"}
+    assert result["splitTasks"] is False
