@@ -3,11 +3,14 @@
 Finds the local files an API-format ComfyUI workflow reads (input images, videos, audio and so on,
 but not custom nodes) and writes them to a job bundle's asset_references.yaml. Model files are
 not part of that scan. A model the workflow loads is staged into the job's model directory and
-attached from there.
+attached from there. A custom node pack the workflow uses is staged into the job's custom nodes
+directory in the same way.
 """
 
 from __future__ import annotations
 
+import fnmatch
+import functools
 import json
 import logging
 import os
@@ -200,6 +203,154 @@ def stage_local_models(
             logger.exception("Couldn't stage model %r from %s", name, source)
             continue
         staged[key] = target
+    return dict(sorted(staged.items()))
+
+
+# Left out of staged node packs: version control, caches and Python virtual environments.
+_SKIPPED_NODE_DIRS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        "node_modules",
+    }
+)
+
+
+# Left out of staged node packs: files that usually hold credentials, such as an API-backed
+# pack's keys. Job attachments can be read by anyone who can use the queue. Settings files such
+# as config.json are kept, since packs need them to run.
+_SECRET_NODE_FILES = (
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "id_rsa",
+    "id_ecdsa",
+    "id_ed25519",
+    ".netrc",
+    "credentials",
+    "credentials.*",
+    "secrets.json",
+    "secrets.toml",
+    "secrets.yaml",
+    "secrets.yml",
+)
+
+
+_NODE_CODE_SUFFIXES = (".py", ".pyi", ".js", ".mjs")
+
+
+def _is_secret_node_file(name: str) -> bool:
+    name = name.lower()
+    # A code file is the pack's own, such as a credentials.py that its nodes import, or its web
+    # extension's JavaScript.
+    if name.endswith(_NODE_CODE_SUFFIXES):
+        return False
+    return any(fnmatch.fnmatch(name, pattern) for pattern in _SECRET_NODE_FILES)
+
+
+def _ignore_node_files(root: Path, directory: str, names: list[str]) -> set[str]:
+    """
+    The entries of a pack's folder to leave out of the job. root is the pack's folder, resolved.
+    copytree follows links, so an entry is attached only when it resolves inside the pack, and is
+    checked for credentials by its target's name as well as its own. Every entry is resolved, not
+    only symbolic links, since Python doesn't count a Windows directory junction as one.
+    """
+    ignored = set()
+    for name in names:
+        path = Path(directory, name)
+        if name in _SKIPPED_NODE_DIRS or name.endswith(".pyc") or (path / "pyvenv.cfg").is_file():
+            ignored.add(name)
+            continue
+        target = path.resolve()
+        if not target.is_relative_to(root):
+            logger.warning("Leaving %s out of the job: it links outside the pack", path)
+            ignored.add(name)
+        elif target.is_dir() and Path(directory).resolve().is_relative_to(target):
+            logger.warning("Leaving %s out of the job: it links to a folder that holds it", path)
+            ignored.add(name)
+        elif not (path.is_file() or path.is_dir()):
+            # Such as a named pipe, which would block the copy, or a link to nothing.
+            logger.warning("Leaving %s out of the job: it isn't a file or a folder", path)
+            ignored.add(name)
+        elif path.is_file() and (_is_secret_node_file(name) or _is_secret_node_file(target.name)):
+            logger.warning("Leaving %s out of the job: it can hold credentials", path)
+            ignored.add(name)
+    return ignored
+
+
+def _link_or_copy(source: str, target: str, copied: list[str] | None = None) -> str:
+    """
+    Hard links source to target, or copies it, such as from another drive, into copied. A link is
+    resolved first, so the target holds the file itself on every platform: Windows would otherwise
+    hard link the link.
+    """
+    source = os.path.realpath(source)
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copy2(source, target)
+        if copied is not None:
+            copied.append(source)
+    return target
+
+
+def stage_local_node_packs(packs: Mapping[str, Path], dest: Path) -> dict[str, Path]:
+    """
+    Places each custom node pack at dest/<name>: a pack folder is linked file by file, a
+    single-file custom node as one file. Files are hard linked when the destination is on the
+    same volume, and copied otherwise. Version control, cache and virtual environment folders
+    are left out of folders. A pack that cannot be placed is logged and left out.
+    """
+    staged: dict[str, Path] = {}
+    for name, source in packs.items():
+        if not name or name != source.name or PurePath(name).name != name or name in (".", ".."):
+            logger.warning("Not staging custom node pack %r from %s", name, source)
+            continue
+        target = dest / name
+        copied: list[str] = []
+        try:
+            if source.is_dir():
+                # The pack's own folder can be a link, such as to a checkout elsewhere.
+                shutil.copytree(
+                    source,
+                    target,
+                    ignore=functools.partial(_ignore_node_files, source.resolve()),
+                    copy_function=functools.partial(_link_or_copy, copied=copied),
+                    ignore_dangling_symlinks=True,
+                    dirs_exist_ok=True,
+                )
+            elif source.is_file() and source.suffix == ".py":
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.exists():
+                    _link_or_copy(str(source), str(target), copied)
+            else:
+                logger.warning("Not staging custom node pack %r from %s", name, source)
+                continue
+        except (OSError, shutil.Error):
+            logger.exception("Couldn't stage custom node pack %r from %s", name, source)
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+            else:
+                target.unlink(missing_ok=True)
+            continue
+        if copied:
+            # Copying takes time and space. The copies are deleted with the bundle.
+            logger.warning(
+                "Copied %d files of custom node pack %r into the job bundle, since they can't be "
+                "linked from %s",
+                len(copied),
+                name,
+                source,
+            )
+        staged[name] = target
     return dict(sorted(staged.items()))
 
 

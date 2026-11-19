@@ -25,7 +25,7 @@ npm ci
 | `src/deadline/comfyui_submitter/bridge.py` | Calls `deadline.client.api` for the routes. It runs in the Deadline Cloud CLI's Python (`python -I bridge.py <command>`) and speaks JSON lines, so it only imports the standard library and `deadline`. |
 | `frontend/src/extensions/deadline-cloud/` | The frontend extension's TypeScript. `deadline_submit.ts` registers the commands, the action bar button and the sidebar tab; `deadline_ui.ts` is the panel and the dialog, in plain DOM with ComfyUI's theme variables. The folder mirrors where ComfyUI serves the extension, so imports such as `../../scripts/app.js` resolve to the type declarations in `frontend/src/scripts/`. |
 | `src/deadline/comfyui_submitter/web/` | The compiled JavaScript that ComfyUI serves. It's built by `npm run build` in `frontend/`, which `install_submitter.py` runs, and isn't committed. |
-| `src/deadline/comfyui_submitter/comfy_cli_job_template.yaml` | The job template. Each submission copies it into a new job bundle under `ComfyUI/user/deadline_submissions/`, with the workflow, the models it attaches and the list of input files. |
+| `src/deadline/comfyui_submitter/comfy_cli_job_template.yaml` | The job template. Each submission copies it into a new job bundle under `ComfyUI/user/deadline_submissions/`, with the workflow, the models and custom nodes it attaches and the list of input files. |
 | `test/unit/` | Unit tests. |
 
 ## Commands
@@ -63,8 +63,8 @@ a running ComfyUI, so test them by hand:
    ```
 3. Check the server log for errors that start with `Deadline Cloud Submitter:`. Then open
    ComfyUI, open the **Deadline** sidebar tab, and check that it shows your login status, your
-   default farm and queue, and, under **Attachments**, the models and input files the workflow
-   loads.
+   default farm and queue, and, under **Attachments**, the models, custom nodes and input files
+   the workflow uses.
 4. Submit an image-to-image workflow from the **Deadline** button's dialog, with its model on
    this machine and **Extra Model Paths Config** empty. Check the upload progress, the job ID
    notification and the job's status under **Recent jobs**. When the job finishes, click
@@ -73,6 +73,13 @@ a running ComfyUI, so test them by hand:
 6. Change a host requirement, such as **GPU memory (GiB)**, submit, and check the job's host
    requirements in Deadline Cloud monitor. Then check that **Reset to defaults** goes back to the
    template's.
+7. Submit a workflow that uses a custom node installed on this machine, to a worker that doesn't
+   have it. Check that the job log lists it under `Attached custom nodes` and that the job
+   succeeds.
+6. Wire three prompts into a **Create List** that feeds a text-to-image workflow's prompt. Check
+   that the job runs as one task with all three prompts. Then choose **Multiple tasks**
+   under **Tasks**, and check that it shows 3 tasks, that the job runs 3, and that each output's
+   name ends with its item, such as `_List5-2`. Set the field to `2,3` and check that it runs 2.
 
 To exercise the routes without the frontend:
 
