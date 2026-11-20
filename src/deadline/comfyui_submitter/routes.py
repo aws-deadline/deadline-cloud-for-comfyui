@@ -238,6 +238,22 @@ def _log_block(text: str) -> str:
 _FORWARDING_HEADERS = ("Forwarded", "X-Forwarded-For", "X-Real-IP")
 
 
+def _has_local_host(request: web.Request) -> bool:
+    """The single Host header must name a local authority matching the request target."""
+    hosts = request.headers.getall("Host", [])
+    if len(hosts) != 1:
+        return False
+    try:
+        host = URL.build(scheme=request.scheme, authority=hosts[0])
+        return (
+            host.user is None
+            and _is_local_host(host.host)
+            and host.origin() == request.url.origin()
+        )
+    except ValueError:
+        return False
+
+
 def _has_matching_origin(request: web.Request) -> bool:
     """An explicit Origin must name the request's scheme, host and port."""
     origins = request.headers.getall("Origin", [])
@@ -264,7 +280,8 @@ async def _read_body(request: web.Request) -> dict[str, Any] | web.Response:
     # The routes act with this machine's AWS credentials, so they accept only ComfyUI's own page
     # or a request no page sent. --enable-cors-header turns off ComfyUI's origin check, and
     # "same-site" includes other ports on this machine.
-    if request.headers.get("Sec-Fetch-Site", "none") not in ("same-origin", "none"):
+    fetch_sites = request.headers.getall("Sec-Fetch-Site", [])
+    if len(fetch_sites) > 1 or (fetch_sites and fetch_sites[0] not in ("same-origin", "none")):
         return _error(403, "Deadline Cloud doesn't accept requests from other websites.")
     if not _has_matching_origin(request):
         return _error(403, "Deadline Cloud doesn't accept requests from other websites.")
@@ -275,13 +292,9 @@ async def _read_body(request: web.Request) -> dict[str, Any] | web.Response:
             "Deadline Cloud uses the ComfyUI server's AWS credentials and only accepts requests "
             "from that machine. Use a browser on the machine running ComfyUI and access it through localhost.",
         )
-    # Check the requested name as well as the peer address: a website can point its own name at
-    # 127.0.0.1, so that its page counts as same-origin with ComfyUI.
-    try:
-        local_host = _is_local_host(request.url.host)
-    except ValueError:
-        local_host = False
-    if not local_host:
+    # Check the actual Host header as well as the request URL: an absolute-form target can give
+    # request.url a different authority, and another domain can point at this machine.
+    if not _has_local_host(request):
         return _error(
             403,
             "Deadline Cloud only accepts requests addressed to localhost or a loopback address.",

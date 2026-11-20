@@ -235,6 +235,9 @@ def test_jobs_rejects_remote_clients(comfy, monkeypatch):
         ),
         ("127.0.0.1", {"Host": "attacker.example:8188"}, 403),
         ("127.0.0.1", {"Host": "[invalid]:8188"}, 403),
+        ("127.0.0.1", {"Host": "user@localhost:8188"}, 403),
+        ("127.0.0.1", {"Host": "localhost:invalid"}, 403),
+        ("127.0.0.1", {"Host": "localhost:65536"}, 403),
     ],
 )
 @pytest.mark.parametrize("path", ["/deadline/plan", "/deadline/jobs/cancel"])
@@ -337,6 +340,74 @@ def test_routes_reject_multiple_origins(comfy):
     )
     assert status == 403
     assert "websites" in response["error"]
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        ("same-origin", "cross-site"),
+        ("cross-site", "same-origin"),
+        ("none", "same-origin"),
+        ("same-origin", "same-origin"),
+    ],
+)
+def test_routes_reject_duplicate_fetch_metadata(comfy, values):
+    status, response = run(
+        call(
+            comfy,
+            "/deadline/plan",
+            {"workflow": WORKFLOW},
+            headers=[("Sec-Fetch-Site", value) for value in values],
+        )
+    )
+    assert status == 403
+    assert "websites" in response["error"]
+
+
+@pytest.mark.parametrize(
+    ("host", "target_host", "status"),
+    [
+        ("localhost:8188", "localhost:8188", 200),
+        ("LOCALHOST:8188", "localhost:8188", 200),
+        ("other.example:8188", "localhost:8188", 403),
+        ("localhost:8188", "other.example:8188", 403),
+        ("localhost:8188", "127.0.0.1:8188", 403),
+        ("user@localhost:8188", "localhost:8188", 403),
+        (None, "localhost:8188", 403),
+    ],
+)
+def test_routes_validate_host_with_an_absolute_request_target(comfy, host, target_host, status):
+    """The URL's authority cannot hide a different or malformed Host header."""
+
+    async def request():
+        app = web.Application()
+        app.add_routes(comfy.server.routes)
+        async with TestServer(app) as server:
+            reader, writer = await asyncio.open_connection(server.host, server.port)
+            body = json.dumps({"workflow": WORKFLOW}).encode()
+            version = "1.0" if host is None else "1.1"
+            host_header = "" if host is None else f"Host: {host}\r\n"
+            headers = (
+                f"POST http://{target_host}/deadline/plan HTTP/{version}\r\n"
+                f"{host_header}"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode()
+            try:
+                writer.write(headers + body)
+                await writer.drain()
+                response = await asyncio.wait_for(reader.read(), 5)
+            finally:
+                writer.close()
+                await writer.wait_closed()
+            header_block, _, response_body = response.partition(b"\r\n\r\n")
+            return int(header_block.split()[1]), json.loads(response_body)
+
+    got, response = run(request())
+    assert got == status
+    if status == 403:
+        assert "only accepts requests addressed" in response["error"]
 
 
 def test_jobs_requires_json(comfy, monkeypatch):
