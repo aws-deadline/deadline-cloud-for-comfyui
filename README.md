@@ -239,8 +239,7 @@ the same machine.
 **Remote workstations.** Use remote desktop to open ComfyUI's page in a browser on the
 workstation, or an SSH local port-forward to its loopback interface and open the forwarded
 `localhost` address. Direct requests from other machines and requests through reverse proxies
-are rejected. The former `COMFYUI_DEADLINE_ALLOW_REMOTE` setting is no longer supported and has
-no effect.
+are rejected.
 
 The local Host check stays enabled. DNS rebinding can let another website call a reachable
 server by pointing its domain name at that server; the routes reject that domain even if the

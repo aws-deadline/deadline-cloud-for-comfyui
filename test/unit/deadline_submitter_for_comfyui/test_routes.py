@@ -208,55 +208,37 @@ def test_jobs_rejects_remote_clients(comfy, monkeypatch):
     assert "only accepts requests" in body["error"]
 
 
-@pytest.mark.parametrize("setting", ["1", "true", "yes"])
-def test_jobs_ignores_the_removed_remote_opt_in(comfy, monkeypatch, setting):
-    fake_tools(monkeypatch, comfy.tmp_path)
-    monkeypatch.setenv("COMFYUI_DEADLINE_ALLOW_REMOTE", setting)
-    status, _ = run(post(comfy, {"workflow": WORKFLOW}, remote="10.0.0.5"))
-    assert status == 403
-
-
 @pytest.mark.parametrize(
-    ("remote", "headers", "allow_remote", "status"),
+    ("remote", "headers", "status"),
     [
-        ("127.0.0.1", {}, False, 200),
-        ("::1", {}, False, 200),
-        ("10.0.0.5", {}, False, 403),
-        ("10.0.0.5", {}, True, 403),
+        ("127.0.0.1", {}, 200),
+        ("::1", {}, 200),
+        ("10.0.0.5", {}, 403),
         # A reverse proxy on this machine connects from loopback on behalf of other browsers.
-        ("127.0.0.1", {"X-Forwarded-For": "10.0.0.5"}, False, 403),
-        ("127.0.0.1", {"Forwarded": "for=10.0.0.5"}, False, 403),
-        ("127.0.0.1", {"X-Real-IP": "10.0.0.5"}, False, 403),
-        ("127.0.0.1", {"X-Forwarded-For": "10.0.0.5"}, True, 403),
+        ("127.0.0.1", {"X-Forwarded-For": "10.0.0.5"}, 403),
+        ("127.0.0.1", {"Forwarded": "for=10.0.0.5"}, 403),
+        ("127.0.0.1", {"X-Real-IP": "10.0.0.5"}, 403),
         # Another website's page, in a browser on this machine, when CORS is turned on.
-        ("127.0.0.1", {"Sec-Fetch-Site": "cross-site"}, False, 403),
-        ("127.0.0.1", {"Sec-Fetch-Site": "cross-site"}, True, 403),
-        ("127.0.0.1", {"Sec-Fetch-Site": "same-origin"}, False, 200),
+        ("127.0.0.1", {"Sec-Fetch-Site": "cross-site"}, 403),
+        ("127.0.0.1", {"Sec-Fetch-Site": "same-origin"}, 200),
         # A page on another port of this machine, such as a dev server, is "same-site".
-        ("127.0.0.1", {"Sec-Fetch-Site": "same-site"}, False, 403),
-        ("127.0.0.1", {"Sec-Fetch-Site": "same-site"}, True, 403),
+        ("127.0.0.1", {"Sec-Fetch-Site": "same-site"}, 403),
         # Typed into the address bar or sent by a tool, not by another page.
-        ("127.0.0.1", {"Sec-Fetch-Site": "none"}, False, 200),
-        ("127.0.0.1", {"Host": "localhost:8188"}, False, 200),
-        ("::1", {"Host": "[::1]:8188"}, False, 200),
+        ("127.0.0.1", {"Sec-Fetch-Site": "none"}, 200),
+        ("127.0.0.1", {"Host": "localhost:8188"}, 200),
+        ("::1", {"Host": "[::1]:8188"}, 200),
         # A website that points its own name at 127.0.0.1 (DNS rebinding) is same-origin.
         (
             "127.0.0.1",
             {"Host": "attacker.example:8188", "Sec-Fetch-Site": "same-origin"},
-            False,
             403,
         ),
-        ("127.0.0.1", {"Host": "attacker.example:8188"}, True, 403),
-        ("127.0.0.1", {"Host": "[invalid]:8188"}, False, 403),
+        ("127.0.0.1", {"Host": "attacker.example:8188"}, 403),
+        ("127.0.0.1", {"Host": "[invalid]:8188"}, 403),
     ],
 )
 @pytest.mark.parametrize("path", ["/deadline/plan", "/deadline/jobs/cancel"])
-def test_routes_only_answer_allowed_browsers(
-    comfy, monkeypatch, path, remote, headers, allow_remote, status
-):
-    if allow_remote:
-        # An old setting must no longer disable either access check.
-        monkeypatch.setenv("COMFYUI_DEADLINE_ALLOW_REMOTE", "1")
+def test_routes_only_answer_allowed_browsers(comfy, path, remote, headers, status):
     body = {"workflow": WORKFLOW, "submissionId": "a" * 32}
     got, response = run(call(comfy, path, body, remote=remote, headers=headers))
     if status == 403:
