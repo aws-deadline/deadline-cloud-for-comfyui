@@ -7,10 +7,11 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import sys
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 
 TEMPLATE_ENV_VAR = "COMFYUI_DEADLINE_JOB_TEMPLATE"
@@ -427,6 +428,15 @@ _RESERVED_CAPABILITY_NAMES = ("worker", "job", "step", "task")
 _CAPABILITY_NAME = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]{0,63}(\.[a-zA-Z_][a-zA-Z0-9_]{0,63})*")
 _ATTRIBUTE_VALUE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_-]{0,99}")
 MAX_JOB_DESCRIPTION = 2048
+# OpenJD's longest job name.
+MAX_JOB_NAME = 128
+# The IDs that `deadline bundle submit` takes, as Deadline Cloud writes them.
+_BUNDLE_SUBMIT_IDS = (
+    ("--farm-id", re.compile(r"farm-[0-9a-f]{32}")),
+    ("--queue-id", re.compile(r"queue-[0-9a-f]{32}")),
+    ("--storage-profile-id", re.compile(r"sp-[0-9a-f]{32}")),
+)
+JOB_ATTACHMENTS_FILE_SYSTEMS = ("COPIED", "VIRTUAL")
 
 
 def _capability_name(name: Any, prefix: str, standard: tuple[str, ...]) -> str:
@@ -511,6 +521,18 @@ def job_description(value: Any) -> str | None:
     return value
 
 
+def job_name(value: Any) -> str | None:
+    """Checks the panel's job name. Empty keeps the job template's. Raises SubmitError."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise SubmitError("The job name must be a string.")
+    value = value.strip()
+    if len(value) > MAX_JOB_NAME:
+        raise SubmitError(f"The job name can't be over {MAX_JOB_NAME} characters.")
+    return value or None
+
+
 def template_host_requirements(job_template: dict[str, Any]) -> dict[str, Any]:
     """The host requirements of the job template's first step, for the panel to start from."""
     steps = job_template.get("steps")
@@ -527,17 +549,20 @@ def create_job_bundle(
     now: datetime | None = None,
     requirements: dict[str, Any] | None = None,
     description: str | None = None,
+    job_name: str | None = None,
 ) -> tuple[Path, Path]:
     """
     Creates <dest_dir>/<timestamp>_<name>/ with the job template and the API-format workflow, and
     returns the bundle directory and the workflow file. They have to outlive the submitter dialog
     and the job attachments upload. The template is copied as it is, unless the artist changed its
-    host requirements or description.
+    host requirements, description or job name.
     """
     suffix = ".json" if template.suffix.lower() == ".json" else ".yaml"
     text = None
-    if requirements is not None or description:
+    if requirements is not None or description or job_name:
         job_template = read_job_template(template)
+        if job_name:
+            job_template["name"] = job_name
         if description:
             job_template["description"] = description
         if requirements is not None:
@@ -574,3 +599,43 @@ def create_job_bundle(
         raise SubmitError(str(e)) from e
     write_private_text(workflow_path, json.dumps(workflow, indent=2))
     return bundle_dir, workflow_path
+
+
+def bundle_submit_command(
+    cli: str,
+    bundle_dir: PurePath,
+    ids: dict[str, Any],
+    settings: dict[str, Any],
+    platform: str = sys.platform,
+) -> str:
+    """
+    The `deadline bundle submit` command for a saved bundle, with the panel's choices that a job
+    bundle can't hold: the farm, queue and storage profile, and how workers read the attachments.
+    ids holds the panel's farmId, queueId and storageProfileId.
+    """
+    args = [cli, "bundle", "submit", str(bundle_dir)]
+    for (option, pattern), key in zip(
+        _BUNDLE_SUBMIT_IDS, ("farmId", "queueId", "storageProfileId"), strict=True
+    ):
+        value = ids.get(key)
+        if isinstance(value, str) and pattern.fullmatch(value):
+            args += [option, value]
+    file_system = str(settings.get("jobAttachmentsFileSystem") or "").upper()
+    if file_system in JOB_ATTACHMENTS_FILE_SYSTEMS:
+        args += ["--job-attachments-file-system", file_system]
+    if settings.get("requirePathsExist") in (True, "true"):
+        args.append("--require-paths-exist")
+    if platform == "win32":
+        # PowerShell, Windows' default shell, runs a quoted program only after its & operator.
+        return "& " + " ".join(_powershell_quoted(arg) for arg in args)
+    return shlex.join(args)
+
+
+def _powershell_quoted(value: str) -> str:
+    """
+    A PowerShell argument. Single quotes keep $, backticks and spaces as they are. PowerShell also
+    reads typographic single quotes as quotes, and each is escaped by doubling it.
+    """
+    if re.fullmatch(r"[\w%+=:./\\-]+", value):
+        return value
+    return "'" + re.sub("(['\u2018\u2019\u201a\u201b])", r"\1\1", value) + "'"

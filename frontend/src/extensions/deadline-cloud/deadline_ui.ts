@@ -1659,11 +1659,24 @@ async function saveBundle() {
     if (!body) {
       return;
     }
-    const result = await postJson<{ job_bundle: string; warnings?: string[] }>("/deadline/bundle", {
-      ...body,
-      ...bundleRequest(),
-    });
-    toast("success", `Saved the job bundle to ${result.job_bundle}`, 20000);
+    const result = await postJson<{ job_bundle: string; command?: string; warnings?: string[] }>(
+      "/deadline/bundle",
+      {
+        ...body,
+        // A bundle can't hold these, so the server puts them in the command that submits it.
+        farmId: state.farmId,
+        queueId: state.queueId,
+        storageProfileId: state.storageProfileId,
+        ...bundleRequest(),
+      }
+    );
+    toast(
+      "success",
+      result.command
+        ? `Saved the job bundle to ${result.job_bundle}. To submit it with these settings, run: ${result.command}`
+        : `Saved the job bundle to ${result.job_bundle}`,
+      30000
+    );
     for (const warning of result.warnings ?? []) {
       toast("warn", warning, 20000);
     }

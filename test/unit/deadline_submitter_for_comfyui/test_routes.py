@@ -160,7 +160,12 @@ def test_jobs_fills_in_the_workflow_parameters(comfy, monkeypatch):
     bundle_dir = Path(body["job_bundle"])
     assert bundle_dir.parent == comfy.tmp_path / "user" / "deadline_submissions"
     assert bundle_dir.name.endswith("_portrait")
-    assert (bundle_dir / "template.yaml").read_text() == submit.JOB_TEMPLATE.read_text()
+    # The template only gets the job's name.
+    template = yaml.safe_load((bundle_dir / "template.yaml").read_text())
+    assert template == {
+        **yaml.safe_load(submit.JOB_TEMPLATE.read_text()),
+        "name": "ComfyUI - portrait",
+    }
     workflow_file = Path(body["workflow_file"])
     assert workflow_file == bundle_dir / "portrait_api.json"
     assert json.loads(workflow_file.read_text()) == WORKFLOW
@@ -743,8 +748,18 @@ def test_jobs_keeps_the_templates_host_requirements_by_default(comfy, monkeypatc
     status, response = run(call(comfy, "/deadline/jobs", {**JOB, "parameters": {}}))
     assert status == 202
     assert bridge_requests(requests)
-    bundle = Path(response["job_bundle"])
-    assert (bundle / "template.yaml").read_text() == submit.JOB_TEMPLATE.read_text()
+    original = yaml.safe_load(submit.JOB_TEMPLATE.read_text())
+    assert _template_steps(Path(response["job_bundle"])) == original["steps"]
+
+
+def test_jobs_gives_the_template_the_name_it_submits_with(comfy, monkeypatch):
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    for settings, expected in (({}, "ComfyUI - fox"), ({"name": "  Fox lookdev "}, "Fox lookdev")):
+        status, response = run(call(comfy, "/deadline/jobs", {**JOB, "settings": settings}))
+        assert status == 202
+        template = yaml.safe_load((Path(response["job_bundle"]) / "template.yaml").read_text())
+        assert template["name"] == expected
+        assert bridge_requests(requests)[-1]["request"]["settings"]["name"] == expected
 
 
 def test_jobs_passes_require_paths_exist_to_the_library(comfy, monkeypatch):
@@ -1623,6 +1638,75 @@ def test_bundle_saves_the_values_without_submitting(comfy, monkeypatch):
     assert _template_steps(bundle)[0]["hostRequirements"] == REQUIREMENTS
     # A saved bundle is submitted later, so it isn't deleted with the submissions.
     assert not (bundle / comfy.routes.SUBMISSION_MARKER).exists()
+
+
+def test_bundle_keeps_the_job_name_and_description_in_its_template(comfy, monkeypatch):
+    fake_bridge(monkeypatch, comfy.tmp_path, {})
+    body = {
+        "workflow": WORKFLOW,
+        "name": "fox",
+        "settings": {"name": "  Fox lookdev  "},
+        "description": "Golden hour",
+    }
+    status, response = run(call(comfy, "/deadline/bundle", body))
+    assert status == 200
+    template = yaml.safe_load((Path(response["job_bundle"]) / "template.yaml").read_text())
+    # deadline bundle submit and Deadline Cloud monitor use the template's name.
+    assert template["name"] == "Fox lookdev"
+    assert template["description"] == "Golden hour"
+
+
+def test_bundle_without_a_job_name_keeps_the_templates(comfy, monkeypatch):
+    fake_bridge(monkeypatch, comfy.tmp_path, {})
+    body = {"workflow": WORKFLOW, "name": "fox", "settings": {"name": " "}}
+    status, response = run(call(comfy, "/deadline/bundle", body))
+    assert status == 200
+    template = yaml.safe_load((Path(response["job_bundle"]) / "template.yaml").read_text())
+    assert template["name"] == "ComfyUI Workflow (comfy-cli)"
+
+
+def test_bundle_returns_the_command_with_the_settings_it_cant_hold(comfy, monkeypatch):
+    fake_bridge(monkeypatch, comfy.tmp_path, {})
+    body = {
+        "workflow": WORKFLOW,
+        "name": "fox",
+        "farmId": FARM,
+        "queueId": QUEUE,
+        "storageProfileId": "",
+        "settings": {"jobAttachmentsFileSystem": "VIRTUAL", "requirePathsExist": True},
+    }
+    status, response = run(call(comfy, "/deadline/bundle", body))
+    assert status == 200
+    command = response["command"]
+    if os.name == "nt":
+        # PowerShell: & then arguments, each bare or in single quotes with '' for a quote.
+        assert command.startswith("& ")
+        args = [
+            part[1:-1].replace("''", "'") if part.startswith("'") else part
+            for part in re.findall(r"'(?:[^']|'')*'|\S+", command[2:])
+        ]
+    else:
+        args = shlex.split(command)
+    assert args[1:] == [
+        "bundle",
+        "submit",
+        response["job_bundle"],
+        "--farm-id",
+        FARM,
+        "--queue-id",
+        QUEUE,
+        "--job-attachments-file-system",
+        "VIRTUAL",
+        "--require-paths-exist",
+    ]
+
+
+def test_bundle_rejects_a_job_name_over_the_limit(comfy, monkeypatch):
+    body = {"workflow": WORKFLOW, "settings": {"name": "x" * 129}}
+    status, response = run(call(comfy, "/deadline/bundle", body))
+    assert status == 400
+    assert "over 128 characters" in response["error"]
+    assert not (comfy.tmp_path / "user" / "deadline_submissions").exists()
 
 
 def test_bundle_rejects_bad_host_requirements(comfy, monkeypatch):

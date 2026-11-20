@@ -41,11 +41,13 @@ from .submit import (
     DEFAULT_WORKFLOW_NAME,
     PICKER_KINDS,
     SubmitError,
+    bundle_submit_command,
     check_cli_version,
     create_job_bundle,
     host_requirements,
     input_folders,
     job_description,
+    job_name,
     load_config,
     picker_command,
     read_job_template,
@@ -689,11 +691,21 @@ class _Bundle:
     warnings: list[str]
 
 
+def _job_settings(body: dict[str, Any]) -> dict[str, Any]:
+    """The panel's job settings, with its job name checked. Raises SubmitError."""
+    settings = _string_map(body.get("settings"), "settings")
+    name = job_name(settings.pop("name", None))
+    if name:
+        settings["name"] = name
+    return settings
+
+
 async def _build_bundle(
     body: dict[str, Any],
     workflow: dict[str, Any],
     template: Path,
     config: dict[str, Any],
+    settings: dict[str, Any],
     submission: bool = True,
 ) -> _Bundle:
     """
@@ -718,6 +730,7 @@ async def _build_bundle(
         _submissions_dir(),
         requirements=requirements,
         description=description,
+        job_name=settings.get("name"),
     )
     # Marked before the models are staged, so a bundle left by a crash while copying them is
     # still deleted.
@@ -745,16 +758,17 @@ async def _build_bundle(
 async def save_bundle(request: web.Request) -> web.Response:
     """
     Creates the job bundle and saves its parameter values, to submit later with `deadline bundle
-    submit`.
+    submit`. Returns the command that submits it with the panel's choices that a bundle can't hold.
     """
     checked = await _read_request(request)
     if isinstance(checked, web.Response):
         return checked
     body, workflow, template = checked
     try:
-        settings = _string_map(body.get("settings"), "settings")
+        settings = _job_settings(body)
+        config = load_config()
         # A saved bundle is kept: it's submitted later, from this folder.
-        bundle = await _build_bundle(body, workflow, template, load_config(), submission=False)
+        bundle = await _build_bundle(body, workflow, template, config, settings, submission=False)
     except SubmitError as e:
         return _error(400, str(e))
     values: list[dict[str, Any]] = [
@@ -770,7 +784,17 @@ async def save_bundle(request: web.Request) -> web.Response:
         bundle.bundle_dir / "parameter_values.yaml",
         yaml.safe_dump({"parameterValues": values}, sort_keys=False),
     )
-    return web.json_response({"job_bundle": str(bundle.bundle_dir), "warnings": bundle.warnings})
+    try:
+        cli = resolve_deadline_cli(config)
+    except SubmitError:
+        cli = "deadline"
+    return web.json_response(
+        {
+            "job_bundle": str(bundle.bundle_dir),
+            "command": bundle_submit_command(cli, bundle.bundle_dir, body, settings),
+            "warnings": bundle.warnings,
+        }
+    )
 
 
 @PromptServer.instance.routes.post("/deadline/jobs")
@@ -789,20 +813,21 @@ async def submit_job(request: web.Request) -> web.Response:
         return _error(400, "Choose a farm and a queue.")
     try:
         config = load_config()
-        settings = _string_map(body.get("settings"), "settings")
+        settings = _job_settings(body)
     except SubmitError as e:
         return _error(400, str(e))
     cli = await _checked_cli(config)
     if isinstance(cli, web.Response):
         return cli
+    # The job template and CreateJob get the same name.
+    settings.setdefault("name", f"ComfyUI - {name}")
     try:
-        bundle = await _build_bundle(body, workflow, template, config)
+        bundle = await _build_bundle(body, workflow, template, config, settings)
     except SubmitError as e:
         return _error(400, str(e))
     # A server that runs for weeks also deletes old bundles, not only when ComfyUI starts.
     _start(asyncio.to_thread(_remove_old_submissions, _submissions_dir()))
 
-    settings.setdefault("name", f"ComfyUI - {name}")
     submission = {
         "bundleDir": str(bundle.bundle_dir),
         "farmId": farm_id,

@@ -57,7 +57,8 @@ def _run_scenario(tmp_path: Path, ui_source: str, scenario: str) -> dict:
         "\nexport { state as __state, queueParameterValue as __queueParameterValue,"
         " parameterControl as __parameterControl, RENDERERS as __renderers,"
         " pollJobs as __pollJobs, formFromRequirements as __formFromRequirements,"
-        " requirementsFromForm as __requirementsFromForm, createView as __createView };\n"
+        " requirementsFromForm as __requirementsFromForm, createView as __createView,"
+        " saveBundle as __saveBundle };\n"
     )
     (web / "deadline_ui.js").write_text(ui_source + exports, encoding="utf-8")
     (tmp_path / "package.json").write_text('{"type": "module"}')
@@ -107,6 +108,24 @@ def test_a_submission_finished_before_the_response_is_cleared(run_scenario):
     assert result["submission"] is None
     assert result["canSubmit"] is True
     assert "success" in result["toasts"]
+
+
+def test_save_bundle_sends_the_farm_and_queue_and_shows_the_command(run_scenario):
+    result = run_scenario("save-bundle")
+    # A bundle can't hold the farm, queue and storage profile, so the server puts them in the
+    # command that submits it.
+    assert result["sent"] == {
+        "farmId": "farm-1",
+        "queueId": "queue-1",
+        "storageProfileId": "",
+        "name": "Fox lookdev",
+    }
+    assert result["toasts"] == [
+        (
+            "Saved the job bundle to /bundle. To submit it with these settings, run: "
+            "deadline bundle submit /bundle --farm-id farm-1"
+        )
+    ]
 
 
 def test_a_cleared_queue_parameter_goes_back_to_the_queue_default(run_scenario):

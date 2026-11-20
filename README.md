@@ -23,8 +23,10 @@ GPU workers, with the models and input files it uses attached to the job.
   - upload progress, the status of your recent jobs, and **Download** for their outputs, which
     go back into the output directory they were submitted with. Each job shows that directory.
   - **Save job bundle**, which creates the job bundle without submitting it, to submit later with
-    `deadline bundle submit`. The bundle keeps the parameters, host requirements, priority,
-    initial state, and the failed task, retry and worker limits. Pass the job name with `--name`.
+    `deadline bundle submit`. The bundle keeps the job name and description, the parameters, host
+    requirements, priority, initial state, and the failed task, retry and worker limits. A bundle
+    can't hold the farm, queue, storage profile or job attachments settings. The panel shows the
+    command that submits it with yours.
 - A **Deadline** button next to **Run**, and **Workflow > Submit to Deadline Cloud…**, which open a
   short dialog: farm, queue and **Submit**.
 

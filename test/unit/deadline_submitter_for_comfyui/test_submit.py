@@ -2,9 +2,10 @@
 import json
 import os
 import re
+import shlex
 import stat
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
 import yaml
@@ -18,9 +19,11 @@ from openjd.model import (
 from deadline.comfyui_submitter import submit
 from deadline.comfyui_submitter.submit import (
     SubmitError,
+    bundle_submit_command,
     check_cli_version,
     create_job_bundle,
     get_safe_path,
+    job_name,
     parse_cli_version,
     resolve_deadline_cli,
     resolve_job_template,
@@ -314,6 +317,91 @@ def test_create_job_bundle(tmp_path):
     assert (bundle_dir / "template.yaml").read_text() == template.read_text()
     assert workflow_path == bundle_dir / "my_workflow_api.json"
     assert json.loads(workflow_path.read_text()) == API_WORKFLOW
+
+
+def test_create_job_bundle_sets_the_job_name(tmp_path):
+    bundle_dir, _ = create_job_bundle(
+        submit.JOB_TEMPLATE, API_WORKFLOW, "fox", tmp_path, job_name="Fox lookdev"
+    )
+    assert yaml.safe_load((bundle_dir / "template.yaml").read_text())["name"] == "Fox lookdev"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, None), ("", None), ("  ", None), (" Fox ", "Fox"), ("x" * 128, "x" * 128)],
+)
+def test_job_name(value, expected):
+    assert job_name(value) == expected
+
+
+@pytest.mark.parametrize(("value", "message"), [(5, "must be a string"), ("x" * 129, "over 128")])
+def test_job_name_rejects(value, message):
+    with pytest.raises(SubmitError, match=message):
+        job_name(value)
+
+
+FARM_ID = "farm-" + "a" * 32
+QUEUE_ID = "queue-" + "b" * 32
+PROFILE_ID = "sp-" + "c" * 32
+
+
+def test_bundle_submit_command_quotes_the_bundle_for_the_shell():
+    command = bundle_submit_command(
+        "/opt/deadline cli/bin/deadline",
+        PurePosixPath("/bundles/20261120_fox lookdev"),
+        {"farmId": FARM_ID, "queueId": QUEUE_ID, "storageProfileId": PROFILE_ID},
+        {"jobAttachmentsFileSystem": "copied", "requirePathsExist": False},
+        platform="darwin",
+    )
+    assert shlex.split(command) == [
+        "/opt/deadline cli/bin/deadline",
+        "bundle",
+        "submit",
+        "/bundles/20261120_fox lookdev",
+        "--farm-id",
+        FARM_ID,
+        "--queue-id",
+        QUEUE_ID,
+        "--storage-profile-id",
+        PROFILE_ID,
+        "--job-attachments-file-system",
+        "COPIED",
+    ]
+
+
+def test_bundle_submit_command_is_written_for_powershell_on_windows():
+    command = bundle_submit_command(
+        r"C:\Program Files\deadline.exe",
+        PureWindowsPath(r"C:\bundles\Rory’s fox $shot"),
+        {"farmId": FARM_ID},
+        {"requirePathsExist": "true"},
+        platform="win32",
+    )
+    # PowerShell runs a quoted program only after &. In single quotes, $ is kept as it is, and a
+    # typographic quote is doubled.
+    assert command == (
+        r"& 'C:\Program Files\deadline.exe' bundle submit 'C:\bundles\Rory’’s fox $shot' "
+        rf"--farm-id {FARM_ID} --require-paths-exist"
+    )
+
+
+def test_bundle_submit_command_quotes_a_comma_for_powershell():
+    # An unquoted comma is PowerShell's array operator, which would split the path in two.
+    command = bundle_submit_command(
+        "deadline", PureWindowsPath(r"C:\Users\Smith,J\b"), {}, {}, platform="win32"
+    )
+    assert command == r"& deadline bundle submit 'C:\Users\Smith,J\b'"
+
+
+def test_bundle_submit_command_leaves_out_what_isnt_an_id_or_a_choice():
+    command = bundle_submit_command(
+        "deadline",
+        PurePosixPath("/b"),
+        {"farmId": "farm-1; rm -rf ~", "queueId": "", "storageProfileId": None},
+        {"jobAttachmentsFileSystem": "", "requirePathsExist": "yes"},
+        platform="linux",
+    )
+    assert command == "deadline bundle submit /b"
 
 
 def test_create_job_bundle_keeps_json_template(tmp_path):

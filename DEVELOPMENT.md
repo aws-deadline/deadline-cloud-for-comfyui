@@ -69,7 +69,9 @@ a running ComfyUI, so test them by hand:
    this machine and **Extra Model Paths Config** empty. Check the upload progress, the job ID
    notification and the job's status under **Recent jobs**. When the job finishes, click
    **Download** and check that the image is in ComfyUI's output directory.
-5. Click **Save job bundle**, and submit the saved bundle with `deadline bundle submit`.
+5. Change the job's **Name**, click **Save job bundle**, and run the command the notification
+   shows. Check that the job has that name in Deadline Cloud monitor, and is in the farm and queue
+   chosen in the panel.
 6. Change a host requirement, such as **GPU memory (GiB)**, submit, and check the job's host
    requirements in Deadline Cloud monitor. Then check that **Reset to defaults** goes back to the
    template's.
