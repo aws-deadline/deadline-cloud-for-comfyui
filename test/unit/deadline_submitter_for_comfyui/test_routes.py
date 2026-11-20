@@ -290,6 +290,38 @@ def test_routes_check_origin_even_without_fetch_metadata(
         assert got == (200 if path == "/deadline/plan" else 404)
 
 
+@pytest.mark.parametrize("fetch_site", [None, "same-origin", "none"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/deadline/plan",
+        "/deadline/bundle",
+        "/deadline/jobs",
+        "/deadline/jobs/confirm",
+        "/deadline/jobs/cancel",
+        "/deadline/jobs/download",
+        "/deadline/cloud/farms",
+        "/deadline/choose",
+    ],
+)
+def test_routes_reject_other_origins_with_a_local_host(comfy, path, fetch_site):
+    # A local proxy can rewrite Host and omit forwarding headers while preserving Origin.
+    headers = {"Host": "127.0.0.1:8188", "Origin": "http://other.example"}
+    if fetch_site is not None:
+        headers["Sec-Fetch-Site"] = fetch_site
+    status, response = run(
+        call(
+            comfy,
+            path,
+            {"workflow": WORKFLOW, "submissionId": "a" * 32},
+            remote="127.0.0.1",
+            headers=headers,
+        )
+    )
+    assert status == 403
+    assert "websites" in response["error"]
+
+
 def test_routes_reject_multiple_origins(comfy):
     status, response = run(
         call(

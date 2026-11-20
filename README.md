@@ -218,7 +218,7 @@ the same machine.
 
 **What the extension adds.**
 
-- The routes only accept a browser on the ComfyUI machine. A request from another address, or one
+- The routes require a loopback peer address. A request from another address, or one
   with a `Forwarded`, `X-Forwarded-For` or `X-Real-IP` header from a reverse proxy, gets a 403.
 - They only accept requests addressed to `localhost` or a loopback address such as `127.0.0.1`,
   so a website that points its own domain name at this machine can't pass for ComfyUI's page.
@@ -240,9 +240,9 @@ the same machine.
 **Local access.** Use a browser on the machine running ComfyUI and access it through
 `localhost`.
 
-The local Host check stays enabled. DNS rebinding can let another website call a reachable
-server by pointing its domain name at that server; the routes reject that domain even if the
-request comes from loopback and the browser marks it as same-origin.
+The Host and Origin checks stay enabled. DNS rebinding can let another website call a reachable
+server by pointing its domain name at that server. The routes require a local Host and reject
+any Origin that does not match the request's scheme, host and port.
 
 ## Limitations
 

@@ -233,8 +233,8 @@ def _log_block(text: str) -> str:
     return text.rstrip().replace("\r\n", "\n").replace("\n", "\n    ").replace("\r", "\\r")
 
 
-# Headers that a reverse proxy adds. A proxy on this machine connects from a loopback address, so
-# without them the browsers it forwards would pass for local ones.
+# Headers that identify a forwarded request. A local proxy can connect from loopback on
+# behalf of other browsers.
 _FORWARDING_HEADERS = ("Forwarded", "X-Forwarded-For", "X-Real-IP")
 
 
@@ -275,8 +275,8 @@ async def _read_body(request: web.Request) -> dict[str, Any] | web.Response:
             "Deadline Cloud uses the ComfyUI server's AWS credentials and only accepts requests "
             "from that machine. Use a browser on the machine running ComfyUI and access it through localhost.",
         )
-    # A website can point its own name at 127.0.0.1, so that its page counts as same-origin with
-    # ComfyUI. Its name is still in the Host header.
+    # Check the requested name as well as the peer address: a website can point its own name at
+    # 127.0.0.1, so that its page counts as same-origin with ComfyUI.
     try:
         local_host = _is_local_host(request.url.host)
     except ValueError:
