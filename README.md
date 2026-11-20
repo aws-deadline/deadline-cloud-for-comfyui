@@ -135,7 +135,6 @@ the environment that starts ComfyUI.
 | `COMFYUI_DEADLINE_CONDA_CHANNELS` | `conda_channels` in the config | Optional **Conda Channels** to fill in. When neither is set, the queue's default, the Deadline Cloud channels, is used. |
 | `COMFYUI_DEADLINE_CONFIG` | `deadline_cloud_submitter.json` in the extension folder | Another config file to read. |
 | `COMFYUI_DEADLINE_JOB_TEMPLATE` | The extension's job template | A job template file, YAML or JSON, to submit instead, such as your studio's version of the extension's template. It needs the same parameters, such as `WorkflowFile`, `InputDir` and `OutputDir`. Local models are attached only when the template also defines `ModelDirectory`, and it has to point ComfyUI at that folder. The extension's template does. |
-| `COMFYUI_DEADLINE_ALLOW_REMOTE` | unset | Set it to `1` to accept submit requests from browsers on other machines or through a reverse proxy. See [Security](#security) first. |
 
 ## The job
 
@@ -237,11 +236,15 @@ the same machine.
   deleted once its job is created. On Windows, bundles inherit the permissions of the ComfyUI
   user folder. The `deadline_cloud_submitter.json` config file is also `0600`.
 
-**Sharing a server.** `COMFYUI_DEADLINE_ALLOW_REMOTE=1` turns off the local-only check, including
-for requests through a proxy. Only set it when every person who can reach ComfyUI may submit with
-its credentials. The server's network or reverse proxy then has to limit who can reach it, for
-example with authentication at the proxy or a private network, because ComfyUI and the extension
-don't check who's calling.
+**Remote workstations.** Use remote desktop to open ComfyUI's page in a browser on the
+workstation, or an SSH local port-forward to its loopback interface and open the forwarded
+`localhost` address. Direct requests from other machines and requests through reverse proxies
+are rejected. The former `COMFYUI_DEADLINE_ALLOW_REMOTE` setting is no longer supported and has
+no effect.
+
+The local Host check stays enabled. DNS rebinding can let another website call a reachable
+server by pointing its domain name at that server; the routes reject that domain even if the
+request comes from loopback and the browser marks it as same-origin.
 
 ## Limitations
 

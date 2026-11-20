@@ -37,7 +37,6 @@ from .get_local_assets import (
     write_asset_references,
 )
 from .submit import (
-    ALLOW_REMOTE_ENV_VAR,
     DEFAULT_WORKFLOW_NAME,
     PICKER_KINDS,
     SubmitError,
@@ -49,7 +48,6 @@ from .submit import (
     load_config,
     picker_command,
     read_job_template,
-    remote_allowed,
     resolve_cli_python,
     resolve_conda_channels,
     resolve_deadline_cli,
@@ -247,20 +245,23 @@ async def _read_body(request: web.Request) -> dict[str, Any] | web.Response:
     if request.headers.get("Sec-Fetch-Site", "none") not in ("same-origin", "none"):
         return _error(403, "Deadline Cloud doesn't accept requests from other websites.")
     forwarded = any(header in request.headers for header in _FORWARDING_HEADERS)
-    if (forwarded or not _is_loopback(request.remote)) and not remote_allowed():
+    if forwarded or not _is_loopback(request.remote):
         return _error(
             403,
             "Deadline Cloud submits from the ComfyUI server, with its credentials, so it only "
-            "accepts requests from a browser on that machine, not through a proxy. Set "
-            f"{ALLOW_REMOTE_ENV_VAR}=1 to allow others.",
+            "accepts requests from a browser on that machine, not through a proxy. Use a local "
+            "browser, remote desktop, or an SSH tunnel to the server's loopback interface.",
         )
     # A website can point its own name at 127.0.0.1, so that its page counts as same-origin with
     # ComfyUI. Its name is still in the Host header.
-    if not _is_local_host(request.url.host) and not remote_allowed():
+    try:
+        local_host = _is_local_host(request.url.host)
+    except ValueError:
+        local_host = False
+    if not local_host:
         return _error(
             403,
-            "Deadline Cloud only accepts requests to localhost or a loopback address. Set "
-            f"{ALLOW_REMOTE_ENV_VAR}=1 to allow other host names.",
+            "Deadline Cloud only accepts requests addressed to localhost or a loopback address.",
         )
     if request.content_type != "application/json":
         return _error(415, "Expected a JSON request.")

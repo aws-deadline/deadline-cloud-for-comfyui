@@ -74,7 +74,6 @@ def comfy(monkeypatch, tmp_path):
     monkeypatch.setattr(routes, "_remove_bundle", lambda bundle_dir: None)
     for var in (
         submit.TEMPLATE_ENV_VAR,
-        submit.ALLOW_REMOTE_ENV_VAR,
         submit.CONDA_CHANNELS_ENV_VAR,
     ):
         monkeypatch.delenv(var, raising=False)
@@ -206,14 +205,15 @@ def test_jobs_rejects_remote_clients(comfy, monkeypatch):
     fake_tools(monkeypatch, comfy.tmp_path)
     status, body = run(post(comfy, {"workflow": WORKFLOW}, remote="10.0.0.5"))
     assert status == 403
-    assert submit.ALLOW_REMOTE_ENV_VAR in body["error"]
+    assert "only accepts requests" in body["error"]
 
 
-def test_jobs_allows_remote_clients_when_configured(comfy, monkeypatch):
+@pytest.mark.parametrize("setting", ["1", "true", "yes"])
+def test_jobs_ignores_the_removed_remote_opt_in(comfy, monkeypatch, setting):
     fake_tools(monkeypatch, comfy.tmp_path)
-    monkeypatch.setenv(submit.ALLOW_REMOTE_ENV_VAR, "1")
+    monkeypatch.setenv("COMFYUI_DEADLINE_ALLOW_REMOTE", setting)
     status, _ = run(post(comfy, {"workflow": WORKFLOW}, remote="10.0.0.5"))
-    assert status == 202
+    assert status == 403
 
 
 @pytest.mark.parametrize(
@@ -222,12 +222,12 @@ def test_jobs_allows_remote_clients_when_configured(comfy, monkeypatch):
         ("127.0.0.1", {}, False, 200),
         ("::1", {}, False, 200),
         ("10.0.0.5", {}, False, 403),
-        ("10.0.0.5", {}, True, 200),
+        ("10.0.0.5", {}, True, 403),
         # A reverse proxy on this machine connects from loopback on behalf of other browsers.
         ("127.0.0.1", {"X-Forwarded-For": "10.0.0.5"}, False, 403),
         ("127.0.0.1", {"Forwarded": "for=10.0.0.5"}, False, 403),
         ("127.0.0.1", {"X-Real-IP": "10.0.0.5"}, False, 403),
-        ("127.0.0.1", {"X-Forwarded-For": "10.0.0.5"}, True, 200),
+        ("127.0.0.1", {"X-Forwarded-For": "10.0.0.5"}, True, 403),
         # Another website's page, in a browser on this machine, when CORS is turned on.
         ("127.0.0.1", {"Sec-Fetch-Site": "cross-site"}, False, 403),
         ("127.0.0.1", {"Sec-Fetch-Site": "cross-site"}, True, 403),
@@ -246,7 +246,8 @@ def test_jobs_allows_remote_clients_when_configured(comfy, monkeypatch):
             False,
             403,
         ),
-        ("127.0.0.1", {"Host": "attacker.example:8188"}, True, 200),
+        ("127.0.0.1", {"Host": "attacker.example:8188"}, True, 403),
+        ("127.0.0.1", {"Host": "[invalid]:8188"}, False, 403),
     ],
 )
 @pytest.mark.parametrize("path", ["/deadline/plan", "/deadline/jobs/cancel"])
@@ -254,12 +255,13 @@ def test_routes_only_answer_allowed_browsers(
     comfy, monkeypatch, path, remote, headers, allow_remote, status
 ):
     if allow_remote:
-        monkeypatch.setenv(submit.ALLOW_REMOTE_ENV_VAR, "1")
+        # An old setting must no longer disable either access check.
+        monkeypatch.setenv("COMFYUI_DEADLINE_ALLOW_REMOTE", "1")
     body = {"workflow": WORKFLOW, "submissionId": "a" * 32}
     got, response = run(call(comfy, path, body, remote=remote, headers=headers))
     if status == 403:
         assert got == 403
-        assert "websites" in response["error"] or submit.ALLOW_REMOTE_ENV_VAR in response["error"]
+        assert any(text in response["error"] for text in ("websites", "only accepts"))
     else:
         # Cancel answers 404 for a submission that isn't running, past the access check.
         assert got == (200 if path == "/deadline/plan" else 404)

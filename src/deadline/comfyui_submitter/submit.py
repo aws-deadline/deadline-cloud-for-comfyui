@@ -17,7 +17,6 @@ TEMPLATE_ENV_VAR = "COMFYUI_DEADLINE_JOB_TEMPLATE"
 CLI_ENV_VAR = "COMFYUI_DEADLINE_CLI"
 # The Python the submitter panel's bridge runs with. By default, the Deadline Cloud CLI's own.
 PYTHON_ENV_VAR = "COMFYUI_DEADLINE_PYTHON"
-ALLOW_REMOTE_ENV_VAR = "COMFYUI_DEADLINE_ALLOW_REMOTE"
 CONDA_CHANNELS_ENV_VAR = "COMFYUI_DEADLINE_CONDA_CHANNELS"
 CONFIG_ENV_VAR = "COMFYUI_DEADLINE_CONFIG"
 
@@ -210,10 +209,6 @@ def check_cli_version(cli: str, version_output: str) -> None:
             f"open the submitter with the workflow filled in. Upgrade it to {minimum} or later with "
             f'pip install --upgrade "deadline[gui]>={minimum}".'
         )
-
-
-def remote_allowed() -> bool:
-    return os.environ.get(ALLOW_REMOTE_ENV_VAR, "").lower() in ("1", "true", "yes")
 
 
 def _describe_missing_node(node_id: str, ui_workflow: Any) -> str:

@@ -45,7 +45,6 @@ def clean_env(monkeypatch, tmp_path):
     for var in (
         submit.TEMPLATE_ENV_VAR,
         submit.CLI_ENV_VAR,
-        submit.ALLOW_REMOTE_ENV_VAR,
         submit.CONDA_CHANNELS_ENV_VAR,
     ):
         monkeypatch.delenv(var, raising=False)
