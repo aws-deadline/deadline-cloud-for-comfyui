@@ -111,9 +111,9 @@ _cli_versions: dict[str, str] = {}
 class _Submission:
     name: str
     process: asyncio.subprocess.Process
-    canceled: bool = False
     # The browser tab that submitted it, which alone gets its events.
-    client_id: str | None = None
+    client_id: str
+    canceled: bool = False
     confirms: int = 0
     answered: int = 0
     # Timers that decline unanswered confirmations, canceled when the submission ends.
@@ -212,10 +212,7 @@ def _client_id(body: dict[str, Any]) -> str | None:
 
 
 def _send(event: str, data: dict[str, Any], client_id: str | None) -> None:
-    """
-    Sends an event to the browser tab that started the work. Without its ID, as from an older
-    panel, every connected tab gets it.
-    """
+    """Sends an event to its browser tab, or broadcasts tool requests without a websocket ID."""
     PromptServer.instance.send_sync(event, data, client_id)
 
 
@@ -783,6 +780,9 @@ async def submit_job(request: web.Request) -> web.Response:
     if isinstance(checked, web.Response):
         return checked
     body, workflow, template = checked
+    client_id = _client_id(body)
+    if client_id is None:
+        return _error(400, "A valid browser clientId is required to submit a job.")
     name = _workflow_name(body)
     farm_id, queue_id = body.get("farmId"), body.get("queueId")
     if not (isinstance(farm_id, str) and farm_id and isinstance(queue_id, str) and queue_id):
@@ -833,7 +833,7 @@ async def submit_job(request: web.Request) -> web.Response:
     _submissions[submission_id] = _Submission(
         str(settings["name"]),
         process,
-        client_id=_client_id(body),
+        client_id=client_id,
         bundle_dir=bundle.bundle_dir,
         output_dir=_output_dir(bundle.values),
     )
@@ -877,7 +877,11 @@ async def _watch_submission(submission_id: str) -> None:
                 _send(PROGRESS_EVENT, {**base, **data, "kind": kind}, submission.client_id)
             elif kind == "confirm":
                 submission.confirms += 1
-                _send(CONFIRM_EVENT, {**base, **data}, submission.client_id)
+                _send(
+                    CONFIRM_EVENT,
+                    {**base, **data, "promptNumber": submission.confirms},
+                    submission.client_id,
+                )
                 submission.timers.append(
                     asyncio.create_task(
                         _decline_unanswered(submission_id, submission, submission.confirms)
@@ -950,7 +954,12 @@ async def _write_line(process: asyncio.subprocess.Process, data: dict[str, Any])
 async def _decline_unanswered(submission_id: str, submission: _Submission, number: int) -> None:
     """Declines the bridge's confirmation `number` if it's still unanswered after the timeout."""
     await asyncio.sleep(CONFIRM_TIMEOUT)
-    if _submissions.get(submission_id) is not submission or submission.answered >= number:
+    if (
+        _submissions.get(submission_id) is not submission
+        or submission.canceled
+        or submission.confirms != number
+        or submission.answered >= number
+    ):
         return
     logger.warning(
         "Nobody answered the confirmation of %s within %g seconds, so it isn't submitted.",
@@ -977,12 +986,15 @@ async def confirm_submission(request: web.Request) -> web.Response:
     submission = _running_submission(body)
     if isinstance(submission, web.Response):
         return submission
-    if body.get("clientId") != submission.client_id:
+    if _client_id(body) != submission.client_id:
         return _error(403, "Only the browser tab that started this submission can confirm it.")
     if submission.canceled or submission.confirms <= submission.answered:
         return _error(409, "That submission has no pending confirmation.")
+    number = body.get("promptNumber")
+    if type(number) is not int or number != submission.confirms:
+        return _error(409, "That confirmation is no longer pending.")
     # Claim this prompt before yielding to the bridge, so another answer cannot queue behind it.
-    submission.answered = submission.confirms
+    submission.answered = number
     if not await _write_line(submission.process, {"accept": body.get("accept") is True}):
         return _error(404, "That submission isn't running.")
     return web.json_response({})
@@ -997,6 +1009,8 @@ async def cancel_submission(request: web.Request) -> web.Response:
     submission = _running_submission(body)
     if isinstance(submission, web.Response):
         return submission
+    if _client_id(body) != submission.client_id:
+        return _error(403, "Only the browser tab that started this submission can cancel it.")
     submission.canceled = True
     try:
         submission.process.kill()

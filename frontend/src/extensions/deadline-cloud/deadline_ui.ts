@@ -93,7 +93,7 @@ interface Submission {
   name?: string;
   stage?: string;
   progress?: number;
-  confirm?: { message: string; default?: boolean } | null;
+  confirm?: { message: string; default?: boolean; promptNumber: number } | null;
 }
 
 interface Job {
@@ -125,6 +125,7 @@ interface SubmissionEvent {
   progress?: number;
   message?: string;
   default?: boolean;
+  promptNumber?: number;
   status?: "SUBMITTED" | "FAILED" | "CANCELED";
   jobId?: string;
   farmId?: string;
@@ -752,15 +753,18 @@ export async function submit() {
 
 async function answerConfirmation(accept: boolean) {
   const submission = state.submission;
-  if (!submission?.confirm) {
+  const confirmation = submission?.confirm;
+  if (!submission || !confirmation) {
     return;
   }
+  const promptNumber = confirmation.promptNumber;
   submission.confirm = null;
   refresh("submit");
   try {
     await postJson("/deadline/jobs/confirm", {
       submissionId: submission.id,
       clientId: api.clientId,
+      promptNumber,
       accept,
     });
   } catch (error) {
@@ -773,7 +777,10 @@ async function cancelSubmission() {
     return;
   }
   try {
-    await postJson("/deadline/jobs/cancel", { submissionId: state.submission.id });
+    await postJson("/deadline/jobs/cancel", {
+      submissionId: state.submission.id,
+      clientId: api.clientId,
+    });
   } catch (error) {
     toast("error", messageOf(error));
   }
@@ -804,10 +811,17 @@ export function listenForSubmissions() {
   });
   api.addEventListener<SubmissionEvent>("deadline.confirm", ({ detail }) => {
     const submission = state.submission;
-    if (!submission || detail.submissionId !== submission.id) {
+    const promptNumber = detail.promptNumber;
+    if (
+      !submission ||
+      detail.submissionId !== submission.id ||
+      typeof promptNumber !== "number" ||
+      !Number.isSafeInteger(promptNumber) ||
+      promptNumber < 1
+    ) {
       return;
     }
-    submission.confirm = { message: detail.message ?? "", default: detail.default };
+    submission.confirm = { message: detail.message ?? "", default: detail.default, promptNumber };
     refresh("submit");
     if (!views.size) {
       openDialog();

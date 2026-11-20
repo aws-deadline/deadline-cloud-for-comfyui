@@ -36,6 +36,21 @@ function jobs() {
       clientId: body.clientId,
     }));
 }
+function emitConfirmation(promptNumber, message = "Upload?", defaultAnswer = true) {
+  try {
+    api.emit("deadline.confirm", {
+      submissionId: state.submission.id,
+      message,
+      default: defaultAnswer,
+      promptNumber,
+    });
+  } catch {
+    // Without a document, opening the dialog fails after the prompt has been recorded.
+  }
+}
+function confirmationAnswers() {
+  return api.calls.filter(({ path }) => path === "/deadline/jobs/confirm").map(({ body }) => body);
+}
 
 api.handlers["/deadline/cloud/status"] = async () => ({
   authenticationStatus: "AUTHENTICATED",
@@ -52,15 +67,45 @@ const result = {};
 const scenario = process.argv[2];
 
 if (scenario === "answer-confirmation") {
-  state.submission = {
-    id: "a".repeat(32),
-    confirm: { message: "Upload?", default: true },
-  };
+  state.submission = { id: "a".repeat(32), starting: false };
+  emitConfirmation(1);
   api.handlers["/deadline/jobs/confirm"] = async () => ({});
   await ui.__answerConfirmation(true);
   // Clicking again cannot send an answer once the pending prompt has been cleared.
   await ui.__answerConfirmation(true);
-  result.answers = api.calls.filter(({ path }) => path === "/deadline/jobs/confirm").map(({ body }) => body);
+  result.answers = confirmationAnswers();
+  result.pending = state.submission.confirm;
+} else if (scenario === "answer-while-next-prompt-arrives") {
+  state.submission = { id: "a".repeat(32), starting: false };
+  emitConfirmation(1);
+  const firstResponse = deferred();
+  api.handlers["/deadline/jobs/confirm"] = async (body) => {
+    if (body.promptNumber === 1) {
+      emitConfirmation(2, "Run hooks?", false);
+      await firstResponse.promise;
+    }
+    return {};
+  };
+  const firstAnswer = ui.__answerConfirmation(true);
+  await settle();
+  result.answersWhileFirstPending = confirmationAnswers();
+  result.nextPrompt = state.submission.confirm;
+  firstResponse.resolve();
+  await firstAnswer;
+  // Completing the old answer must preserve the next prompt until it is answered separately.
+  await ui.__answerConfirmation(false);
+  result.answers = confirmationAnswers();
+  result.pending = state.submission.confirm;
+} else if (scenario === "cancel-submission") {
+  state.submission = { id: "a".repeat(32), starting: false };
+  api.handlers["/deadline/jobs/cancel"] = async () => ({});
+  await ui.__cancelSubmission();
+  result.cancels = api.calls.filter(({ path }) => path === "/deadline/jobs/cancel").map(({ body }) => body);
+} else if (scenario === "invalid-prompt-number") {
+  state.submission = { id: "a".repeat(32), starting: false, confirm: null };
+  for (const number of [undefined, null, 0, -1, 1.5, "1", Number.MAX_SAFE_INTEGER + 1]) {
+    emitConfirmation(number);
+  }
   result.pending = state.submission.confirm;
 } else if (scenario === "edited-before-replanning") {
   // The artist edits the graph and submits before the debounced plan request starts.
@@ -147,7 +192,7 @@ if (scenario === "answer-confirmation") {
   const detail = { submissionId, name: "ComfyUI - fox" };
   try {
     if (scenario === "early-confirm") {
-      api.emit("deadline.confirm", { ...detail, message: "Upload 5 GB?", default: true });
+      api.emit("deadline.confirm", { ...detail, message: "Upload 5 GB?", default: true, promptNumber: 1 });
     } else {
       api.emit("deadline.submitted", { ...detail, status: "SUBMITTED", jobId: "job-1" });
     }
