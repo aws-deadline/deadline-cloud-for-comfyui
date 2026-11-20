@@ -103,30 +103,27 @@ def test_a_confirmation_before_the_response_is_shown(run_scenario):
     assert result["submission"]["confirm"] == {
         "message": "Upload 5 GB?",
         "default": True,
-        "promptNumber": 1,
     }
     assert result["submission"]["starting"] is False
 
 
-def test_confirmation_answers_include_the_submitting_client_and_prompt_number(run_scenario):
+def test_confirmation_answers_include_the_submitting_client(run_scenario):
     result = run_scenario("answer-confirmation")
     assert result == {
-        "answers": [
-            {"submissionId": "a" * 32, "clientId": "tab-1", "promptNumber": 1, "accept": True}
-        ],
+        "answers": [{"submissionId": "a" * 32, "clientId": "tab-1", "accept": True}],
         "pending": None,
     }
 
 
-def test_confirmation_answers_keep_their_number_when_a_new_prompt_arrives(run_scenario):
+def test_a_new_confirmation_survives_an_earlier_answer_finishing(run_scenario):
     result = run_scenario("answer-while-next-prompt-arrives")
     assert result["answersWhileFirstPending"] == [
-        {"submissionId": "a" * 32, "clientId": "tab-1", "promptNumber": 1, "accept": True}
+        {"submissionId": "a" * 32, "clientId": "tab-1", "accept": True}
     ]
-    assert result["nextPrompt"] == {"message": "Run hooks?", "default": False, "promptNumber": 2}
+    assert result["nextPrompt"] == {"message": "Run hooks?", "default": False}
     assert result["answers"] == [
-        {"submissionId": "a" * 32, "clientId": "tab-1", "promptNumber": 1, "accept": True},
-        {"submissionId": "a" * 32, "clientId": "tab-1", "promptNumber": 2, "accept": False},
+        {"submissionId": "a" * 32, "clientId": "tab-1", "accept": True},
+        {"submissionId": "a" * 32, "clientId": "tab-1", "accept": False},
     ]
     assert result["pending"] is None
 
@@ -135,10 +132,6 @@ def test_cancel_requests_include_the_submitting_client(run_scenario):
     assert run_scenario("cancel-submission")["cancels"] == [
         {"submissionId": "a" * 32, "clientId": "tab-1"}
     ]
-
-
-def test_confirmation_events_require_a_positive_integer_prompt_number(run_scenario):
-    assert run_scenario("invalid-prompt-number")["pending"] is None
 
 
 def test_a_submission_finished_before_the_response_is_cleared(run_scenario):

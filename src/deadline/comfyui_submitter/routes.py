@@ -877,11 +877,7 @@ async def _watch_submission(submission_id: str) -> None:
                 _send(PROGRESS_EVENT, {**base, **data, "kind": kind}, submission.client_id)
             elif kind == "confirm":
                 submission.confirms += 1
-                _send(
-                    CONFIRM_EVENT,
-                    {**base, **data, "promptNumber": submission.confirms},
-                    submission.client_id,
-                )
+                _send(CONFIRM_EVENT, {**base, **data}, submission.client_id)
                 submission.timers.append(
                     asyncio.create_task(
                         _decline_unanswered(submission_id, submission, submission.confirms)
@@ -990,11 +986,8 @@ async def confirm_submission(request: web.Request) -> web.Response:
         return _error(403, "Only the browser tab that started this submission can confirm it.")
     if submission.canceled or submission.confirms <= submission.answered:
         return _error(409, "That submission has no pending confirmation.")
-    number = body.get("promptNumber")
-    if type(number) is not int or number != submission.confirms:
-        return _error(409, "That confirmation is no longer pending.")
     # Claim this prompt before yielding to the bridge, so another answer cannot queue behind it.
-    submission.answered = number
+    submission.answered = submission.confirms
     if not await _write_line(submission.process, {"accept": body.get("accept") is True}):
         return _error(404, "That submission isn't running.")
     return web.json_response({})

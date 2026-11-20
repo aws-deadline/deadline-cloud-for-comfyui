@@ -649,7 +649,6 @@ async def submit_and_confirm(comfy, body, accept=True):
                 json={
                     "submissionId": result["submissionId"],
                     "clientId": body.get("clientId"),
-                    "promptNumber": prompts[-1]["promptNumber"],
                     "accept": accept,
                 },
             )
@@ -708,7 +707,7 @@ def test_jobs_submits_with_the_library(comfy, monkeypatch):
     )
     assert events[1] == (
         "deadline.confirm",
-        {**submission, "message": "Upload?", "default": True, "promptNumber": 1},
+        {**submission, "message": "Upload?", "default": True},
     )
     # The panel shows each job's output directory, where Download puts its outputs.
     assert events[2] == (
@@ -1132,7 +1131,7 @@ def test_jobs_cancel_the_unanswered_confirmation_timer_when_the_submission_ends(
     assert comfy.routes._watchers == set()
 
 
-def test_jobs_number_each_prompt_and_reject_answers_to_an_earlier_one(comfy, monkeypatch):
+def test_jobs_accept_answers_to_successive_prompts(comfy, monkeypatch):
     fake_cli(monkeypatch, comfy.tmp_path, "")
     fake_bridge(
         monkeypatch, comfy.tmp_path, {"submit": ["confirm", "confirm", result({"jobId": "job-1"})]}
@@ -1150,7 +1149,7 @@ def test_jobs_number_each_prompt_and_reject_answers_to_an_earlier_one(comfy, mon
                     prompts = [
                         data for event, data in comfy.server.events if event == "deadline.confirm"
                     ]
-                    if prompts and prompts[-1]["promptNumber"] == number:
+                    if len(prompts) == number:
                         break
                     await asyncio.sleep(0.05)
                 else:
@@ -1158,21 +1157,15 @@ def test_jobs_number_each_prompt_and_reject_answers_to_an_earlier_one(comfy, mon
                 answer = {
                     "submissionId": submission_id,
                     "clientId": JOB["clientId"],
-                    "promptNumber": number,
                     "accept": True,
                 }
-                if number == 2:
-                    stale = await client.post(
-                        "/deadline/jobs/confirm", json={**answer, "promptNumber": 1}
-                    )
-                    assert stale.status == 409
                 accepted = await client.post("/deadline/jobs/confirm", json=answer)
                 assert accepted.status == 200
             await asyncio.gather(*comfy.routes._watchers)
 
     run(confirm_both_prompts())
     prompts = [data for event, data in comfy.server.events if event == "deadline.confirm"]
-    assert [prompt["promptNumber"] for prompt in prompts] == [1, 2]
+    assert len(prompts) == 2
     assert all(sid == JOB["clientId"] for sid in comfy.server.sids)
     assert comfy.server.events[-1][1]["status"] == "SUBMITTED"
 
@@ -1228,7 +1221,6 @@ def test_confirm_rejects_answers_without_a_pending_prompt(comfy, monkeypatch, co
             {
                 "submissionId": "a" * 32,
                 "clientId": "tab-1",
-                "promptNumber": 1,
                 "accept": True,
             },
         )
@@ -1264,7 +1256,7 @@ def test_submission_controls_reject_other_or_invalid_clients(comfy, monkeypatch,
         call(
             comfy,
             path,
-            {"submissionId": "a" * 32, "promptNumber": 1, "accept": True, **client},
+            {"submissionId": "a" * 32, "accept": True, **client},
         )
     )
     assert status == 403
@@ -1274,52 +1266,18 @@ def test_submission_controls_reject_other_or_invalid_clients(comfy, monkeypatch,
     assert process.killed is False
 
 
-@pytest.mark.parametrize(
-    "prompt",
-    [
-        {},
-        {"promptNumber": None},
-        {"promptNumber": 0},
-        {"promptNumber": -1},
-        {"promptNumber": 2},
-        {"promptNumber": "1"},
-        {"promptNumber": 1.0},
-        {"promptNumber": True},
-        {"promptNumber": False},
-        {"promptNumber": []},
-        {"promptNumber": {}},
-    ],
-)
-def test_confirm_requires_the_pending_prompt_number(comfy, monkeypatch, prompt):
-    process = _RecordingProcess()
-    submission = comfy.routes._Submission("fox", process, client_id="tab-1", confirms=1)
-    monkeypatch.setitem(comfy.routes._submissions, "a" * 32, submission)
-    status, response = run(
-        call(
-            comfy,
-            "/deadline/jobs/confirm",
-            {"submissionId": "a" * 32, "clientId": "tab-1", "accept": True, **prompt},
-        )
-    )
-    assert status == 409
-    assert "no longer pending" in response["error"]
-    assert process.answers == []
-    assert submission.answered == 0
-
-
 def test_confirm_only_answers_each_pending_prompt_once(comfy, monkeypatch):
     process = _RecordingProcess()
     submission = comfy.routes._Submission("fox", process, client_id="tab-1")
     monkeypatch.setitem(comfy.routes._submissions, "a" * 32, submission)
 
-    async def answer(number=1, accept=True):
+    async def answer(accept=True):
         return await call(
             comfy,
             "/deadline/jobs/confirm",
             {
                 "submissionId": "a" * 32,
                 "clientId": "tab-1",
-                "promptNumber": number,
                 "accept": accept,
             },
         )
@@ -1332,12 +1290,8 @@ def test_confirm_only_answers_each_pending_prompt_once(comfy, monkeypatch):
         assert sorted(status for status, _ in responses) == [200, 409]
         assert (await answer())[0] == 409
         submission.confirms = 2
-        # A delayed answer to prompt 1 cannot claim prompt 2.
+        assert (await answer(accept=False))[0] == 200
         assert (await answer())[0] == 409
-        assert submission.answered == 1
-        assert process.answers == [{"accept": True}]
-        assert (await answer(2, accept=False))[0] == 200
-        assert (await answer(2))[0] == 409
 
     run(confirm_prompts())
     assert process.answers == [{"accept": True}, {"accept": False}]
@@ -1357,7 +1311,6 @@ def test_confirm_rejects_a_canceled_submission(comfy, monkeypatch):
             {
                 "submissionId": "a" * 32,
                 "clientId": "tab-1",
-                "promptNumber": 1,
                 "accept": True,
             },
         )
@@ -1385,7 +1338,7 @@ class _ExitedProcess:
 @pytest.mark.parametrize(
     ("path", "body", "status"),
     [
-        ("/deadline/jobs/confirm", {"accept": True, "promptNumber": 1}, 404),
+        ("/deadline/jobs/confirm", {"accept": True}, 404),
         ("/deadline/jobs/cancel", {}, 200),
     ],
 )

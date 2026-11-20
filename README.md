@@ -230,7 +230,7 @@ the same machine.
 - Submission progress, confirmation prompts and errors, and download progress go only to the
   browser tab that started them, not to every tab connected to the server.
 - A submission requires a valid browser client ID. Only that client can confirm or cancel it,
-  and a confirmation answer must identify the current pending prompt.
+  and confirmation answers are accepted only while a prompt is pending.
 - Job bundles in `ComfyUI/user/deadline_submissions/` hold your workflows, prompts and file paths.
   On Linux and macOS that folder and each bundle in it can only be opened by the user that runs
   ComfyUI (mode `0700`), and the files the extension writes there can only be read by that user

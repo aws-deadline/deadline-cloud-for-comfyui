@@ -93,7 +93,7 @@ interface Submission {
   name?: string;
   stage?: string;
   progress?: number;
-  confirm?: { message: string; default?: boolean; promptNumber: number } | null;
+  confirm?: { message: string; default?: boolean } | null;
 }
 
 interface Job {
@@ -125,7 +125,6 @@ interface SubmissionEvent {
   progress?: number;
   message?: string;
   default?: boolean;
-  promptNumber?: number;
   status?: "SUBMITTED" | "FAILED" | "CANCELED";
   jobId?: string;
   farmId?: string;
@@ -753,18 +752,15 @@ export async function submit() {
 
 async function answerConfirmation(accept: boolean) {
   const submission = state.submission;
-  const confirmation = submission?.confirm;
-  if (!submission || !confirmation) {
+  if (!submission?.confirm) {
     return;
   }
-  const promptNumber = confirmation.promptNumber;
   submission.confirm = null;
   refresh("submit");
   try {
     await postJson("/deadline/jobs/confirm", {
       submissionId: submission.id,
       clientId: api.clientId,
-      promptNumber,
       accept,
     });
   } catch (error) {
@@ -811,17 +807,10 @@ export function listenForSubmissions() {
   });
   api.addEventListener<SubmissionEvent>("deadline.confirm", ({ detail }) => {
     const submission = state.submission;
-    const promptNumber = detail.promptNumber;
-    if (
-      !submission ||
-      detail.submissionId !== submission.id ||
-      typeof promptNumber !== "number" ||
-      !Number.isSafeInteger(promptNumber) ||
-      promptNumber < 1
-    ) {
+    if (!submission || detail.submissionId !== submission.id) {
       return;
     }
-    submission.confirm = { message: detail.message ?? "", default: detail.default, promptNumber };
+    submission.confirm = { message: detail.message ?? "", default: detail.default };
     refresh("submit");
     if (!views.size) {
       openDialog();
