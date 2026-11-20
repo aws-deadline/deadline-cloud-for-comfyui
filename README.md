@@ -223,7 +223,8 @@ the same machine.
 - They only accept requests addressed to `localhost` or a loopback address such as `127.0.0.1`,
   so a website that points its own domain name at this machine can't pass for ComfyUI's page.
 - They refuse requests that a browser marks as coming from another website, even when
-  `--enable-cors-header` turns off ComfyUI's own check.
+  `--enable-cors-header` turns off ComfyUI's own check. When an `Origin` header is present, its
+  scheme, host and port must match the ComfyUI request, even without browser fetch metadata.
 - They only accept JSON, which a page from another website can't send without the server's
   permission.
 - Submission progress, confirmation prompts and errors, and download progress go only to the
