@@ -86,6 +86,8 @@ parameterDefinitions:
   default: ""
   description: >
     Extra command line arguments for the ComfyUI server, for example "--lowvram".
+    Use quotes to group arguments that contain spaces. Shell commands, variable
+    expansion and command substitution are not supported.
 - name: ServerStartTimeout
   type: INT
   userInterface:
@@ -128,6 +130,15 @@ jobEnvironments:
     nodes and inputs, for the tasks in the session to share.
   variables:
     COMFY_NO_TELEMETRY: "1"
+    COMFYUI_SESSION_DIR: "{{Session.WorkingDirectory}}"
+    COMFYUI_MODEL_DIRECTORY: "{{Param.ModelDirectory}}"
+    COMFYUI_EXTRA_MODEL_PATHS_CONFIG: "{{Param.ExtraModelPathsConfig}}"
+    COMFYUI_INPUT_DIR: "{{Param.InputDir}}"
+    COMFYUI_OUTPUT_DIR: "{{Param.OutputDir}}"
+    COMFYUI_ARGS: "{{Param.ComfyUIArgs}}"
+    COMFYUI_SERVER_START_TIMEOUT: "{{Param.ServerStartTimeout}}"
+    COMFYUI_WORKFLOW_FILE: "{{Param.WorkflowFile}}"
+    COMFYUI_WORKFLOW_TIMEOUT: "{{Param.WorkflowTimeout}}"
   script:
     actions:
       onEnter:
@@ -146,45 +157,38 @@ jobEnvironments:
         #!/bin/env bash
         set -euo pipefail
 
-        # Prints an extra model paths entry for each model folder in a directory, such as loras/ or
-        # style_models/. Each folder is named after the ComfyUI model folder type it holds, so any
-        # type the submitter attaches is found, not only a fixed list.
-        model_folders() {
-            local FOLDER NAME
-            for FOLDER in "$1"/*/; do
-                [ -d "$FOLDER" ] || continue
-                NAME="$(basename "$FOLDER")"
-                if [[ "$NAME" =~ ^[A-Za-z0-9_]+$ ]]; then
-                    echo "    $NAME: $NAME/"
-                fi
-            done
-        }
+        MODEL_PATHS="$COMFYUI_SESSION_DIR/extra_model_paths.yaml"
+        # JSON is also valid YAML. Serializing the paths preserves quotes and line breaks.
+        python - <<'PY'
+        import json
+        import os
+        import re
+        from pathlib import Path
 
-        MODEL_PATHS='{{Session.WorkingDirectory}}/extra_model_paths.yaml'
-        : > "$MODEL_PATHS"
-        if [ -n "${COMFYUI_CUSTOM_NODES_DIR:-}" ] && [ -d "$COMFYUI_CUSTOM_NODES_DIR" ]; then
-            cat >> "$MODEL_PATHS" <<EOF
-        conda_custom_nodes:
-            custom_nodes: $COMFYUI_CUSTOM_NODES_DIR
-        EOF
-            echo "Custom nodes from the conda environment: $(ls "$COMFYUI_CUSTOM_NODES_DIR" | xargs)"
-        fi
-        # Path mapping turns ModelDirectory into the folder where the model files were attached.
-        if [ -n '{{Param.ModelDirectory}}' ] && [ -d '{{Param.ModelDirectory}}' ]; then
-            cat >> "$MODEL_PATHS" <<EOF
-        model_directory:
-            base_path: '{{Param.ModelDirectory}}'
-        EOF
-            model_folders '{{Param.ModelDirectory}}' >> "$MODEL_PATHS"
-            echo "Attached model folders: $(ls '{{Param.ModelDirectory}}' | xargs)"
-        fi
+        paths = {}
+        custom_nodes = os.environ.get("COMFYUI_CUSTOM_NODES_DIR", "")
+        if custom_nodes and Path(custom_nodes).is_dir():
+            paths["conda_custom_nodes"] = {"custom_nodes": custom_nodes}
+        # Param.ModelDirectory has already had OpenJD's path mapping applied.
+        model_directory = os.environ["COMFYUI_MODEL_DIRECTORY"]
+        if model_directory and Path(model_directory).is_dir():
+            folders = {
+                folder.name: folder.name + "/"
+                for folder in sorted(Path(model_directory).iterdir())
+                if folder.is_dir() and re.fullmatch(r"[A-Za-z0-9_]+", folder.name)
+            }
+            paths["model_directory"] = {"base_path": model_directory, **folders}
+        with open(Path(os.environ["COMFYUI_SESSION_DIR"]) / "extra_model_paths.yaml", "w") as f:
+            if paths:
+                json.dump(paths, f, indent=2)
+        PY
         # ComfyUI can't read an empty extra model paths file, so it's only passed with entries.
         MODEL_PATH_FILES=()
         if [ -s "$MODEL_PATHS" ]; then
             MODEL_PATH_FILES+=("$MODEL_PATHS")
         fi
-        if [ -n '{{Param.ExtraModelPathsConfig}}' ]; then
-            MODEL_PATH_FILES+=('{{Param.ExtraModelPathsConfig}}')
+        if [ -n "$COMFYUI_EXTRA_MODEL_PATHS_CONFIG" ]; then
+            MODEL_PATH_FILES+=("$COMFYUI_EXTRA_MODEL_PATHS_CONFIG")
         fi
         MODEL_PATH_ARGS=()
         if [ ${#MODEL_PATH_FILES[@]} -gt 0 ]; then
@@ -193,28 +197,47 @@ jobEnvironments:
 
         # Keep ComfyUI's data out of the shared conda environment: use a base directory
         # in the session. ComfyUI 0.38.0 fails to start on one without custom_nodes/.
-        BASE_DIR='{{Session.WorkingDirectory}}/comfyui'
+        BASE_DIR="$COMFYUI_SESSION_DIR/comfyui"
 
         # Path mapping turns InputDir into the folder where the job's input files were attached.
-        INPUT_DIR='{{Param.InputDir}}'
+        INPUT_DIR="$COMFYUI_INPUT_DIR"
         if [ -z "$INPUT_DIR" ]; then
             INPUT_DIR="$BASE_DIR/input"
         fi
         echo "Input directory: $INPUT_DIR"
-        mkdir -p "$BASE_DIR/custom_nodes" '{{Param.OutputDir}}' "$INPUT_DIR"
+        mkdir -p "$BASE_DIR/custom_nodes" "$COMFYUI_OUTPUT_DIR" "$INPUT_DIR"
 
         PORT=$(python -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
         echo "openjd_status: Starting ComfyUI with comfy launch"
-        comfy --skip-prompt --workspace "$COMFYUI_LOCATION" launch --background -- \
-            --listen 127.0.0.1 --port "$PORT" \
-            --base-directory "$BASE_DIR" \
-            --input-directory "$INPUT_DIR" \
-            --output-directory '{{Param.OutputDir}}' \
-            ${MODEL_PATH_ARGS[@]+"${MODEL_PATH_ARGS[@]}"} \
-            {{Param.ComfyUIArgs}}
+        # Parse the extra arguments as words, then pass them directly as argv.
+        COMFYUI_PORT="$PORT" COMFYUI_BASE_DIR="$BASE_DIR" COMFYUI_INPUT_DIR="$INPUT_DIR" \
+            python - ${MODEL_PATH_ARGS[@]+"${MODEL_PATH_ARGS[@]}"} <<'PY'
+        import os
+        import shlex
+        import subprocess
+        import sys
+
+        try:
+            extra_args = shlex.split(os.environ["COMFYUI_ARGS"])
+        except ValueError as e:
+            print(f"openjd_fail: Invalid Extra ComfyUI Arguments: {e}", flush=True)
+            sys.exit(1)
+        subprocess.run(
+            [
+                "comfy", "--skip-prompt", "--workspace", os.environ["COMFYUI_LOCATION"],
+                "launch", "--background", "--",
+                "--listen", "127.0.0.1", "--port", os.environ["COMFYUI_PORT"],
+                "--base-directory", os.environ["COMFYUI_BASE_DIR"],
+                "--input-directory", os.environ["COMFYUI_INPUT_DIR"],
+                "--output-directory", os.environ["COMFYUI_OUTPUT_DIR"],
+                *sys.argv[1:], *extra_args,
+            ],
+            check=True,
+        )
+        PY
         echo "openjd_env: COMFYUI_PORT=$PORT"
 
-        for (( i = 0; i < {{Param.ServerStartTimeout}}; i++ )); do
+        for (( i = 0; i < COMFYUI_SERVER_START_TIMEOUT; i++ )); do
             if curl -sf "http://127.0.0.1:$PORT/system_stats" > /dev/null; then
                 echo "ComfyUI server is ready after ${i}s"
                 curl -s "http://127.0.0.1:$PORT/system_stats"; echo
@@ -232,7 +255,7 @@ jobEnvironments:
             fi
             sleep 1
         done
-        echo "openjd_fail: The ComfyUI server didn't start within {{Param.ServerStartTimeout}}s"
+        echo "openjd_fail: The ComfyUI server didn't start within ${COMFYUI_SERVER_START_TIMEOUT}s"
         exit 1
     - name: Exit
       filename: exit-comfyui-server.sh
@@ -268,8 +291,8 @@ steps:
         import urllib.request
 
         PORT = os.environ["COMFYUI_PORT"]
-        OUTPUT_DIR = r"{{Param.OutputDir}}"
-        WORKFLOW_TIMEOUT = int("{{Param.WorkflowTimeout}}")
+        OUTPUT_DIR = os.environ["COMFYUI_OUTPUT_DIR"]
+        WORKFLOW_TIMEOUT = int(os.environ["COMFYUI_WORKFLOW_TIMEOUT"])
         SERVER = ["--where", "local", "--host", "127.0.0.1", "--port", PORT]
 
 
@@ -322,7 +345,7 @@ steps:
         # Convert the workflow to API format. comfy-cli accepts both formats, and converts
         # UI-format workflows using the running server's node definitions.
         print("openjd_status: Preparing the workflow", flush=True)
-        preview = comfy_run("--workflow", r"{{Param.WorkflowFile}}", "--print-prompt")
+        preview = comfy_run("--workflow", os.environ["COMFYUI_WORKFLOW_FILE"], "--print-prompt")
         workflow = (preview.get("data") or {}).get("prompt")
         if not isinstance(workflow, dict) or not workflow:
             fail("comfy run --print-prompt returned no workflow")

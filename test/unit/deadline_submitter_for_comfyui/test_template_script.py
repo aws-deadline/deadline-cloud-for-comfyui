@@ -27,6 +27,21 @@ pytestmark = pytest.mark.skipif(os.name == "nt", reason="The stand-in comfy is a
 TEMPLATE = yaml.safe_load(submit.JOB_TEMPLATE.read_text())
 
 
+def environment_values(tmp_path: Path, **parameters: str) -> dict[str, str]:
+    """Resolve the job environment's variables as OpenJD does, without editing script source."""
+    values = {p["name"]: str(p.get("default", "")) for p in TEMPLATE["parameterDefinitions"]}
+    values.update(parameters)
+    [environment] = TEMPLATE["jobEnvironments"]
+    result = {}
+    for name, value in environment["variables"].items():
+        value = value.replace("{{Session.WorkingDirectory}}", str(tmp_path))
+        for parameter, parameter_value in values.items():
+            value = value.replace("{{Param." + parameter + "}}", parameter_value)
+        assert "{{" not in value
+        result[name] = value
+    return result
+
+
 def run_task(
     tmp_path: Path,
     workflow: dict,
@@ -74,18 +89,19 @@ def run_task(
         f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(stand_in))} "$@"\n'
     )
     comfy.chmod(0o755)
-    script = (
-        TEMPLATE["steps"][0]["script"]["embeddedFiles"][0]["data"]
-        .replace("{{Param.OutputDir}}", str(tmp_path / "out"))
-        .replace("{{Param.WorkflowFile}}", str(workflow_file))
-        .replace("{{Param.WorkflowTimeout}}", str(workflow_timeout))
-    )
+    script = TEMPLATE["steps"][0]["script"]["embeddedFiles"][0]["data"]
     (tmp_path / "run.py").write_text(script, encoding="utf-8")
     env = {
         **os.environ,
         "PATH": f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}",
         "COMFYUI_PORT": str(port),
         "PYTHONIOENCODING": "utf-8",
+        **environment_values(
+            tmp_path,
+            OutputDir=str(tmp_path / "out"),
+            WorkflowFile=str(workflow_file),
+            WorkflowTimeout=str(workflow_timeout),
+        ),
     }
     result = subprocess.run(
         [sys.executable, str(tmp_path / "run.py")],
@@ -107,19 +123,12 @@ def comfy_calls(tmp_path: Path) -> list[list[str]]:
     return [json.loads(line) for line in lines]
 
 
-def enter_script(
-    tmp_path: Path, end: str, model_directory: Path | None = None, extra: str = ""
-) -> str:
-    """The start of the server environment's Enter script, with the job's values filled in."""
+def enter_script(end: str | None = None) -> str:
+    """The server environment's Enter script, or its prefix, without source substitutions."""
     [environment] = TEMPLATE["jobEnvironments"]
     [enter] = [f for f in environment["script"]["embeddedFiles"] if f["name"] == "Enter"]
     data = enter["data"]
-    return (
-        data[data.index("model_folders() {") : data.index(end)]
-        .replace("{{Session.WorkingDirectory}}", str(tmp_path))
-        .replace("{{Param.ModelDirectory}}", str(model_directory or ""))
-        .replace("{{Param.ExtraModelPathsConfig}}", extra)
-    )
+    return data if end is None else data[: data.index(end)]
 
 
 def write_model_paths(
@@ -129,11 +138,12 @@ def write_model_paths(
     Runs the part of the Enter script that writes extra_model_paths.yaml, and returns the config
     it wrote.
     """
-    script = enter_script(tmp_path, "# ComfyUI can't read an empty", model_directory)
+    script = enter_script("# ComfyUI can't read an empty")
     result = subprocess.run(
         ["bash", "-c", "set -euo pipefail\n" + script],
         env={
             "PATH": os.environ["PATH"],
+            **environment_values(tmp_path, ModelDirectory=str(model_directory or "")),
             **({"COMFYUI_CUSTOM_NODES_DIR": str(conda_nodes)} if conda_nodes else {}),
         },
         capture_output=True,
@@ -181,17 +191,21 @@ def model_path_args(
     model_directory: Path | None = None,
 ) -> list[str]:
     """The extra model paths arguments the Enter script passes to ComfyUI."""
-    script = enter_script(tmp_path, "# Keep ComfyUI's data out", model_directory, extra)
+    script = enter_script("# Keep ComfyUI's data out")
     result = subprocess.run(
         [
             "bash",
             "-c",
             "set -euo pipefail\n"
             + script
-            + '\necho ARGS; printf "%s\\n" ${MODEL_PATH_ARGS[@]+"${MODEL_PATH_ARGS[@]}"}',
+            + "\npython -c 'import json, sys; print(json.dumps(sys.argv[1:]))'"
+            + ' ${MODEL_PATH_ARGS[@]+"${MODEL_PATH_ARGS[@]}"}',
         ],
         env={
             "PATH": os.environ["PATH"],
+            **environment_values(
+                tmp_path, ModelDirectory=str(model_directory or ""), ExtraModelPathsConfig=extra
+            ),
             **({"COMFYUI_CUSTOM_NODES_DIR": str(conda_nodes)} if conda_nodes else {}),
         },
         capture_output=True,
@@ -199,7 +213,7 @@ def model_path_args(
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    return result.stdout.split("ARGS\n", 1)[1].split()
+    return json.loads(result.stdout)
 
 
 def test_an_empty_extra_model_paths_file_isnt_passed_to_comfyui(tmp_path):
@@ -231,6 +245,107 @@ def test_attached_models_and_the_studio_config_are_both_passed(tmp_path):
     ]
 
 
+def test_model_paths_preserve_quotes_and_line_breaks(tmp_path):
+    attached = tmp_path / 'artist\'s "models"\n$folder'
+    (attached / "checkpoints").mkdir(parents=True)
+    conda_nodes = tmp_path / 'artist\'s "custom nodes"\n$folder'
+    conda_nodes.mkdir()
+    assert write_model_paths(tmp_path, attached, conda_nodes) == {
+        "model_directory": {"base_path": str(attached), "checkpoints": "checkpoints/"},
+        "conda_custom_nodes": {"custom_nodes": str(conda_nodes)},
+    }
+    studio = str(tmp_path / 'artist\'s "config"; $(touch injected).yaml')
+    assert model_path_args(tmp_path, studio, conda_nodes, attached) == [
+        "--extra-model-paths-config",
+        str(tmp_path / "extra_model_paths.yaml"),
+        studio,
+    ]
+    assert not (tmp_path / "injected").exists()
+
+
+def run_enter(tmp_path: Path, **parameters: str) -> tuple[subprocess.CompletedProcess, list[str]]:
+    """Run the whole Enter script with stand-in comfy and curl commands, without a listener."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "launch_calls.jsonl"
+    stand_in = tmp_path / "comfy.py"
+    stand_in.write_text(textwrap.dedent(f"""\
+        import json, sys
+        with open({str(calls)!r}, "a") as f:
+            f.write(json.dumps(sys.argv[1:]) + "\\n")
+        if "logs" in sys.argv:
+            print(json.dumps({{"data": {{"lines": []}}}}))
+        """))
+    comfy = bin_dir / "comfy"
+    comfy.write_text(
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(stand_in))} "$@"\n'
+    )
+    comfy.chmod(0o755)
+    curl = bin_dir / "curl"
+    curl.write_text('#!/bin/sh\nprintf "{}\\n"\n')
+    curl.chmod(0o755)
+    (bin_dir / "python").symlink_to(sys.executable)
+    result = subprocess.run(
+        ["bash", "-c", enter_script()],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "COMFYUI_LOCATION": str(tmp_path / "ComfyUI"),
+            **environment_values(tmp_path, **parameters),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    launches = []
+    if calls.exists():
+        for line in calls.read_text().splitlines():
+            args = json.loads(line)
+            if "launch" in args:
+                launches.append(args)
+    return result, launches[0] if launches else []
+
+
+def test_enter_passes_paths_and_extra_arguments_as_literal_argv(tmp_path):
+    session = tmp_path / 'artist\'s "session"; $value'
+    session.mkdir()
+    output = str(session / "out'\"; $(touch injected)")
+    inputs = str(session / "input'\"; `touch injected`")
+    config = str(session / "extra'\" model paths.yaml")
+    extra_args = "--lowvram --name \"two words\" --literal '$(touch injected)' ; touch injected"
+    result, args = run_enter(
+        session,
+        InputDir=inputs,
+        OutputDir=output,
+        ExtraModelPathsConfig=config,
+        ComfyUIArgs=extra_args,
+    )
+    assert result.returncode == 0, result.stderr
+    assert args[args.index("--input-directory") + 1] == inputs
+    assert args[args.index("--output-directory") + 1] == output
+    assert args[args.index("--extra-model-paths-config") + 1] == config
+    assert args[-8:] == [
+        "--lowvram",
+        "--name",
+        "two words",
+        "--literal",
+        "$(touch injected)",
+        ";",
+        "touch",
+        "injected",
+    ]
+    assert not (session / "injected").exists()
+    assert Path(output).is_dir()
+
+
+def test_enter_rejects_unclosed_argument_quotes_before_launching(tmp_path):
+    result, args = run_enter(tmp_path, ComfyUIArgs='--name "unfinished')
+    assert result.returncode != 0
+    assert "openjd_fail: Invalid Extra ComfyUI Arguments" in result.stdout
+    assert args == []
+
+
 # Line and paragraph separators that str.splitlines() also splits on, and other non-ASCII text.
 UNUSUAL_TEXT = "final fade.   \x85\x0b\x0c\x1c — café, naïve 🦊"
 
@@ -250,6 +365,17 @@ def test_prompts_with_line_separators_and_other_unicode_run(tmp_path):
     assert ran["9"]["inputs"]["filename_prefix"] == "fox — café 🦊"
     [preview, run] = comfy_calls(tmp_path)
     assert "--print-prompt" in preview and "--wait" in run
+
+
+def test_task_paths_with_quotes_and_shell_characters_run(tmp_path):
+    session = tmp_path / 'artist\'s "session"; $(touch injected)'
+    session.mkdir()
+    code, output, ran = run_task(session, _prompt("fox"))
+    assert code == 0, output
+    assert ran == _prompt("fox")
+    [preview, _] = comfy_calls(session)
+    assert preview[preview.index("--workflow") + 1] == str(session / "workflow_api.json")
+    assert not (session / "injected").exists()
 
 
 def test_output_without_an_envelope_says_so(tmp_path):
