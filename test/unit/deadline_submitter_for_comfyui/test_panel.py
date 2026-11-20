@@ -57,7 +57,7 @@ def _run_scenario(tmp_path: Path, ui_source: str, scenario: str) -> dict:
         "\nexport { state as __state, queueParameterValue as __queueParameterValue,"
         " parameterControl as __parameterControl, RENDERERS as __renderers,"
         " pollJobs as __pollJobs, formFromRequirements as __formFromRequirements,"
-        " requirementsFromForm as __requirementsFromForm };\n"
+        " requirementsFromForm as __requirementsFromForm, createView as __createView };\n"
     )
     (web / "deadline_ui.js").write_text(ui_source + exports, encoding="utf-8")
     (tmp_path / "package.json").write_text('{"type": "module"}')
@@ -155,6 +155,18 @@ def test_every_attachment_is_listed_and_can_be_removed_or_restored(run_scenario)
         "filenames": [*planned, external],
         "directories": ["/outside/frames"],
     }
+
+
+def test_attachment_lists_keep_independent_scroll_positions_when_updated(run_scenario):
+    result = run_scenario("all-attachments")
+    assert result["scrollAfterRemoving"] == 640
+    assert result["scrollAfterRestoring"] == 640
+    assert result["inputScrollAfterAddingModels"] == 640
+    assert result["newModelScroll"] == 0
+    assert result["scrollAfterRemovingModel"] == {"inputs": 640, "models": 320}
+    assert result["scrollAfterRestoringModel"] == {"inputs": 640, "models": 320}
+    assert result["inputScrollAfterModelsDisappear"] == 640
+    assert result["attachmentsStillOpen"] is True
 
 
 def test_a_model_is_removed_by_its_folder_and_name(run_scenario):

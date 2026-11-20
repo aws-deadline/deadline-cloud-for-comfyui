@@ -156,12 +156,27 @@ if (scenario === "edited-before-replanning") {
       this.children = [];
       this.attributes = {};
       this.listeners = {};
+      this.scrollTop = 0;
+      this.open = false;
     }
     append(child) {
       this.children.push(child);
     }
     setAttribute(name, value) {
       this.attributes[name] = value;
+    }
+    getAttribute(name) {
+      return this.attributes[name] ?? null;
+    }
+    replaceChildren(...children) {
+      this.children = children;
+    }
+    querySelectorAll(selector) {
+      return descendants(this).slice(1).filter((node) => {
+        if (selector === "details") return node.tag === "details";
+        if (selector === "[data-dl-scroll]") return node.getAttribute("data-dl-scroll") !== null;
+        throw new Error(`Unsupported selector: ${selector}`);
+      });
     }
     addEventListener(name, handler) {
       this.listeners[name] = handler;
@@ -173,7 +188,10 @@ if (scenario === "edited-before-replanning") {
     node,
     ...node.children.filter((child) => child instanceof NodeStub).flatMap(descendants),
   ];
-  const rows = () => descendants(ui.__renderers.attachments()).filter((node) => node.tag === "li");
+  const container = new NodeStub("div");
+  const rows = () => descendants(container).filter((node) => node.tag === "li");
+  const list = (key) => container.querySelectorAll("[data-dl-scroll]")
+    .find((node) => node.getAttribute("data-dl-scroll") === key);
   const click = (path) => rows().find((row) => row.attributes.title === path)
     .children.find((child) => child.tag === "button").listeners.click();
   const external = "/outside/review-me.png";
@@ -182,8 +200,12 @@ if (scenario === "edited-before-replanning") {
   const planned = Array.from({ length: 105 }, (_, index) => `/input/image-${index}.png`);
   state.plan.attachments = { filenames: [...planned, external], directories: ["/outside/frames"] };
   state.addedAttachments = { filenames: [manualFile], directories: [manualFolder] };
+  const view = ui.__createView(container, ["attachments"]);
+  container.querySelectorAll("details")[0].open = true;
+  list("inputs").scrollTop = 640;
   result.listed = rows().map((row) => row.attributes.title);
   click(external);
+  result.scrollAfterRemoving = list("inputs").scrollTop;
   result.removedRowClass = rows().find((row) => row.attributes.title === external).className;
   await ui.submit();
   result.sentAfterRemoving = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body.attachments;
@@ -191,9 +213,28 @@ if (scenario === "edited-before-replanning") {
   click(external);
   click(manualFile);
   click(manualFolder);
+  result.scrollAfterRestoring = list("inputs").scrollTop;
   result.listedAfterRemovingManual = rows().map((row) => row.attributes.title);
   await ui.submit();
   result.sentAfterRestoring = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body.attachments;
+  state.plan.localModels = Array.from({ length: 40 }, (_, index) => ({
+    id: `checkpoints/model-${index}.safetensors`,
+    path: `/models/model-${index}.safetensors`,
+    name: `model-${index}.safetensors`,
+    directory: "checkpoints",
+  }));
+  view.render(["attachments"]);
+  result.inputScrollAfterAddingModels = list("inputs").scrollTop;
+  result.newModelScroll = list("models").scrollTop;
+  list("models").scrollTop = 320;
+  click("/models/model-30.safetensors");
+  result.scrollAfterRemovingModel = { inputs: list("inputs").scrollTop, models: list("models").scrollTop };
+  click("/models/model-30.safetensors");
+  result.scrollAfterRestoringModel = { inputs: list("inputs").scrollTop, models: list("models").scrollTop };
+  state.plan.localModels = [];
+  view.render(["attachments"]);
+  result.inputScrollAfterModelsDisappear = list("inputs").scrollTop;
+  result.attachmentsStillOpen = container.querySelectorAll("details")[0].open;
 } else if (scenario === "same-name-models") {
   // A checkpoint and a LoRA share a file name. Removing one leaves the other attached.
   const model = (directory) => ({
