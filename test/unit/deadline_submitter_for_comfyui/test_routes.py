@@ -1766,3 +1766,449 @@ def test_download_only_takes_deadline_ids(comfy, monkeypatch):
     body = {"farmId": FARM, "queueId": QUEUE, "jobId": "--profile=evil"}
     status, _ = run(call(comfy, "/deadline/jobs/download", body))
     assert status == 400
+
+
+def use_basic_template(comfy, monkeypatch) -> Path:
+    """A studio template without a custom nodes directory."""
+    template = comfy.tmp_path / "studio.yaml"
+    template.write_text(
+        yaml.safe_dump(
+            {
+                "specificationVersion": "jobtemplate-2023-09",
+                "name": "Studio job",
+                "parameterDefinitions": [
+                    {"name": name, "type": "PATH"}
+                    for name in ("WorkflowFile", "InputDir", "OutputDir", "ModelDirectory")
+                ],
+                "steps": [{"name": "Run", "script": {"actions": {"onRun": {"command": "true"}}}}],
+            }
+        )
+    )
+    monkeypatch.setenv(submit.TEMPLATE_ENV_VAR, str(template))
+    return template
+
+
+def fake_nodes(monkeypatch, modules: dict[str, str], loaded: dict[str, Path]) -> None:
+    """Stands in for ComfyUI's nodes module: node type to module, and module to its folder."""
+    monkeypatch.setitem(
+        sys.modules,
+        "nodes",
+        types.SimpleNamespace(
+            NODE_CLASS_MAPPINGS={
+                class_type: types.SimpleNamespace(RELATIVE_PYTHON_MODULE=module)
+                for class_type, module in modules.items()
+            },
+            LOADED_MODULE_DIRS={name: str(path) for name, path in loaded.items()},
+        ),
+    )
+
+
+def write_pack(directory: Path, registry: str | None = None) -> Path:
+    (directory / "nodes").mkdir(parents=True)
+    (directory / "__init__.py").write_text("")
+    (directory / "nodes" / "resize.py").write_text("")
+    (directory / ".git").mkdir()
+    (directory / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    if registry:
+        (directory / ".tracking").write_text("")
+        (directory / "pyproject.toml").write_text(
+            f'[project]\nname = "{registry}"\nversion = "1.5.2"\n'
+        )
+    return directory
+
+
+def _studio_pack(comfy, monkeypatch):
+    """A custom node pack from a git checkout, and a workflow that runs one of its nodes."""
+    custom = comfy.tmp_path / "custom_nodes"
+    pack = write_pack(custom / "studio-nodes")
+    fake_nodes(
+        monkeypatch,
+        {"StudioResize": "custom_nodes.studio-nodes"},
+        {"studio-nodes": pack},
+    )
+    return pack, {**WORKFLOW, "5": {"class_type": "StudioResize", "inputs": {}}}
+
+
+def test_jobs_attaches_every_custom_node_pack_the_workflow_uses(comfy, monkeypatch):
+    """A git checkout and a registry install are both attached under CustomNodesDirectory."""
+    custom = comfy.tmp_path / "custom_nodes"
+    git_pack = write_pack(custom / "studio-nodes")
+    write_pack(custom / "comfyui-kjnodes", registry="comfyui-kjnodes")
+    fake_nodes(
+        monkeypatch,
+        {
+            "StudioResize": "custom_nodes.studio-nodes",
+            "ImageResizeKJv2": "custom_nodes.comfyui-kjnodes",
+        },
+        {"studio-nodes": git_pack, "comfyui-kjnodes": custom / "comfyui-kjnodes"},
+    )
+    workflow = {
+        **WORKFLOW,
+        "5": {"class_type": "StudioResize", "inputs": {}},
+        "6": {"class_type": "ImageResizeKJv2", "inputs": {}},
+    }
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    status, body = run(post(comfy, {"workflow": workflow, "ui_workflow": {"nodes": []}}))
+    assert status == 202
+    bundle = Path(body["job_bundle"])
+    staged = bundle / "local_nodes" / "studio-nodes"
+    assert (staged / "nodes" / "resize.py").is_file()
+    assert not (staged / ".git").exists()
+    kj = bundle / "local_nodes" / "comfyui-kjnodes"
+    assert (kj / "__init__.py").is_file()
+    references = yaml.safe_load((bundle / "asset_references.yaml").read_text())
+    assert references["assetReferences"]["inputs"]["directories"] == [str(kj), str(staged)]
+    parameters = sent_parameters(requests)
+    assert "CustomNodes" not in parameters
+    assert parameters["CustomNodesDirectory"] == str(bundle / "local_nodes")
+    assert not any("custom nodes" in warning for warning in body["warnings"])
+
+
+def test_jobs_finds_a_pack_in_a_registered_custom_nodes_folder(comfy, monkeypatch):
+    """ComfyUI may not report a folder for the module, so the custom_nodes folders are searched."""
+    shared = comfy.tmp_path / "shared" / "custom_nodes"
+    pack = write_pack(shared / "studio-nodes")
+    comfy.routes.folder_paths.folder_names_and_paths["custom_nodes"] = ([str(shared)], set())
+    fake_nodes(monkeypatch, {"StudioResize": "custom_nodes.studio-nodes"}, {})
+    workflow = {**WORKFLOW, "5": {"class_type": "StudioResize", "inputs": {}}}
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    status, body = run(post(comfy, {"workflow": workflow}))
+    assert status == 202
+    bundle = Path(body["job_bundle"])
+    staged = bundle / "local_nodes" / "studio-nodes"
+    assert (staged / "__init__.py").stat().st_ino == (pack / "__init__.py").stat().st_ino
+    parameters = sent_parameters(requests)
+    assert parameters["CustomNodesDirectory"] == str(bundle / "local_nodes")
+    assert "CustomNodes" not in parameters
+
+
+def test_jobs_finds_a_v3_pack_from_the_class_module_path(comfy, monkeypatch):
+    """A V3 extension class without RELATIVE_PYTHON_MODULE resolves from its __module__ path."""
+    pack = write_pack(comfy.tmp_path / "custom_nodes" / "my_local_node_pack")
+    monkeypatch.setitem(
+        sys.modules,
+        "nodes",
+        types.SimpleNamespace(
+            NODE_CLASS_MAPPINGS={
+                "CustomTextToList": types.SimpleNamespace(__module__=f"{pack}.nodes")
+            },
+            LOADED_MODULE_DIRS={"my_local_node_pack": str(pack)},
+        ),
+    )
+    workflow = {**WORKFLOW, "5": {"class_type": "CustomTextToList", "inputs": {}}}
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    status, body = run(post(comfy, {"workflow": workflow}))
+    assert status == 202
+    bundle = Path(body["job_bundle"])
+    staged = bundle / "local_nodes" / "my_local_node_pack"
+    assert (staged / "nodes" / "resize.py").is_file()
+    references = yaml.safe_load((bundle / "asset_references.yaml").read_text())
+    assert references["assetReferences"]["inputs"]["directories"] == [str(staged)]
+    parameters = sent_parameters(requests)
+    assert parameters["CustomNodesDirectory"] == str(bundle / "local_nodes")
+    assert not any("custom nodes" in warning for warning in body["warnings"])
+
+
+def test_custom_node_pack_name(comfy):
+    cases = [
+        # V1 and V3 classes that ComfyUI tags with the module it loaded them from.
+        (types.SimpleNamespace(RELATIVE_PYTHON_MODULE="custom_nodes.pack"), "pack"),
+        # A pack folder's name can contain dots.
+        (
+            types.SimpleNamespace(RELATIVE_PYTHON_MODULE="custom_nodes.ComfyUI-Foo.v2"),
+            "ComfyUI-Foo.v2",
+        ),
+        # V3 classes on a ComfyUI that doesn't tag them: __module__ is the file path.
+        (types.SimpleNamespace(__module__="/ComfyUI/custom_nodes/my_pack.nodes"), "my_pack"),
+        (types.SimpleNamespace(__module__="C:\\ComfyUI\\custom_nodes\\my_pack.nodes"), "my_pack"),
+        # ComfyUI writes a pack folder's dots as _x_ in the module name.
+        (
+            types.SimpleNamespace(__module__="/ComfyUI/custom_nodes/ComfyUI-Foo_x_v2.nodes"),
+            "ComfyUI-Foo.v2",
+        ),
+        # A tag that isn't a custom node falls back to the module path.
+        (
+            types.SimpleNamespace(
+                RELATIVE_PYTHON_MODULE="comfy_extras.nodes_x",
+                __module__="/ComfyUI/custom_nodes/my_pack",
+            ),
+            "my_pack",
+        ),
+        # Built-in nodes and single-file custom nodes have no pack folder.
+        (types.SimpleNamespace(RELATIVE_PYTHON_MODULE="", __module__="nodes"), None),
+        (types.SimpleNamespace(__module__="/ComfyUI/comfy_extras/nodes_x"), None),
+        (None, None),
+    ]
+    for cls, expected in cases:
+        assert comfy.routes._custom_node_pack_name(cls) == expected
+
+
+def test_jobs_attaches_a_single_file_custom_node(comfy, monkeypatch):
+    """A single-file custom node is attached as one file, listed under filenames."""
+    custom = comfy.tmp_path / "custom_nodes"
+    custom.mkdir()
+    source = custom / "single.py"
+    source.write_text("NODE_CLASS_MAPPINGS = {}")
+    fake_nodes(monkeypatch, {"SingleNode": "custom_nodes.single"}, {"single": custom})
+    workflow = {**WORKFLOW, "5": {"class_type": "SingleNode", "inputs": {}}}
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    status, body = run(post(comfy, {"workflow": workflow}))
+    assert status == 202
+    bundle = Path(body["job_bundle"])
+    staged = bundle / "local_nodes" / "single.py"
+    assert staged.is_file() and staged.stat().st_ino == source.stat().st_ino
+    references = yaml.safe_load((bundle / "asset_references.yaml").read_text())["assetReferences"]
+    assert str(staged) in references["inputs"]["filenames"]
+    assert references["inputs"]["directories"] == []
+    parameters = sent_parameters(requests)
+    assert parameters["CustomNodesDirectory"] == str(bundle / "local_nodes")
+    assert not any("custom nodes" in warning for warning in body["warnings"])
+
+
+def test_jobs_finds_a_single_file_node_in_a_registered_custom_nodes_folder(comfy, monkeypatch):
+    """Without a LOADED_MODULE_DIRS entry, the custom_nodes folders are searched for <name>.py."""
+    shared = comfy.tmp_path / "shared" / "custom_nodes"
+    shared.mkdir(parents=True)
+    (shared / "single.py").write_text("")
+    comfy.routes.folder_paths.folder_names_and_paths["custom_nodes"] = ([str(shared)], set())
+    fake_nodes(monkeypatch, {"SingleNode": "custom_nodes.single"}, {})
+    workflow = {**WORKFLOW, "5": {"class_type": "SingleNode", "inputs": {}}}
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    status, body = run(post(comfy, {"workflow": workflow}))
+    assert status == 202
+    bundle = Path(body["job_bundle"])
+    assert (bundle / "local_nodes" / "single.py").is_file()
+    assert sent_parameters(requests)["CustomNodesDirectory"] == str(bundle / "local_nodes")
+
+
+def test_jobs_warns_about_custom_nodes_it_cannot_attach(comfy, monkeypatch):
+    """A custom node whose pack folder and .py file are both missing can't be attached."""
+    custom = comfy.tmp_path / "custom_nodes"
+    custom.mkdir()
+    fake_nodes(monkeypatch, {"GhostNode": "custom_nodes.ghost"}, {"ghost": custom})
+    workflow = {**WORKFLOW, "5": {"class_type": "GhostNode", "inputs": {}}}
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    status, body = run(post(comfy, {"workflow": workflow}))
+    assert status == 202
+    assert not (Path(body["job_bundle"]) / "local_nodes").exists()
+    assert "CustomNodesDirectory" not in sent_parameters(requests)
+    assert body["warnings"][-1] == (
+        "The files of the custom nodes GhostNode couldn't be attached. The job fails unless "
+        "the workers already have them, for example in a custom nodes conda package."
+    )
+
+
+def test_jobs_leaves_out_local_node_packs_for_jobs_without_the_parameter(comfy, monkeypatch):
+    pack = write_pack(comfy.tmp_path / "custom_nodes" / "studio-nodes")
+    fake_nodes(monkeypatch, {"StudioResize": "custom_nodes.studio-nodes"}, {"studio-nodes": pack})
+    workflow = {**WORKFLOW, "5": {"class_type": "StudioResize", "inputs": {}}}
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    use_basic_template(comfy, monkeypatch)
+    status, body = run(post(comfy, {"workflow": workflow}))
+    assert status == 202
+    assert not (Path(body["job_bundle"]) / "local_nodes").exists()
+    parameters = sent_parameters(requests)
+    assert "CustomNodesDirectory" not in parameters
+
+
+def test_custom_nodes_directory_does_not_upload_its_contents():
+    template = yaml.safe_load(submit.JOB_TEMPLATE.read_text())
+    parameter = next(
+        item for item in template["parameterDefinitions"] if item["name"] == "CustomNodesDirectory"
+    )
+    assert parameter["dataFlow"] == "NONE"
+    assert parameter["objectType"] == "DIRECTORY"
+
+
+def test_jobs_accepts_a_non_string_attach_custom_nodes_value(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    _, workflow = _studio_pack(comfy, monkeypatch)
+    fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
+    body = {**JOB, "workflow": workflow, "parameters": {"AttachCustomNodes": False}}
+    status, response = run(call(comfy, "/deadline/jobs", body))
+    assert status == 202
+    assert not (Path(response["job_bundle"]) / "local_nodes").exists()
+
+
+def test_plan_lists_local_custom_nodes_and_doesnt_warn_about_them(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    pack, workflow = _studio_pack(comfy, monkeypatch)
+    status, body = run(call(comfy, "/deadline/plan", {"workflow": workflow, "name": "fox"}))
+    assert status == 200
+    assert body["localNodes"] == [{"name": "studio-nodes", "path": str(pack)}]
+    assert body["nodeWarnings"] == []
+    assert not any("custom nodes" in warning for warning in body["warnings"])
+    # Planning doesn't stage anything.
+    assert not (comfy.tmp_path / "user" / "deadline_submissions").exists()
+
+
+def test_plan_hides_the_custom_nodes_directory_and_offers_the_switch(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    status, body = run(call(comfy, "/deadline/plan", {"workflow": WORKFLOW, "name": "fox"}))
+    assert status == 200
+    parameters = {parameter["name"]: parameter for parameter in body["parameters"]}
+    assert parameters["CustomNodesDirectory"]["userInterface"]["control"] == "HIDDEN"
+    assert parameters["AttachCustomNodes"]["userInterface"]["control"] == "CHECK_BOX"
+    assert parameters["AttachCustomNodes"]["default"] == "true"
+
+
+def test_plan_warns_about_custom_nodes_it_cant_find(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    fake_nodes(monkeypatch, {"StudioResize": "custom_nodes.gone"}, {})
+    workflow = {**WORKFLOW, "5": {"class_type": "StudioResize", "inputs": {}}}
+    status, body = run(call(comfy, "/deadline/plan", {"workflow": workflow, "name": "fox"}))
+    assert status == 200
+    assert body["localNodes"] == []
+    assert len(body["nodeWarnings"]) == 1
+    assert "StudioResize" in body["nodeWarnings"][0]
+    assert body["nodeWarnings"][0] in body["warnings"]
+
+
+def test_jobs_attaches_local_custom_nodes_through_their_directory(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    _, workflow = _studio_pack(comfy, monkeypatch)
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
+    # The panel sends the hidden directory's empty default, and a folder of the artist's own.
+    body = {
+        **JOB,
+        "workflow": workflow,
+        "parameters": {"CustomNodesDirectory": "", "AttachCustomNodes": "true"},
+        "attachments": {"filenames": [], "directories": ["/a/folder"]},
+    }
+    status, response = run(call(comfy, "/deadline/jobs", body))
+    assert status == 202
+    bundle = Path(response["job_bundle"])
+    staged = bundle / "local_nodes" / "studio-nodes"
+    assert (staged / "nodes" / "resize.py").is_file()
+    assert not (staged / ".git").exists()
+    references = yaml.safe_load((bundle / "asset_references.yaml").read_text())
+    assert references["assetReferences"]["inputs"]["directories"] == sorted(
+        ["/a/folder", str(staged)]
+    )
+    sent = bridge_requests(requests)[0]["request"]["parameters"]
+    assert sent["CustomNodesDirectory"] == str(bundle / "local_nodes")
+    assert sent["AttachCustomNodes"] == "true"
+
+
+def test_jobs_attaches_a_single_file_custom_node_as_a_file(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    custom = comfy.tmp_path / "custom_nodes"
+    custom.mkdir()
+    (custom / "single.py").write_text("")
+    fake_nodes(monkeypatch, {"Single": "custom_nodes.single"}, {"single": custom})
+    workflow = {**WORKFLOW, "5": {"class_type": "Single", "inputs": {}}}
+    fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
+    body = {**JOB, "workflow": workflow, "parameters": {}}
+    status, response = run(call(comfy, "/deadline/jobs", body))
+    assert status == 202
+    bundle = Path(response["job_bundle"])
+    staged = bundle / "local_nodes" / "single.py"
+    assert staged.is_file()
+    references = yaml.safe_load((bundle / "asset_references.yaml").read_text())
+    assert str(staged) in references["assetReferences"]["inputs"]["filenames"]
+
+
+def test_jobs_doesnt_upload_custom_nodes_with_attach_custom_nodes_off(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    pack, workflow = _studio_pack(comfy, monkeypatch)
+    fake_nodes(
+        monkeypatch,
+        {"StudioResize": "custom_nodes.studio-nodes", "Gone": "custom_nodes.gone"},
+        {"studio-nodes": pack},
+    )
+    workflow = {**workflow, "6": {"class_type": "Gone", "inputs": {}}}
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
+    body = {**JOB, "workflow": workflow, "parameters": {"AttachCustomNodes": "false"}}
+    status, response = run(call(comfy, "/deadline/jobs", body))
+    assert status == 202
+    assert not any("custom nodes" in warning for warning in response["warnings"])
+    bundle = Path(response["job_bundle"])
+    assert not (bundle / "local_nodes").exists()
+    references = yaml.safe_load((bundle / "asset_references.yaml").read_text())
+    assert not references["assetReferences"]["inputs"]["directories"]
+    sent = bridge_requests(requests)[0]["request"]["parameters"]
+    assert sent["AttachCustomNodes"] == "false"
+    assert "CustomNodesDirectory" not in sent
+
+
+def test_jobs_warns_when_a_planned_custom_node_pack_cant_be_staged(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    _, workflow = _studio_pack(comfy, monkeypatch)
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
+
+    def fail(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(comfy.routes, "stage_local_node_packs", fail)
+    body = {**JOB, "workflow": workflow, "parameters": {}}
+    status, response = run(call(comfy, "/deadline/jobs", body))
+    assert status == 202
+    assert any("StudioResize" in warning for warning in response["warnings"])
+    assert "CustomNodesDirectory" not in bridge_requests(requests)[0]["request"]["parameters"]
+
+
+def _staged_node_packs(response: dict) -> list[str]:
+    bundle = Path(response["job_bundle"])
+    references = yaml.safe_load((bundle / "asset_references.yaml").read_text())
+    directories = references["assetReferences"]["inputs"]["directories"]
+    assert (bundle / "local_nodes").exists() is bool(directories)
+    return directories
+
+
+@pytest.mark.parametrize("value", ["no", "OFF", "0", 0, " False "])
+def test_jobs_read_attach_custom_nodes_as_openjd_does(comfy, monkeypatch, value):
+    """OpenJD reads each of these as false, so the job wouldn't load the packs."""
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    _, workflow = _studio_pack(comfy, monkeypatch)
+    fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
+    body = {**JOB, "workflow": workflow, "parameters": {"AttachCustomNodes": value}}
+    status, response = run(call(comfy, "/deadline/jobs", body))
+    assert status == 202, response
+    assert _staged_node_packs(response) == []
+
+
+def test_jobs_use_the_templates_attach_custom_nodes_default(comfy, monkeypatch):
+    """A studio template can turn the switch off by default, and a request can leave it out."""
+    template = yaml.safe_load(submit.JOB_TEMPLATE.read_text())
+    for parameter in template["parameterDefinitions"]:
+        if parameter["name"] == "AttachCustomNodes":
+            parameter["default"] = "no"
+    studio = comfy.tmp_path / "studio.yaml"
+    studio.write_text(yaml.safe_dump(template, sort_keys=False))
+    monkeypatch.setenv(submit.TEMPLATE_ENV_VAR, str(studio))
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    _, workflow = _studio_pack(comfy, monkeypatch)
+    fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
+    status, response = run(call(comfy, "/deadline/jobs", {**JOB, "workflow": workflow}))
+    assert status == 202, response
+    assert _staged_node_packs(response) == []
+
+
+@pytest.mark.parametrize(
+    ("parameters", "error"),
+    [
+        ({"AttachCustomNodes": "garbage"}, "Attach Custom Nodes must be true or false"),
+        ({"AttachCustomNodes": ""}, "Attach Custom Nodes must be true or false"),
+        ({"AttachCustomNodes": 2}, "Attach Custom Nodes must be true or false"),
+        ({"WorkflowTimeout": "soon"}, "must be a whole number, not 'soon'"),
+        ({"WorkflowTimeout": "30"}, "must be at least 60, not '30'"),
+    ],
+)
+@pytest.mark.parametrize("route", ["/deadline/jobs", "/deadline/bundle"])
+def test_bad_parameter_values_are_refused_before_anything_is_staged(
+    comfy, monkeypatch, parameters, error, route
+):
+    """Deadline Cloud would refuse them too, after the models and packs were copied."""
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    _, workflow = _studio_pack(comfy, monkeypatch)
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, {})
+    staged = []
+    monkeypatch.setattr(comfy.routes, "_stage_prepared", lambda *args: staged.append(args))
+    status, response = run(
+        call(comfy, route, {**JOB, "workflow": workflow, "parameters": parameters})
+    )
+    assert status == 400
+    assert error in response["error"]
+    assert staged == []
+    assert not requests.exists()
+    assert not (comfy.tmp_path / "user" / "deadline_submissions").exists()

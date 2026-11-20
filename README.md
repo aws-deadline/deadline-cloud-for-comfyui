@@ -7,7 +7,7 @@
 
 A ComfyUI extension that submits the open workflow to [AWS Deadline Cloud](https://aws.amazon.com/deadline-cloud/),
 from a **Deadline** panel and dialog inside ComfyUI. The job runs the workflow on Deadline Cloud
-GPU workers, with the models and input files it uses attached to the job.
+GPU workers, with the models, input files and custom nodes it uses attached to the job.
 
 ## What it adds
 
@@ -18,8 +18,8 @@ GPU workers, with the models and input files it uses attached to the job.
     workers, how workers read attachments, and whether every input path has to exist
   - [host requirements](#host-requirements), starting from the job template's
   - the job template's parameters, such as Workflow Timeout, and the queue's, such as Conda Channels
-  - the input files and folders, and the models, to attach, which you can remove, or add to with a
-    file dialog on the ComfyUI machine
+  - the input files and folders, models and custom nodes to attach. You can remove files, folders
+    and models, or add more with a file dialog on the ComfyUI machine
   - upload progress, the status of your recent jobs, and **Download** for their outputs, which
     go back into the output directory they were submitted with. Each job shows that directory.
   - **Save job bundle**, which creates the job bundle without submitting it, to submit later with
@@ -46,6 +46,7 @@ When you submit, the extension:
    | Output Directory | ComfyUI's output directory |
    | Input Directory | ComfyUI's input directory, so load nodes on the worker find the attached input files |
    | Model Directory | The bundle's folder of attached models, so ComfyUI on the worker finds them |
+   | Custom Nodes Directory | The bundle's folder of attached custom node packs |
 
 4. Shows the hashing and upload progress, asks you to confirm when Deadline Cloud would (for
    example, to upload files outside the storage profile), and then shows the job ID.
@@ -134,7 +135,7 @@ the environment that starts ComfyUI.
 | `COMFYUI_DEADLINE_CLI` | `deadline_cli` in the config, then `deadline` on the `PATH` | The Deadline Cloud CLI executable. |
 | `COMFYUI_DEADLINE_CONDA_CHANNELS` | `conda_channels` in the config | Optional **Conda Channels** to fill in. When neither is set, the queue's default, the Deadline Cloud channels, is used. |
 | `COMFYUI_DEADLINE_CONFIG` | `deadline_cloud_submitter.json` in the extension folder | Another config file to read. |
-| `COMFYUI_DEADLINE_JOB_TEMPLATE` | The extension's job template | A job template file, YAML or JSON, to submit instead, such as your studio's version of the extension's template. It needs the same parameters, such as `WorkflowFile`, `InputDir` and `OutputDir`. Local models are attached only when the template also defines `ModelDirectory`, and it has to point ComfyUI at that folder. The extension's template does. |
+| `COMFYUI_DEADLINE_JOB_TEMPLATE` | The extension's job template | A job template file, YAML or JSON, to submit instead, such as your studio's version of the extension's template. It needs the same parameters, such as `WorkflowFile`, `InputDir` and `OutputDir`. Local models are attached only when the template also defines `ModelDirectory`, and it has to point ComfyUI at that folder. Custom node packs are attached only when the template defines `CustomNodesDirectory`, and it has to add that folder to ComfyUI's `custom_nodes` paths. The extension's template does both. |
 
 ## The job
 
@@ -152,8 +153,8 @@ Each task runs the workflow for up to **Workflow Timeout**, an hour by default. 
 waits that long for ComfyUI to report progress, since loading a large model can take minutes
 without any. Raise it for long video workflows.
 
-The job runs the workflow once, as one task. Input files and models are attached to the job,
-uploaded from this machine. The workers have to provide the custom nodes:
+The job runs the workflow once, as one task. Workers get everything the workflow uses as job
+attachments, uploaded from this machine:
 
 - **Input files.** The submitter lists the files in ComfyUI's input directory that the workflow
   loads, such as Load Image's image, in the job bundle's `asset_references.yaml`, with the whole
@@ -172,10 +173,20 @@ uploaded from this machine. The workers have to provide the custom nodes:
   **Attachments** lists the models it will attach. The panel lists each model by its folder and
   name, such as `loras/style.safetensors`, since two folders can hold files of the same name. Remove
   one with its **✕** when the workers already have it, and it isn't uploaded.
-- **Custom nodes.** Workers load the custom nodes in the job's conda environment, such as a
-  custom nodes conda package added to **Conda Packages**, or in a `custom_nodes` folder that
-  **Extra Model Paths Config** lists. The job fails with the import error when a custom node
-  doesn't load.
+- **Custom nodes.** The submitter attaches the custom node pack of every custom node the workflow
+  runs, however it was installed: from the Comfy Registry, a git checkout or your studio's own. It
+  takes each pack from the folder ComfyUI loaded it from and places it under **Custom Nodes
+  Directory**, without its `.git`, `__pycache__` or virtual environment folders. A single-file
+  custom node is attached as its one `.py` file. On the worker, ComfyUI loads the packs from where
+  they're mapped, and the job installs each pack's `requirements.txt` into a virtual environment
+  layered on the conda environment, which they can't change. When a pack's files can't be found
+  on this machine, the panel warns about it. The job fails with the import error when a custom
+  node doesn't load.
+
+  Turn off **Attach Custom Nodes** when the workers already provide every custom node and its
+  dependencies, such as through a custom nodes conda package added to **Conda Packages**, or a
+  `custom_nodes` folder that **Extra Model Paths Config** lists. The job then ignores **Custom
+  Nodes Directory**, and the panel doesn't upload the packs it lists under **Attachments**.
 
 ## Host requirements
 
@@ -232,10 +243,14 @@ the same machine.
 - Job bundles in `ComfyUI/user/deadline_submissions/` hold your workflows, prompts and file paths.
   On Linux and macOS that folder and each bundle in it can only be opened by the user that runs
   ComfyUI (mode `0700`), and the files the extension writes there can only be read by that user
-  (`0600`), whatever the umask. Models staged in a bundle are often links to your files, so
-  their permissions stay as they are, but they can only be reached through the bundle, which is
-  deleted once its job is created. On Windows, bundles inherit the permissions of the ComfyUI
+  (`0600`), whatever the umask. Models and custom nodes staged in a bundle are often links to
+  your files and keep their permissions, but they can only be reached through the bundle, which
+  is deleted once its job is created. On Windows, bundles inherit the permissions of the ComfyUI
   user folder. The `deadline_cloud_submitter.json` config file is also `0600`.
+- Custom node packs are uploaded with their files to the queue's job attachments bucket, where
+  anyone who can use the queue can read them. Credential files, such as `.env`, `*.key` and `*.pem`,
+  are left out. A pack's settings files, such as `config.json`, are attached as they are, so keep
+  API keys in environment variables on the workers instead.
 
 **Local access.** Use a browser on the machine running ComfyUI and access it through
 `localhost`.
@@ -252,7 +267,9 @@ any Origin that does not match the request's scheme, host and port.
 - Deadline Cloud monitor login opens on the ComfyUI server's desktop, not in the browser.
 - Each job runs the workflow once. To render variations, such as two seeds, submit a job for
   each.
-- Custom nodes aren't attached. The workers have to provide them.
+- Custom nodes are attached from this machine. Each job uploads your local copy, and the worker
+  runs it. A single-file node's own imports still have to exist on the worker, since it has no
+  `requirements.txt` to install.
 - The workflow must have at least one Save node, such as **SaveImage**.
 
 ## Development

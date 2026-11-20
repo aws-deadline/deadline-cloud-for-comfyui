@@ -236,3 +236,8 @@ def test_a_submitted_job_remembers_where_its_outputs_download_to(run_scenario):
 )
 def test_a_finished_download_says_where_the_files_are(run_scenario, scenario, destination):
     assert run_scenario(scenario)["toasts"] == [f"Downloaded 2 files from fox {destination}."]
+
+
+def test_bool_parameters_are_read_as_openjd_reads_them(run_scenario):
+    """So the Attach Custom Nodes checkbox and the attachments agree with what the job does."""
+    assert run_scenario("parse-bool")["values"] == [True] * 6 + [False] * 6 + [None] * 3

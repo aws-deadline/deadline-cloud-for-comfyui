@@ -35,6 +35,7 @@ from .get_local_assets import (
     get_local_assets,
     model_name,
     stage_local_models,
+    stage_local_node_packs,
     write_asset_references,
 )
 from .submit import (
@@ -42,11 +43,14 @@ from .submit import (
     PICKER_KINDS,
     SubmitError,
     check_cli_version,
+    check_parameter_values,
     create_job_bundle,
     host_requirements,
     input_folders,
     job_description,
     load_config,
+    local_node_packs,
+    parse_bool,
     picker_command,
     read_job_template,
     resolve_cli_python,
@@ -65,6 +69,8 @@ logger = logging.getLogger(__name__)
 SUBMITTED_EVENT = "deadline.submitted"
 PROGRESS_EVENT = "deadline.progress"
 CONFIRM_EVENT = "deadline.confirm"
+# The job template's switch for loading the attached custom node packs on the worker.
+ATTACH_NODES = "AttachCustomNodes"
 DOWNLOAD_EVENT = "deadline.download"
 # A farm, queue or job ID, which goes on the CLI's command line.
 _RESOURCE_ID = re.compile(r"(farm|queue|job)-[0-9a-f]{32}")
@@ -141,14 +147,99 @@ class _Prepared:
     local_models: dict[str, Path] = field(default_factory=dict)
     model_directories: dict[str, str] = field(default_factory=dict)
     model_warnings: list[str] = field(default_factory=list)
+    # The custom node packs the workflow uses, by folder or file name.
+    local_nodes: dict[str, Path] = field(default_factory=dict)
+    installed_nodes: _InstalledNodes | None = None
+    node_warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
 class _Staged:
-    """What was placed in the job bundle to attach, and the folder the job maps them through."""
+    """What was placed in the job bundle to attach, and the folders the job maps them through."""
 
     model_dir: Path | None = None
+    node_dir: Path | None = None
     filenames: list[Path] = field(default_factory=list)
+    directories: list[Path] = field(default_factory=list)
+
+
+@dataclass
+class _InstalledNodes:
+    # Node type to the custom node pack folder, or single .py file, ComfyUI loaded it from.
+    dirs: dict[str, Path] = field(default_factory=dict)
+    # Node types that come from a custom node module, whether or not its files were found.
+    custom: set[str] = field(default_factory=set)
+
+
+def _installed_node_packs(workflow: dict[str, Any]) -> _InstalledNodes:
+    """
+    Finds the custom node pack, and its folder, that ComfyUI loaded each workflow node from.
+    Both the legacy NODE_CLASS_MAPPINGS packs and V3 extension packs (a comfy_entrypoint that
+    returns a ComfyExtension) are found.
+    """
+    installed = _InstalledNodes()
+    try:
+        import nodes
+    except ImportError:
+        return installed
+    for class_type in {node["class_type"] for node in workflow.values()}:
+        name = _custom_node_pack_name(nodes.NODE_CLASS_MAPPINGS.get(class_type))
+        if name is None:
+            continue
+        installed.custom.add(class_type)
+        pack_path = _node_pack_path(nodes, name)
+        if pack_path is None:
+            continue
+        installed.dirs[class_type] = pack_path
+    return installed
+
+
+def _custom_node_pack_name(cls: Any) -> str | None:
+    """
+    The name of the custom node pack ComfyUI loaded this node class from, or None when the node
+    isn't from a custom node pack. ComfyUI tags each class it loads with RELATIVE_PYTHON_MODULE,
+    "custom_nodes." and the pack's name, which can contain dots, such as "custom_nodes.Pack.v2".
+    V3 extension classes loaded by a ComfyUI release that doesn't tag them still have the pack's
+    path as their __module__, such as "/ComfyUI/custom_nodes/Pack_x_v2.nodes". ComfyUI writes
+    the dots in a pack folder's name as "_x_" there.
+    """
+    module = str(getattr(cls, "RELATIVE_PYTHON_MODULE", "") or "")
+    prefix = "custom_nodes."
+    if module.startswith(prefix) and len(module) > len(prefix):
+        return module[len(prefix) :]
+    path_parts = re.split(r"[/\\]", str(getattr(cls, "__module__", "") or ""))
+    for index, part in enumerate(path_parts[:-1]):
+        if part == "custom_nodes":
+            pack = path_parts[index + 1].split(".")[0].replace("_x_", ".")
+            return pack or None
+    return None
+
+
+def _node_pack_path(nodes: Any, name: str) -> Path | None:
+    """
+    The custom node pack ComfyUI loaded as `name`: its folder, or its .py file for a single-file
+    custom node. A single-file node records the custom_nodes folder itself in LOADED_MODULE_DIRS,
+    so the folder check refuses it and the file check finds <name>.py beside it.
+    """
+    roots = []
+    loaded = getattr(nodes, "LOADED_MODULE_DIRS", {}).get(name)
+    if loaded:
+        candidate = Path(loaded)
+        # A single-file custom node's entry is the custom_nodes folder, not the pack name.
+        if candidate.name == name and candidate.is_dir():
+            return candidate
+        roots.append(candidate)
+    entry = getattr(folder_paths, "folder_names_and_paths", {}).get("custom_nodes")
+    roots.extend(Path(root) for root in (entry[0] if entry else []))
+    for root in roots:
+        candidate = root / name
+        if candidate.is_dir():
+            return candidate
+    for root in roots:
+        candidate = root / f"{name}.py"
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 async def _cli_version_output(cli: str) -> str:
@@ -344,11 +435,24 @@ def _prepare(
         )
     prepared.model_warnings = _model_warnings(workflow, prepared.local_models)
     prepared.warnings.extend(prepared.model_warnings)
+    # A template without Custom Nodes Directory can't load attached packs on the worker.
+    if template_defines_parameter(template, "CustomNodesDirectory"):
+        installed = _installed_node_packs(workflow)
+        prepared.local_nodes = local_node_packs(workflow, installed.dirs)
+        prepared.installed_nodes = installed
+        prepared.node_warnings = _node_warnings(installed, prepared.local_nodes)
+        prepared.warnings.extend(prepared.node_warnings)
     return prepared
 
 
-def _stage_prepared(prepared: _Prepared, workflow: dict[str, Any], bundle_dir: Path) -> _Staged:
-    """Stages the local models into the bundle, under the folder Deadline Cloud maps on the worker."""
+def _stage_prepared(
+    prepared: _Prepared, workflow: dict[str, Any], bundle_dir: Path, attach_nodes: bool = True
+) -> _Staged:
+    """
+    Stages the local models and custom node packs into the bundle, under the directories Deadline
+    Cloud maps on the worker. Without attach_nodes, the job loads no attached custom nodes, so
+    none are staged.
+    """
     model_dir = bundle_dir / "local_models"
     staged = _stage_local_models(prepared.local_models, prepared.model_directories, model_dir)
     if set(staged) != set(prepared.local_models):
@@ -356,7 +460,24 @@ def _stage_prepared(prepared: _Prepared, workflow: dict[str, Any], bundle_dir: P
         prepared.warnings = [w for w in prepared.warnings if w not in prepared.model_warnings]
         prepared.model_warnings = _model_warnings(workflow, staged)
         prepared.warnings.extend(prepared.model_warnings)
-    return _Staged(model_dir=model_dir if staged else None, filenames=list(staged.values()))
+
+    node_dir = bundle_dir / "local_nodes"
+    nodes = _stage_local_node_packs(prepared.local_nodes, node_dir) if attach_nodes else {}
+    if not attach_nodes or set(nodes) != set(prepared.local_nodes):
+        prepared.warnings = [w for w in prepared.warnings if w not in prepared.node_warnings]
+        prepared.node_warnings = (
+            _node_warnings(prepared.installed_nodes, nodes)
+            if attach_nodes and prepared.installed_nodes
+            else []
+        )
+        prepared.warnings.extend(prepared.node_warnings)
+
+    return _Staged(
+        model_dir=model_dir if staged else None,
+        node_dir=node_dir if nodes else None,
+        filenames=[*staged.values(), *(path for path in nodes.values() if path.is_file())],
+        directories=[path for path in nodes.values() if path.is_dir()],
+    )
 
 
 def _stage_local_models(
@@ -370,6 +491,35 @@ def _stage_local_models(
     except Exception:
         logger.exception("Couldn't stage local models")
         return {}
+
+
+def _stage_local_node_packs(packs: dict[str, Path], node_dir: Path) -> dict[str, Path]:
+    """Stages local custom node packs into the bundle. A failure still lets the job submit."""
+    if not packs:
+        return {}
+    try:
+        return stage_local_node_packs(packs, node_dir)
+    except Exception:
+        logger.exception("Couldn't stage local custom node packs")
+        return {}
+
+
+def _node_warnings(installed: _InstalledNodes, staged_nodes: dict[str, Path]) -> list[str]:
+    """A warning for custom nodes whose files couldn't be attached."""
+    missing = sorted(
+        class_type
+        for class_type in installed.custom
+        if class_type not in installed.dirs or installed.dirs[class_type].name not in staged_nodes
+    )
+    if not missing:
+        return []
+    return [
+        (
+            f"The files of the custom nodes {', '.join(missing)} couldn't be attached. The job "
+            "fails unless the workers already have them, for example in a custom nodes conda "
+            "package."
+        )
+    ]
 
 
 def _model_warnings(workflow: dict[str, Any], attached: dict[str, Path]) -> list[str]:
@@ -442,15 +592,18 @@ def _save_asset_references(
     bundle_dir: Path,
     assets: LocalAssets | None = None,
     extra_filenames: Iterable[Path] | None = None,
+    extra_directories: Iterable[Path] | None = None,
 ) -> None:
     """
-    Saves the workflow's local input files, and the staged models in extra_filenames, to
-    asset_references.yaml next to the job template.
+    Saves the workflow's local input files, and the staged models and custom node packs in
+    extra_filenames and extra_directories, to asset_references.yaml next to the job template.
     """
     try:
         chosen = assets if assets is not None else _local_assets(workflow)
         if extra_filenames:
             chosen.filenames = sorted(set(chosen.filenames).union(extra_filenames))
+        if extra_directories:
+            chosen.directories = sorted(set(chosen.directories).union(extra_directories))
         write_asset_references(chosen, bundle_dir / "asset_references.yaml")
     except Exception:
         # The submitter still works without the references. The artist can add files in its dialog.
@@ -534,7 +687,12 @@ def _plan(body: dict[str, Any], workflow: dict[str, Any], template: Path) -> dic
             for key, path in prepared.local_models.items()
         ],
         "hostRequirements": template_host_requirements(job_template),
+        # Attached when submitting, unless the artist turns off Attach Custom Nodes.
+        "localNodes": [
+            {"name": name, "path": str(path)} for name, path in prepared.local_nodes.items()
+        ],
         "warnings": prepared.warnings,
+        "nodeWarnings": prepared.node_warnings,
     }
 
 
@@ -689,6 +847,19 @@ class _Bundle:
     warnings: list[str]
 
 
+def _attaches_nodes(definitions: list[Any], parameters: dict[str, Any]) -> bool:
+    """
+    Whether the job loads the attached custom node packs: the panel's Attach Custom Nodes, or the
+    job template's default, read as OpenJD reads a BOOL. A template without it attaches them.
+    """
+    definition = next(
+        (d for d in definitions if isinstance(d, dict) and d.get("name") == ATTACH_NODES),
+        {},
+    )
+    value = parameters.get(ATTACH_NODES, definition.get("default", True))
+    return parse_bool(value) is not False
+
+
 async def _build_bundle(
     body: dict[str, Any],
     workflow: dict[str, Any],
@@ -705,12 +876,12 @@ async def _build_bundle(
     excluded_models = _model_ids(body.get("excludedModels"))
     requirements = host_requirements(body.get("hostRequirements"))
     description = job_description(body.get("description"))
+    definitions = read_job_template(template).get("parameterDefinitions") or []
+    # Refused before anything is prepared, staged or copied for the job.
+    check_parameter_values(definitions, parameters)
 
     prepared = await asyncio.to_thread(_prepare, body, workflow, template, config)
-    defined = {
-        parameter.get("name")
-        for parameter in read_job_template(template).get("parameterDefinitions", [])
-    }
+    defined = {parameter.get("name") for parameter in definitions if isinstance(parameter, dict)}
     bundle_dir, workflow_path = create_job_bundle(
         template,
         workflow,
@@ -727,17 +898,23 @@ async def _build_bundle(
         except OSError:
             logger.warning("Couldn't mark %s to delete after submitting", _log_value(bundle_dir))
     _exclude_local_models(prepared, excluded_models, workflow)
-    # Copying models can take a while when the bundle is on another volume.
-    staged = await asyncio.to_thread(_stage_prepared, prepared, workflow, bundle_dir)
-    await asyncio.to_thread(_save_asset_references, workflow, bundle_dir, assets, staged.filenames)
+    # The job ignores attached packs with Attach Custom Nodes off, so they aren't uploaded.
+    attach_nodes = _attaches_nodes(definitions, parameters)
+    # Copying models and custom nodes can take a while when the bundle is on another volume.
+    staged = await asyncio.to_thread(_stage_prepared, prepared, workflow, bundle_dir, attach_nodes)
+    await asyncio.to_thread(
+        _save_asset_references, workflow, bundle_dir, assets, staged.filenames, staged.directories
+    )
 
     # The artist's values win over the ones the submitter fills in, except the workflow file. The
     # library rejects parameters that neither the job template nor the queue defines.
     filled = {key: value for key, value in prepared.values.items() if key in defined}
     values = {**filled, **parameters, "WorkflowFile": str(workflow_path)}
-    # Attached models are only mapped through this directory, so it wins over the panel's value.
+    # Attached files are only mapped through these directories, so they win over the panel's values.
     if staged.model_dir is not None:
         values["ModelDirectory"] = str(staged.model_dir)
+    if staged.node_dir is not None:
+        values["CustomNodesDirectory"] = str(staged.node_dir)
     return _Bundle(bundle_dir, workflow_path, values, prepared.warnings)
 
 

@@ -5,6 +5,7 @@ import re
 import stat
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -21,6 +22,7 @@ from deadline.comfyui_submitter.submit import (
     check_cli_version,
     create_job_bundle,
     get_safe_path,
+    local_node_packs,
     parse_cli_version,
     resolve_deadline_cli,
     resolve_job_template,
@@ -245,6 +247,32 @@ def test_workflow_models():
     ]
 
 
+KJ_API = {
+    "1": {"class_type": "KSampler", "inputs": {}},
+    "2": {"class_type": "ImageResizeKJv2", "inputs": {}},
+    "3": {"class_type": "VHS_VideoCombine", "inputs": {}},
+}
+
+
+def test_local_node_packs_attaches_every_custom_pack_the_workflow_uses(tmp_path):
+    """Workers get custom nodes only through job attachments, registry installs included."""
+    kj, vhs, unused = (tmp_path / name for name in ("comfyui-kjnodes", "vhs", "unused"))
+    # ComfyUI's own nodes, such as KSampler, aren't loaded from custom_nodes, so aren't listed.
+    loaded = {"ImageResizeKJv2": kj, "VHS_VideoCombine": vhs, "Unused": unused}
+    assert local_node_packs(KJ_API, loaded) == {"comfyui-kjnodes": kj, "vhs": vhs}
+
+
+def test_local_node_packs_lists_each_folder_once(tmp_path):
+    pack = tmp_path / "studio-nodes"
+    loaded = {"ImageResizeKJv2": pack, "VHS_VideoCombine": pack}
+    assert local_node_packs(KJ_API, loaded) == {"studio-nodes": pack}
+
+
+def test_local_node_packs_includes_single_file_nodes(tmp_path):
+    script = tmp_path / "custom_nodes" / "single.py"
+    assert local_node_packs(KJ_API, {"ImageResizeKJv2": script}) == {"single.py": script}
+
+
 @pytest.mark.parametrize(
     ("content", "expected"),
     [
@@ -343,7 +371,7 @@ def test_host_requirements_openjd_accepts(requirements, tmp_path):
     )
     template = yaml.safe_load((bundle_dir / "template.yaml").read_text())
     assert template["steps"][0]["hostRequirements"] == requirements
-    decode_job_template(template=template)
+    decode_job_template(template=template, supported_extensions=["EXPR"])
 
 
 @pytest.mark.parametrize(
@@ -385,7 +413,7 @@ def test_create_job_bundle_can_remove_host_requirements(tmp_path):
     bundle_dir, _ = create_job_bundle(submit.JOB_TEMPLATE, {}, "w", tmp_path, requirements={})
     template = yaml.safe_load((bundle_dir / "template.yaml").read_text())
     assert "hostRequirements" not in template["steps"][0]
-    decode_job_template(template=template)
+    decode_job_template(template=template, supported_extensions=["EXPR"])
 
 
 @pytest.mark.parametrize(
@@ -418,13 +446,14 @@ def test_create_job_bundle_description_is_valid_at_the_limit(tmp_path):
     )
     template = yaml.safe_load((bundle_dir / "template.yaml").read_text())
     assert template["description"] == description
-    decode_job_template(template=template)
+    decode_job_template(template=template, supported_extensions=["EXPR"])
 
 
 def _tasks(bundle_dir: Path, tmp_path: Path, **values: str) -> list[dict[str, str]]:
     """Creates the bundle's job with openjd-model, as Deadline Cloud does, and lists its tasks."""
     template = decode_job_template(
         template=yaml.safe_load((bundle_dir / "template.yaml").read_text()),
+        supported_extensions=["EXPR"],
     )
     parameters = preprocess_job_parameters(
         job_template=template,
@@ -535,3 +564,58 @@ def test_picker_command_on_linux(monkeypatch):
     assert "--multiple" in (submit.picker_command("files", "linux") or [])
     monkeypatch.setattr(submit.shutil, "which", lambda name: None)
     assert submit.picker_command("files", "linux") is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(True, True), ("true", True), ("Yes", True), (" ON ", True), ("1", True), (1, True)]
+    + [(False, False), ("FALSE", False), ("no", False), ("off", False), ("0", False), (0, False)]
+    + [("", None), ("garbage", None), (2, None), ("1.0", None), (None, None)],
+)
+def test_parse_bool_reads_bool_parameters_as_openjd_does(value, expected):
+    assert submit.parse_bool(value) is expected
+
+
+TYPED_PARAMETERS: list[dict[str, Any]] = [
+    {"name": "Switch", "type": "BOOL"},
+    {"name": "Steps", "type": "INT", "minValue": 1, "maxValue": 50},
+    {"name": "Scale", "type": "FLOAT", "minValue": "0.5", "allowedValues": [0.5, 1, 2.5]},
+    {"name": "Mode", "type": "STRING", "allowedValues": ["fast", "best"]},
+    {"name": "Tag", "type": "STRING", "minLength": 2, "maxLength": 4},
+    {"name": "Out", "type": "PATH"},
+]
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        {"Switch": "off", "Steps": "20", "Scale": "2.5", "Mode": "best", "Tag": "abc"},
+        {"Steps": 50, "Scale": 1, "Out": ""},
+        # Parameters the template doesn't define, such as the queue's, are the library's to check.
+        {"CondaChannels": "deadline-cloud"},
+    ],
+)
+def test_check_parameter_values_accepts_what_openjd_does(parameters):
+    submit.check_parameter_values(TYPED_PARAMETERS, parameters)
+
+
+@pytest.mark.parametrize(
+    ("parameters", "error"),
+    [
+        ({"Switch": "maybe"}, "Switch must be true or false, not 'maybe'."),
+        ({"Steps": "1.5"}, "Steps must be a whole number, not '1.5'."),
+        ({"Steps": True}, "Steps must be a whole number, not True."),
+        ({"Steps": "0"}, "Steps must be at least 1, not '0'."),
+        ({"Steps": 51}, "Steps must be at most 50, not 51."),
+        ({"Scale": "nan"}, "Scale must be a number, not 'nan'."),
+        ({"Scale": "0.25"}, "Scale must be at least 0.5, not '0.25'."),
+        ({"Scale": "2"}, "Scale must be one of 0.5, 1, 2.5, not '2'."),
+        ({"Mode": "slow"}, "Mode must be one of fast, best, not 'slow'."),
+        ({"Tag": "a"}, "Tag must be at least 2 characters long."),
+        ({"Tag": "abcde"}, "Tag must be at most 4 characters long."),
+    ],
+)
+def test_check_parameter_values_says_what_is_wrong(parameters, error):
+    with pytest.raises(SubmitError) as raised:
+        submit.check_parameter_values(TYPED_PARAMETERS, parameters)
+    assert str(raised.value) == error

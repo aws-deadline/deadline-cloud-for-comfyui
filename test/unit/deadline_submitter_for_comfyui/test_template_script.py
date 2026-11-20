@@ -28,7 +28,7 @@ from deadline.comfyui_submitter import submit
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="The stand-in comfy is a POSIX script")
 
 TEMPLATE = yaml.safe_load(submit.JOB_TEMPLATE.read_text())
-PARSED_TEMPLATE = decode_job_template(template=TEMPLATE)
+PARSED_TEMPLATE = decode_job_template(template=TEMPLATE, supported_extensions=["EXPR"])
 
 
 def environment_values(
@@ -170,7 +170,11 @@ def enter_script(end: str | None = None) -> str:
 
 
 def write_model_paths(
-    tmp_path: Path, model_directory: Path | None = None, conda_nodes: Path | None = None
+    tmp_path: Path,
+    model_directory: Path | None = None,
+    conda_nodes: Path | None = None,
+    custom_nodes_directory: Path | None = None,
+    attach_nodes: bool = True,
 ) -> Any:
     """
     Runs the part of the Enter script that writes extra_model_paths.yaml, and returns the config
@@ -181,7 +185,12 @@ def write_model_paths(
         ["bash", "-c", "set -euo pipefail\n" + script],
         env={
             "PATH": os.environ["PATH"],
-            **environment_values(tmp_path, ModelDirectory=str(model_directory or "")),
+            **environment_values(
+                tmp_path,
+                ModelDirectory=str(model_directory or ""),
+                CustomNodesDirectory=str(custom_nodes_directory or ""),
+                AttachCustomNodes="true" if attach_nodes else "false",
+            ),
             **({"COMFYUI_CUSTOM_NODES_DIR": str(conda_nodes)} if conda_nodes else {}),
         },
         capture_output=True,
@@ -220,6 +229,21 @@ def test_model_paths_add_the_conda_environments_custom_nodes(tmp_path):
     assert write_model_paths(tmp_path, conda_nodes=conda_nodes) == {
         "conda_custom_nodes": {"custom_nodes": str(conda_nodes)}
     }
+
+
+def test_model_paths_add_the_attached_custom_nodes(tmp_path):
+    attached = tmp_path / "attached nodes"
+    (attached / "studio-nodes").mkdir(parents=True)
+    assert write_model_paths(tmp_path, custom_nodes_directory=attached) == {
+        "attached_custom_nodes": {"custom_nodes": str(attached)}
+    }
+
+
+def test_model_paths_leave_out_attached_custom_nodes_when_attaching_is_off(tmp_path):
+    """The workers then provide every custom node, for example from a conda package."""
+    attached = tmp_path / "attached nodes"
+    (attached / "studio-nodes").mkdir(parents=True)
+    assert write_model_paths(tmp_path, custom_nodes_directory=attached, attach_nodes=False) is None
 
 
 def model_path_args(
@@ -702,3 +726,55 @@ def test_a_workflow_past_its_timeout_is_interrupted(tmp_path):
     assert code == 1
     assert "didn't finish within the Workflow Timeout of 2 seconds" in output
     assert interrupts == ["/interrupt"]
+
+
+def test_custom_node_requirements_are_constrained_to_the_conda_packages(tmp_path):
+    """Packages conda installed, such as torch, are pinned too, so a pack can't replace them."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "pip.log"
+    # A stand-in python: "-m venv DIR" makes DIR/bin/python, which lists packages as pip list
+    # does and records each pip command with the constraints it had. Both run the real Python
+    # for anything else, such as the script's diagnostics.
+    venv_python = (
+        "#!/bin/sh\n"
+        f'if [ "$1" = -c ]; then exec {shlex.quote(sys.executable)} "$@"; fi\n'
+        'if [ "$3" = list ]; then printf "torch==2.5.1\\nnumpy==2.1.0\\n"; exit 0; fi\n'
+        f'echo "$* constraint=$PIP_CONSTRAINT" >> {shlex.quote(str(log))}\n'
+    )
+    python = bin_dir / "python"
+    python.write_text(
+        "#!/bin/sh\n"
+        'if [ "$2" = venv ]; then\n'
+        '  mkdir -p "$4/bin"\n'
+        f'  printf %s {shlex.quote(venv_python)} > "$4/bin/python"\n'
+        '  chmod +x "$4/bin/python"\n'
+        f'else exec {shlex.quote(sys.executable)} "$@"; fi\n'
+    )
+    python.chmod(0o755)
+    node = tmp_path / "pack"
+    node.mkdir()
+    (node / "requirements.txt").write_text("torch>=99\n")
+    [environment] = TEMPLATE["jobEnvironments"]
+    [enter] = [f for f in environment["script"]["embeddedFiles"] if f["name"] == "Enter"]
+    data = enter["data"]
+    block = data[data.index("# The attached packs' pip") : data.index("PORT=$(python")]
+    diagnostics = data[data.index("diagnostics() {") : data.index("MODEL_PATHS=")]
+    nodes = f"ATTACHED_NODES=({shlex.quote(str(node))})"
+    result = subprocess.run(
+        ["bash", "-c", f"set -euo pipefail\n{diagnostics}\n{nodes}\n{block}"],
+        env={
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "COMFYUI_SESSION_DIR": str(tmp_path),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    constraints = tmp_path / "constraints.txt"
+    assert constraints.read_text() == "torch==2.5.1\nnumpy==2.1.0\n"
+    assert log.read_text().splitlines() == [
+        f"-m pip install -r {node / 'requirements.txt'} constraint={constraints}",
+        f"-m pip check constraint={constraints}",
+    ]

@@ -331,5 +331,11 @@ if (scenario === "edited-before-replanning") {
   api.emit("deadline.download", { jobId: "job-1", status: "DOWNLOADED", message, fileCount: 2, directory });
   result.toasts = app.toasts.map(({ detail }) => detail);
 }
+if (scenario === "parse-bool") {
+  // The panel reads a BOOL parameter as OpenJD and the submitter do.
+  result.values = [true, "true", "Yes", " ON ", "1", 1, false, "FALSE", "no", "off", "0", 0, "", "garbage", 2].map(
+    ui.parseBool
+  );
+}
 console.log(JSON.stringify(result));
 process.exit(0);
