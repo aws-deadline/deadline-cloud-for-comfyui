@@ -182,8 +182,6 @@ const DEFAULT_SETTINGS: Settings = {
   jobAttachmentsFileSystem: "",
 };
 const DONE_STATUSES = new Set(["SUCCEEDED", "FAILED", "CANCELED"]);
-// The most attachments the panel lists. All of them are still attached.
-const MAX_LISTED_ATTACHMENTS = 100;
 
 function readStorage<T>(key: string, fallback: T): T {
   try {
@@ -1894,20 +1892,15 @@ function renderAttachments() {
       ? h(
           "ul",
           { className: "dl-files" },
-          [...rows.values()]
-            .slice(0, MAX_LISTED_ATTACHMENTS)
-            .map((row) =>
-              attachmentItem(
-                row.path,
-                row.path,
-                row.kind === "folder" ? "▸ " : "",
-                remove(row),
-                restore(row)
-              )
-            ),
-          rows.size > MAX_LISTED_ATTACHMENTS
-            ? h("li", { className: "dl-muted" }, `and ${rows.size - MAX_LISTED_ATTACHMENTS} more`)
-            : null
+          [...rows.values()].map((row) =>
+            attachmentItem(
+              row.path,
+              row.path,
+              row.kind === "folder" ? "▸ " : "",
+              remove(row),
+              restore(row)
+            )
+          )
         )
       : h("div", { className: "dl-muted" }, "The workflow loads no input files."),
     h(

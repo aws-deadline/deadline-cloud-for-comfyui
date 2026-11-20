@@ -148,6 +148,52 @@ if (scenario === "edited-before-replanning") {
   result.submission = state.submission;
   result.canSubmit = Boolean(ui.canSubmit());
   result.toasts = app.toasts.map(({ severity }) => severity);
+} else if (scenario === "all-attachments") {
+  // Render the real section and click its controls, including rows beyond the first 100.
+  class NodeStub {
+    constructor(tag) {
+      this.tag = tag;
+      this.children = [];
+      this.attributes = {};
+      this.listeners = {};
+    }
+    append(child) {
+      this.children.push(child);
+    }
+    setAttribute(name, value) {
+      this.attributes[name] = value;
+    }
+    addEventListener(name, handler) {
+      this.listeners[name] = handler;
+    }
+  }
+  globalThis.Node = NodeStub;
+  globalThis.document = { createElement: (tag) => new NodeStub(tag) };
+  const descendants = (node) => [
+    node,
+    ...node.children.filter((child) => child instanceof NodeStub).flatMap(descendants),
+  ];
+  const rows = () => descendants(ui.__renderers.attachments()).filter((node) => node.tag === "li");
+  const click = (path) => rows().find((row) => row.attributes.title === path)
+    .children.find((child) => child.tag === "button").listeners.click();
+  const external = "/outside/review-me.png";
+  const manualFile = "/manual/clip.mov";
+  const manualFolder = "/manual/frames";
+  const planned = Array.from({ length: 105 }, (_, index) => `/input/image-${index}.png`);
+  state.plan.attachments = { filenames: [...planned, external], directories: ["/outside/frames"] };
+  state.addedAttachments = { filenames: [manualFile], directories: [manualFolder] };
+  result.listed = rows().map((row) => row.attributes.title);
+  click(external);
+  result.removedRowClass = rows().find((row) => row.attributes.title === external).className;
+  await ui.submit();
+  result.sentAfterRemoving = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body.attachments;
+  state.submission = null;
+  click(external);
+  click(manualFile);
+  click(manualFolder);
+  result.listedAfterRemovingManual = rows().map((row) => row.attributes.title);
+  await ui.submit();
+  result.sentAfterRestoring = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body.attachments;
 } else if (scenario === "same-name-models") {
   // A checkpoint and a LoRA share a file name. Removing one leaves the other attached.
   const model = (directory) => ({

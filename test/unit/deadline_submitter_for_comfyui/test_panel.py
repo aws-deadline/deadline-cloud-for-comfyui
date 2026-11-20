@@ -134,6 +134,29 @@ def test_a_queue_parameter_the_template_defines_defaults_to_the_templates_value(
     }
 
 
+def test_every_attachment_is_listed_and_can_be_removed_or_restored(run_scenario):
+    result = run_scenario("all-attachments")
+    planned = [f"/input/image-{index}.png" for index in range(105)]
+    external = "/outside/review-me.png"
+    assert result["listed"] == [
+        *planned,
+        external,
+        "/outside/frames",
+        "/manual/clip.mov",
+        "/manual/frames",
+    ]
+    assert result["removedRowClass"] == "dl-removed"
+    assert result["sentAfterRemoving"] == {
+        "filenames": [*planned, "/manual/clip.mov"],
+        "directories": ["/outside/frames", "/manual/frames"],
+    }
+    assert result["listedAfterRemovingManual"] == [*planned, external, "/outside/frames"]
+    assert result["sentAfterRestoring"] == {
+        "filenames": [*planned, external],
+        "directories": ["/outside/frames"],
+    }
+
+
 def test_a_model_is_removed_by_its_folder_and_name(run_scenario):
     """Two models with the same file name, in different folders, are removed one at a time."""
     result = run_scenario("same-name-models")
