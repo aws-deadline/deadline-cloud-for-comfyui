@@ -1066,6 +1066,9 @@ async def download_outputs(request: web.Request) -> web.Response:
     body = await _read_body(request)
     if isinstance(body, web.Response):
         return body
+    client_id = _client_id(body)
+    if client_id is None:
+        return _error(400, "A valid browser clientId is required to download job outputs.")
     ids = [str(body.get(key)) for key in ("farmId", "queueId", "jobId")]
     if not all(_RESOURCE_ID.fullmatch(value) for value in ids):
         return _error(400, "farmId, queueId and jobId must be Deadline Cloud IDs.")
@@ -1103,13 +1106,11 @@ async def download_outputs(request: web.Request) -> web.Response:
         )
     except OSError as e:
         return _error(500, f"Couldn't run the Deadline Cloud CLI: {e}")
-    _start(_watch_download(process, job_id, _client_id(body)))
+    _start(_watch_download(process, job_id, client_id))
     return web.json_response({"jobId": job_id}, status=202)
 
 
-async def _watch_download(
-    process: asyncio.subprocess.Process, job_id: str, client_id: str | None = None
-) -> None:
+async def _watch_download(process: asyncio.subprocess.Process, job_id: str, client_id: str) -> None:
     assert process.stdout is not None and process.stderr is not None
     summary = None
     errors = []

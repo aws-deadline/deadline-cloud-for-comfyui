@@ -1864,16 +1864,48 @@ def test_bundle_rejects_bad_host_requirements(comfy, monkeypatch):
     assert "hostRequirements" in response["error"]
 
 
-def test_download_sends_events_only_to_the_tab_that_asked(comfy, monkeypatch):
+@pytest.mark.parametrize(
+    "client",
+    [
+        {},
+        {"clientId": None},
+        {"clientId": ""},
+        {"clientId": "../tab"},
+        {"clientId": "tab 1"},
+        {"clientId": "tab-1\n"},
+        {"clientId": "a" * 129},
+        {"clientId": 123},
+        {"clientId": True},
+        {"clientId": ["tab-1"]},
+        {"clientId": {"tab": "1"}},
+    ],
+)
+def test_download_requires_a_valid_client_before_starting_tools(comfy, monkeypatch, client):
+    def unexpected_tool_call(*args, **kwargs):
+        pytest.fail("An invalid client must not start download tools.")
+
+    monkeypatch.setattr(comfy.routes, "load_config", unexpected_tool_call)
+    monkeypatch.setattr(comfy.routes.asyncio, "create_subprocess_exec", unexpected_tool_call)
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, **client}
+    status, response = run(call(comfy, "/deadline/jobs/download", body))
+    assert status == 400
+    assert "valid browser clientId" in response["error"]
+    assert comfy.routes._watchers == set()
+    assert comfy.server.events == []
+    assert comfy.server.sids == []
+
+
+@pytest.mark.parametrize("client_id", ["tab-1", "tab_A-9", "a" * 128])
+def test_download_sends_events_only_to_the_tab_that_asked(comfy, monkeypatch, client_id):
     lines = [
         {"messageType": "progress", "value": "50"},
         {"messageType": "summary", "value": "Downloaded 2 files", "fileCount": 2},
     ]
     fake_cli(monkeypatch, comfy.tmp_path, "\n".join(map(json.dumps, lines)))
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": client_id}
     status, _ = run(call(comfy, "/deadline/jobs/download", body))
     assert status == 202
-    assert comfy.server.sids == ["tab-1", "tab-1"]
+    assert comfy.server.sids == [client_id, client_id]
 
 
 def test_download_runs_the_cli_and_reports_progress(comfy, monkeypatch):
@@ -1883,7 +1915,7 @@ def test_download_runs_the_cli_and_reports_progress(comfy, monkeypatch):
         {"messageType": "summary", "value": "Downloaded 2 files", "fileCount": 2},
     ]
     args_file = fake_cli(monkeypatch, comfy.tmp_path, "\n".join(map(json.dumps, lines)))
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID}
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
     status, result = run(call(comfy, "/deadline/jobs/download", body))
     assert (status, result) == (202, {"jobId": JOB_ID})
     args = json.loads(args_file.read_text())
@@ -1909,7 +1941,7 @@ def test_download_says_which_folder_it_downloaded_into(comfy, monkeypatch):
     files = [str(output / "fox" / "fox_00001_.png"), str(output / "fox_00002_.png")]
     summary = {"messageType": "summary", "value": "Downloaded 2 files", "fileCount": 2}
     fake_cli(monkeypatch, comfy.tmp_path, json.dumps({**summary, "files": files}))
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID}
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
     run(call(comfy, "/deadline/jobs/download", body))
     assert comfy.server.events[-1][1]["directory"] == str(output)
 
@@ -1920,7 +1952,7 @@ def test_download_leaves_out_a_folder_it_cant_tell(comfy, monkeypatch, files):
     if files is not None:
         summary["files"] = files
     fake_cli(monkeypatch, comfy.tmp_path, json.dumps(summary))
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID}
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
     run(call(comfy, "/deadline/jobs/download", body))
     assert comfy.server.events[-1][1]["status"] == "DOWNLOADED"
     assert "directory" not in comfy.server.events[-1][1]
@@ -1930,7 +1962,7 @@ def test_download_reads_stderr_while_waiting_for_the_summary(comfy, monkeypatch)
     """A CLI that fills its stderr pipe before printing its summary still finishes."""
     summary = {"messageType": "summary", "value": "Downloaded 1 file", "fileCount": 1}
     fake_cli(monkeypatch, comfy.tmp_path, json.dumps(summary), stderr_noise=600_000)
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID}
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
     run(asyncio.wait_for(call(comfy, "/deadline/jobs/download", body), 30))
     assert comfy.server.events[-1][1]["status"] == "DOWNLOADED"
 
@@ -1952,7 +1984,7 @@ def test_download_reports_a_summary_longer_than_the_default_line_limit(comfy, mo
     summary = _long_summary()
     assert len(json.dumps(summary)) > 64 * 1024
     fake_cli(monkeypatch, comfy.tmp_path, json.dumps(summary))
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID}
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
     run(asyncio.wait_for(call(comfy, "/deadline/jobs/download", body), 30))
     assert comfy.server.events[-1][1]["status"] == "DOWNLOADED"
     assert comfy.server.events[-1][1]["fileCount"] == 3000
@@ -1962,7 +1994,7 @@ def test_download_reports_output_it_cant_read(comfy, monkeypatch):
     """The panel stops showing the download as running, whatever went wrong reading it."""
     monkeypatch.setattr(comfy.routes, "DOWNLOAD_LINE_LIMIT", 1024)
     fake_cli(monkeypatch, comfy.tmp_path, json.dumps(_long_summary()))
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID}
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
     run(asyncio.wait_for(call(comfy, "/deadline/jobs/download", body), 30))
     [(event, data)] = comfy.server.events
     assert (event, data["status"]) == ("deadline.download", "FAILED")
@@ -1971,18 +2003,19 @@ def test_download_reports_output_it_cant_read(comfy, monkeypatch):
 
 def test_download_reports_failures(comfy, monkeypatch):
     fake_cli(monkeypatch, comfy.tmp_path, "", exit_code=1, stderr="Credentials are expired")
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID}
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
     run(call(comfy, "/deadline/jobs/download", body))
     assert comfy.server.events[-1] == (
         "deadline.download",
         {"jobId": JOB_ID, "status": "FAILED", "error": "Credentials are expired"},
     )
+    assert comfy.server.sids == ["tab-1"]
 
 
 def test_download_failures_log_stderr_indented(comfy, monkeypatch, caplog):
     stderr = "Credentials are expired\nERROR forged entry"
     fake_cli(monkeypatch, comfy.tmp_path, "", exit_code=1, stderr=stderr)
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID}
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
     with caplog.at_level("ERROR", logger=comfy.routes.logger.name):
         run(call(comfy, "/deadline/jobs/download", body))
     message = caplog.records[-1].getMessage()
@@ -1994,6 +2027,6 @@ def test_download_failures_log_stderr_indented(comfy, monkeypatch, caplog):
 
 
 def test_download_only_takes_deadline_ids(comfy, monkeypatch):
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": "--profile=evil"}
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": "--profile=evil", "clientId": "tab-1"}
     status, _ = run(call(comfy, "/deadline/jobs/download", body))
     assert status == 400
