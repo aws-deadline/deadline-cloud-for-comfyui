@@ -758,7 +758,11 @@ async function answerConfirmation(accept: boolean) {
   submission.confirm = null;
   refresh("submit");
   try {
-    await postJson("/deadline/jobs/confirm", { submissionId: submission.id, accept });
+    await postJson("/deadline/jobs/confirm", {
+      submissionId: submission.id,
+      clientId: api.clientId,
+      accept,
+    });
   } catch (error) {
     toast("error", messageOf(error));
   }

@@ -57,7 +57,9 @@ def _run_scenario(tmp_path: Path, ui_source: str, scenario: str) -> dict:
         "\nexport { state as __state, queueParameterValue as __queueParameterValue,"
         " parameterControl as __parameterControl, RENDERERS as __renderers,"
         " pollJobs as __pollJobs, formFromRequirements as __formFromRequirements,"
-        " requirementsFromForm as __requirementsFromForm, createView as __createView };\n"
+        " requirementsFromForm as __requirementsFromForm,"
+        " createView as __createView,"
+        " answerConfirmation as __answerConfirmation };\n"
     )
     (web / "deadline_ui.js").write_text(ui_source + exports, encoding="utf-8")
     (tmp_path / "package.json").write_text('{"type": "module"}')
@@ -100,6 +102,14 @@ def test_a_confirmation_before_the_response_is_shown(run_scenario):
     result = run_scenario("early-confirm")
     assert result["submission"]["confirm"] == {"message": "Upload 5 GB?", "default": True}
     assert result["submission"]["starting"] is False
+
+
+def test_confirmation_answers_include_the_submitting_client(run_scenario):
+    result = run_scenario("answer-confirmation")
+    assert result == {
+        "answers": [{"submissionId": "a" * 32, "clientId": "tab-1", "accept": True}],
+        "pending": None,
+    }
 
 
 def test_a_submission_finished_before_the_response_is_cleared(run_scenario):

@@ -977,6 +977,11 @@ async def confirm_submission(request: web.Request) -> web.Response:
     submission = _running_submission(body)
     if isinstance(submission, web.Response):
         return submission
+    if body.get("clientId") != submission.client_id:
+        return _error(403, "Only the browser tab that started this submission can confirm it.")
+    if submission.canceled or submission.confirms <= submission.answered:
+        return _error(409, "That submission has no pending confirmation.")
+    # Claim this prompt before yielding to the bridge, so another answer cannot queue behind it.
     submission.answered = submission.confirms
     if not await _write_line(submission.process, {"accept": body.get("accept") is True}):
         return _error(404, "That submission isn't running.")

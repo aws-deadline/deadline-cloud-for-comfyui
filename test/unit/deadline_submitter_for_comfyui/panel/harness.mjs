@@ -51,7 +51,18 @@ await ui.loadPlan(true);
 const result = {};
 const scenario = process.argv[2];
 
-if (scenario === "edited-before-replanning") {
+if (scenario === "answer-confirmation") {
+  state.submission = {
+    id: "a".repeat(32),
+    confirm: { message: "Upload?", default: true },
+  };
+  api.handlers["/deadline/jobs/confirm"] = async () => ({});
+  await ui.__answerConfirmation(true);
+  // Clicking again cannot send an answer once the pending prompt has been cleared.
+  await ui.__answerConfirmation(true);
+  result.answers = api.calls.filter(({ path }) => path === "/deadline/jobs/confirm").map(({ body }) => body);
+  result.pending = state.submission.confirm;
+} else if (scenario === "edited-before-replanning") {
   // The artist edits the graph and submits before the debounced plan request starts.
   app.image = "new.png";
   await ui.submit();

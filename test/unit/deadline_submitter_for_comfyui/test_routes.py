@@ -642,7 +642,11 @@ async def submit_and_confirm(comfy, body, accept=True):
                 await asyncio.sleep(0.05)
             answer = await client.post(
                 "/deadline/jobs/confirm",
-                json={"submissionId": result["submissionId"], "accept": accept},
+                json={
+                    "submissionId": result["submissionId"],
+                    "clientId": body.get("clientId"),
+                    "accept": accept,
+                },
             )
             assert answer.status == 200
         await asyncio.gather(*comfy.routes._watchers)
@@ -1088,6 +1092,96 @@ def test_jobs_cancel_the_unanswered_confirmation_timer_when_the_submission_ends(
     event, data = comfy.server.events[-1]
     assert (event, data["status"]) == ("deadline.submitted", "SUBMITTED")
     assert comfy.routes._watchers == set()
+
+
+class _RecordingProcess:
+    """A bridge whose stdin records answers and yields while draining."""
+
+    def __init__(self):
+        self.answers = []
+        self.stdin = self
+
+    def write(self, data):
+        self.answers.append(json.loads(data))
+
+    async def drain(self):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize(("confirms", "answered"), [(0, 0), (1, 1), (2, 2), (1, 2)])
+def test_confirm_rejects_answers_without_a_pending_prompt(comfy, monkeypatch, confirms, answered):
+    process = _RecordingProcess()
+    submission = comfy.routes._Submission(
+        "fox", process, client_id="tab-1", confirms=confirms, answered=answered
+    )
+    monkeypatch.setitem(comfy.routes._submissions, "a" * 32, submission)
+    status, response = run(
+        call(
+            comfy,
+            "/deadline/jobs/confirm",
+            {"submissionId": "a" * 32, "clientId": "tab-1", "accept": True},
+        )
+    )
+    assert status == 409
+    assert "no pending confirmation" in response["error"]
+    assert process.answers == []
+    assert submission.answered == answered
+
+
+@pytest.mark.parametrize("client_id", ["tab-2", None, "../tab", 123])
+def test_confirm_rejects_answers_from_another_client(comfy, monkeypatch, client_id):
+    process = _RecordingProcess()
+    submission = comfy.routes._Submission("fox", process, client_id="tab-1", confirms=1)
+    monkeypatch.setitem(comfy.routes._submissions, "a" * 32, submission)
+    status, _ = run(
+        call(
+            comfy,
+            "/deadline/jobs/confirm",
+            {"submissionId": "a" * 32, "clientId": client_id, "accept": True},
+        )
+    )
+    assert status == 403
+    assert process.answers == []
+    assert submission.answered == 0
+
+
+@pytest.mark.parametrize("client_id", ["tab-1", None])
+def test_confirm_only_answers_each_pending_prompt_once(comfy, monkeypatch, client_id):
+    process = _RecordingProcess()
+    submission = comfy.routes._Submission("fox", process, client_id=client_id)
+    monkeypatch.setitem(comfy.routes._submissions, "a" * 32, submission)
+
+    async def answer():
+        return await call(
+            comfy,
+            "/deadline/jobs/confirm",
+            {"submissionId": "a" * 32, "clientId": client_id, "accept": True},
+        )
+
+    async def confirm_prompts():
+        # An early answer is not saved for the first prompt.
+        assert (await answer())[0] == 409
+        submission.confirms = 1
+        responses = await asyncio.gather(answer(), answer())
+        assert sorted(status for status, _ in responses) == [200, 409]
+        assert (await answer())[0] == 409
+        submission.confirms = 2
+        assert (await answer())[0] == 200
+
+    run(confirm_prompts())
+    assert process.answers == [{"accept": True}, {"accept": True}]
+    assert submission.answered == 2
+
+
+def test_confirm_rejects_a_canceled_submission(comfy, monkeypatch):
+    process = _RecordingProcess()
+    submission = comfy.routes._Submission("fox", process, canceled=True, confirms=1)
+    monkeypatch.setitem(comfy.routes._submissions, "a" * 32, submission)
+    status, _ = run(
+        call(comfy, "/deadline/jobs/confirm", {"submissionId": "a" * 32, "accept": True})
+    )
+    assert status == 409
+    assert process.answers == []
 
 
 class _ExitedProcess:
