@@ -248,9 +248,8 @@ async def _read_body(request: web.Request) -> dict[str, Any] | web.Response:
     if forwarded or not _is_loopback(request.remote):
         return _error(
             403,
-            "Deadline Cloud submits from the ComfyUI server, with its credentials, so it only "
-            "accepts requests from a browser on that machine, not through a proxy. Use a local "
-            "browser, remote desktop, or an SSH tunnel to the server's loopback interface.",
+            "Deadline Cloud uses the ComfyUI server's AWS credentials and only accepts requests "
+            "from that machine. Use a browser on the machine running ComfyUI and access it through localhost.",
         )
     # A website can point its own name at 127.0.0.1, so that its page counts as same-origin with
     # ComfyUI. Its name is still in the Host header.
