@@ -33,7 +33,9 @@ workflow changes.
 The Python project uses Hatch. Run `hatch run lint` and `hatch run test`
 before submitting changes. The shared workflow runs `hatch -v run lint`,
 `hatch -v build`, and `hatch run test` across Linux, Windows, and macOS with
-Python 3.13 and 3.14. CodeQL analyzes the Python source under `src/`.
+Python 3.13 and 3.14. The frontend CI job builds the TypeScript and runs the
+compiled panel tests. CodeQL analyzes the Python source under `src/` and the
+TypeScript source under `frontend/`.
 
 Product CI requires a root `pyproject.toml` with `project.name` and
 `build-system.build-backend`, Python source under `src/`, tests under `test/`
