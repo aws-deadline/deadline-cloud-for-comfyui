@@ -265,6 +265,67 @@ def test_routes_only_answer_allowed_browsers(
         assert got == (200 if path == "/deadline/plan" else 404)
 
 
+@pytest.mark.parametrize(
+    ("origin", "host", "status"),
+    [
+        ("http://localhost:8188", "localhost:8188", 200),
+        ("http://LOCALHOST:8188", "localhost:8188", 200),
+        ("http://localhost", "localhost:80", 200),
+        ("http://[::1]:8188", "[::1]:8188", 200),
+        ("http://attacker.example:8188", "localhost:8188", 403),
+        ("http://localhost:8000", "localhost:8188", 403),
+        ("https://localhost:8188", "localhost:8188", 403),
+        ("http://127.0.0.1:8188", "localhost:8188", 403),
+        ("null", "localhost:8188", 403),
+        ("", "localhost:8188", 403),
+        ("not a URL", "localhost:8188", 403),
+        ("http://[invalid]:8188", "localhost:8188", 403),
+        ("http://localhost:invalid", "localhost:8188", 403),
+        ("http://user@localhost:8188", "localhost:8188", 403),
+        ("http://localhost:8188/path", "localhost:8188", 403),
+        ("http://localhost:8188?query=value", "localhost:8188", 403),
+        ("http://localhost:8188#fragment", "localhost:8188", 403),
+        ("http://localhost:8188 http://attacker.example", "localhost:8188", 403),
+    ],
+)
+@pytest.mark.parametrize("fetch_site", [None, "same-origin", "none"])
+@pytest.mark.parametrize("allow_remote", [False, True])
+@pytest.mark.parametrize("path", ["/deadline/plan", "/deadline/jobs/cancel"])
+def test_routes_check_origin_even_without_fetch_metadata(
+    comfy, monkeypatch, path, origin, host, status, fetch_site, allow_remote
+):
+    if allow_remote:
+        monkeypatch.setenv("COMFYUI_DEADLINE_ALLOW_REMOTE", "1")
+    headers = {"Host": host, "Origin": origin}
+    if fetch_site is not None:
+        headers["Sec-Fetch-Site"] = fetch_site
+    got, response = run(
+        call(comfy, path, {"workflow": WORKFLOW, "submissionId": "a" * 32}, headers=headers)
+    )
+    if status == 403:
+        assert got == 403
+        assert "websites" in response["error"]
+    else:
+        assert got == (200 if path == "/deadline/plan" else 404)
+
+
+def test_routes_reject_multiple_origins(comfy):
+    status, response = run(
+        call(
+            comfy,
+            "/deadline/plan",
+            {"workflow": WORKFLOW},
+            headers=[
+                ("Host", "localhost:8188"),
+                ("Origin", "http://localhost:8188"),
+                ("Origin", "http://attacker.example"),
+            ],
+        )
+    )
+    assert status == 403
+    assert "websites" in response["error"]
+
+
 def test_jobs_requires_json(comfy, monkeypatch):
     fake_tools(monkeypatch, comfy.tmp_path)
     status, _ = run(post(comfy, {"workflow": WORKFLOW}, content_type="text/plain"))

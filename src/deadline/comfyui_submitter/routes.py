@@ -27,6 +27,7 @@ import folder_paths
 import yaml
 from aiohttp import web
 from server import PromptServer
+from yarl import URL
 
 from .get_local_assets import (
     LocalAssets,
@@ -239,12 +240,35 @@ def _log_block(text: str) -> str:
 _FORWARDING_HEADERS = ("Forwarded", "X-Forwarded-For", "X-Real-IP")
 
 
+def _has_matching_origin(request: web.Request) -> bool:
+    """An explicit Origin must name the request's scheme, host and port."""
+    origins = request.headers.getall("Origin", [])
+    if not origins:
+        return True
+    if len(origins) != 1:
+        return False
+    try:
+        origin = URL(origins[0])
+        return (
+            origin.scheme in ("http", "https")
+            and origin.user is None
+            and origin.raw_path == "/"
+            and not origin.query_string
+            and not origin.fragment
+            and origin.origin() == request.url.origin()
+        )
+    except ValueError:
+        return False
+
+
 async def _read_body(request: web.Request) -> dict[str, Any] | web.Response:
     """Checks that a request comes from an allowed browser and returns its JSON object body."""
     # The routes act with this machine's AWS credentials, so they accept only ComfyUI's own page
     # or a request no page sent. --enable-cors-header turns off ComfyUI's origin check, and
     # "same-site" includes other ports on this machine.
     if request.headers.get("Sec-Fetch-Site", "none") not in ("same-origin", "none"):
+        return _error(403, "Deadline Cloud doesn't accept requests from other websites.")
+    if not _has_matching_origin(request):
         return _error(403, "Deadline Cloud doesn't accept requests from other websites.")
     forwarded = any(header in request.headers for header in _FORWARDING_HEADERS)
     if (forwarded or not _is_loopback(request.remote)) and not remote_allowed():
