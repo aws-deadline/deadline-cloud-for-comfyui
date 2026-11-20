@@ -21,7 +21,7 @@ npm ci
 | `__init__.py` | The ComfyUI custom-node entry point. ComfyUI imports it from `custom_nodes/`. |
 | `install_submitter.py` | The setup script for users. It's tested in `test/unit/test_install_submitter.py`. |
 | `src/deadline/comfyui_submitter/submit.py` | Pure helpers for building the submitter command. They don't import ComfyUI, so they're unit tested. |
-| `src/deadline/comfyui_submitter/routes.py` | The `/deadline/...` routes on the ComfyUI server: `plan`, `cloud/<command>`, `jobs`, `jobs/download`, `bundle` and `choose`. |
+| `src/deadline/comfyui_submitter/routes.py` | The `/deadline/...` routes on the ComfyUI server: `plan`, `cloud/<command>`, `bundle`, `jobs`, `jobs/confirm`, `jobs/cancel`, `jobs/download` and `choose`. |
 | `src/deadline/comfyui_submitter/bridge.py` | Calls `deadline.client.api` for the routes. It runs in the Deadline Cloud CLI's Python (`python -I bridge.py <command>`) and speaks JSON lines, so it only imports the standard library and `deadline`. |
 | `frontend/src/extensions/deadline-cloud/` | The frontend extension's TypeScript. `deadline_submit.ts` registers the commands, the action bar button and the sidebar tab; `deadline_ui.ts` is the panel and the dialog, in plain DOM with ComfyUI's theme variables. The folder mirrors where ComfyUI serves the extension, so imports such as `../../scripts/app.js` resolve to the type declarations in `frontend/src/scripts/`. |
 | `src/deadline/comfyui_submitter/web/` | The compiled JavaScript that ComfyUI serves. It's built by `npm run build` in `frontend/`, which `install_submitter.py` runs, and isn't committed. |
@@ -38,6 +38,7 @@ npm ci
 | `hatch run fmt` | Format with black, then run ruff. |
 | `hatch build` | Build the sdist and the wheel into `dist/`. |
 | `hatch version` | Print the version that hatch-vcs derives from git. |
+| `hatch run e2e:test` | Run the e2e tests, which drive the panel in the ComfyUI that `COMFYUI_PATH` names. |
 | `npm run build` | In `frontend/`: type-check the TypeScript and compile it into `src/deadline/comfyui_submitter/web/`. |
 | `npm run check` | In `frontend/`: type-check only. |
 
@@ -87,3 +88,27 @@ To run a bridge command by hand, with the CLI's Python:
 ```
 echo '{}' | /path/to/deadline-cli-python -I src/deadline/comfyui_submitter/bridge.py status
 ```
+
+## End-to-end tests
+
+The e2e tests in `test/e2e` drive the panel's compiled JavaScript in a real ComfyUI with
+[Playwright](https://playwright.dev/python/). Each test case lives in its own `test_scripts`
+subdirectory with the workflow file it runs, the values it changes in the UI, and the expected
+job bundle. The Deadline Cloud tools are faked for the ComfyUI server, so no credentials are
+needed. The test changes values in the panel's GUI, saves the job bundle, and then submits it: a
+successfully submitted bundle is removed once it's uploaded, but a saved one is kept, to submit
+later with `deadline bundle submit`, so the saved bundle is what must match the expected one.
+
+Tests need a ComfyUI checkout with its requirements installed:
+
+```
+python -m venv /path/to/ComfyUI/.venv
+/path/to/ComfyUI/.venv/bin/python -m pip install -r /path/to/ComfyUI/requirements.txt
+COMFYUI_PATH=/path/to/ComfyUI hatch run e2e:test
+```
+
+The panel is compiled first when needed (`npm ci` and `npm run build` in `frontend/`), and
+ComfyUI is started with this checkout linked in as its only custom node, a fresh base directory
+and a free port. Without `COMFYUI_PATH` the tests skip, so `hatch run test` stays hermetic;
+`COMFYUI_PYTHON` picks the interpreter that launches ComfyUI when it isn't the default. The
+e2e hatch environment downloads Playwright's Chromium when it's created.

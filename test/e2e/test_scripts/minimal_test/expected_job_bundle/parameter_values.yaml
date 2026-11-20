@@ -1,0 +1,23 @@
+parameterValues:
+- name: OutputDir
+  value: path/to/ComfyUI/output
+- name: InputDir
+  value: path/to/ComfyUI/input
+- name: ModelDirectory
+  value: ''
+- name: ExtraModelPathsConfig
+  value: ''
+- name: ComfyUIArgs
+  value: ''
+- name: ServerStartTimeout
+  value: '600'
+- name: WorkflowTimeout
+  value: '7200'
+- name: CondaPackages
+  value: comfy
+- name: WorkflowFile
+  value: path/to/workflow/minimal_test_case_workflow_ui_api.json
+- name: deadline:priority
+  value: 50
+- name: deadline:targetTaskRunStatus
+  value: READY

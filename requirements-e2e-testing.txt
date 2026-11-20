@@ -1,0 +1,3 @@
+# Drives ComfyUI's web UI for the e2e tests in test/e2e. The e2e hatch environment installs
+# Playwright's Chromium with `python -m playwright install chromium`.
+pytest-playwright == 0.*
