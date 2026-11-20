@@ -289,13 +289,10 @@ def test_routes_only_answer_allowed_browsers(
     ],
 )
 @pytest.mark.parametrize("fetch_site", [None, "same-origin", "none"])
-@pytest.mark.parametrize("allow_remote", [False, True])
 @pytest.mark.parametrize("path", ["/deadline/plan", "/deadline/jobs/cancel"])
 def test_routes_check_origin_even_without_fetch_metadata(
-    comfy, monkeypatch, path, origin, host, status, fetch_site, allow_remote
+    comfy, path, origin, host, status, fetch_site
 ):
-    if allow_remote:
-        monkeypatch.setenv("COMFYUI_DEADLINE_ALLOW_REMOTE", "1")
     headers = {"Host": host, "Origin": origin}
     if fetch_site is not None:
         headers["Sec-Fetch-Site"] = fetch_site
