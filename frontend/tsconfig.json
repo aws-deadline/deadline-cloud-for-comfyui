@@ -10,8 +10,8 @@
     "strict": true,
     "noEmitOnError": true,
     "newLine": "lf",
-    // src/extensions/deadline-cloud mirrors where ComfyUI serves the extension, so imports such as
-    // ../../scripts/app.js find the type declarations in src/scripts, and compile unchanged.
+    // src/extensions/deadline-cloud mirrors where ComfyUI serves the extension. Imports such as
+    // ../../scripts/app.js use the ambient module declarations in src/ and compile unchanged.
     "rootDir": "src/extensions/deadline-cloud",
     "outDir": "../src/deadline/comfyui_submitter/web"
   },
