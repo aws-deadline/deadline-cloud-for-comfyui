@@ -256,7 +256,8 @@ def test_installed_files_and_dependencies(user_installation: Layout) -> None:
 
 
 def test_user_ownership_and_permissions(user_installation: Layout) -> None:
-    assert sys.platform == "darwin"
+    if sys.platform != "darwin":
+        pytest.skip("User ownership and permissions require macOS.")
     failures = []
     for root in (user_installation.prefix, user_installation.extension):
         for path in (root, *root.rglob("*")):
