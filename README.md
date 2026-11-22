@@ -56,9 +56,9 @@ The library runs in the Deadline Cloud CLI's own Python environment, not ComfyUI
 ## Requirements
 
 - **ComfyUI 0.38.0 or later**, running on Python 3.13 or later, with frontend 1.53 or later.
-- **Python 3.13 or later** to run the setup script. It can be any Python on the machine; it doesn't
+- **Python 3.13 or later** for installation from source, to run the setup script. It can be any Python on the machine; it doesn't
   have to be ComfyUI's.
-- **Node.js 22 or later**, with npm, for the setup script to build the panel. ComfyUI doesn't need
+- **Node.js 22 or later**, with npm, for installation from source to build the panel. ComfyUI doesn't need
   it once the extension is installed.
 - **Deadline Cloud credentials and defaults.** Sign in with Deadline Cloud monitor, or use an
   AWS profile, and set a default farm and queue (`deadline config gui`).
@@ -79,6 +79,41 @@ The library runs in the Deadline Cloud CLI's own Python environment, not ComfyUI
   See [The job](#the-job).
 
 ## Installing
+
+### macOS installer
+
+When your studio supplies a macOS installer built from this repository, quit ComfyUI and
+open the `osx-arm64` installer on an Apple silicon Mac.
+Select the ComfyUI submitter on the component page, then choose your existing ComfyUI
+folder. The folder picker suggests `~/ComfyUI`. Choose the source folder containing
+`main.py`, or a launcher folder containing `comfyui-source.txt` and a supported `launch.sh`.
+The installer validates only the selected folder and its referenced source/base folders.
+For installations using `--base-directory`, select that base folder when it cannot be
+identified from the selected launcher metadata; Deadline belongs in its active
+`custom_nodes`, which can be separate from the source. The custom-node folder must already
+exist and be writable, without symbolic links. Folder names cannot contain double quotes,
+dollar signs, backticks, backslashes, or line breaks. The installer requires macOS 13 or
+later. Windows installers are planned separately; Intel Mac support is deferred.
+
+The installer includes the compiled panel and a private Deadline Cloud Python runtime. You
+need no Node.js, setup script, or package downloads to install it. The runtime lives in
+`~/DeadlineCloudForComfyUISubmitter`; keep that folder while you use the extension.
+Restart ComfyUI after installation to load the extension. The finish page provides restart
+instructions. Deadline Cloud monitor credentials and AWS profiles still need to be set up
+for your account.
+
+Run the newer installer with the same ComfyUI folder to upgrade. It preserves existing
+submitter settings and unrelated custom nodes. To remove an installer installation, quit
+ComfyUI, open `~/DeadlineCloudForComfyUISubmitter/uninstall.app`, and follow its prompts. Start
+ComfyUI again after uninstalling. The uninstaller removes unchanged integration files and
+its own runtime, and keeps customer additions and edited settings. ComfyUI, models,
+workflows, and Deadline Cloud credentials stay in place.
+
+This repository currently provides the installer build pipeline; it does not publish a
+signed customer installer. See [Development](DEVELOPMENT.md#building-the-macos-installer) for
+build and release prerequisites.
+
+### Installing from source
 
 Get this repository, then run the setup script with the ComfyUI directory that contains
 `custom_nodes`:
@@ -126,11 +161,12 @@ require. The script checks it, and the panel stops before uploading if it's too 
 
 ## Configuration
 
-The setup script writes the config file. These environment variables override it. Set them in
+The installer or setup script writes the config file. These environment variables override it. Set them in
 the environment that starts ComfyUI.
 
 | Environment variable | Default | Description |
 |---|---|---|
+| `COMFYUI_DEADLINE_PYTHON` | `deadline_python` in the installer config, then the CLI's Python | The executable Python runtime used for Deadline Cloud. The installer configures its private runtime automatically. |
 | `COMFYUI_DEADLINE_CLI` | `deadline_cli` in the config, then `deadline` on the `PATH` | The Deadline Cloud CLI executable. |
 | `COMFYUI_DEADLINE_CONDA_CHANNELS` | `conda_channels` in the config | Optional **Conda Channels** to fill in. When neither is set, the queue's default, the Deadline Cloud channels, is used. |
 | `COMFYUI_DEADLINE_CONFIG` | `deadline_cloud_submitter.json` in the extension folder | Another config file to read. |

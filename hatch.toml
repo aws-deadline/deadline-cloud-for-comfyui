@@ -6,6 +6,7 @@ pre-install-commands = [
 [envs.default.scripts]
 sync = "pip install -r requirements-testing.txt"
 test = "pytest {args:test/unit} -vvv"
+test-installer = "pytest --no-cov test/installer -vvv {args:}"
 typing = "mypy {args:src test}"
 style = [
   "ruff check {args:.}",
@@ -22,3 +23,9 @@ lint = [
 
 [[envs.all.matrix]]
 python = ["3.13", "3.14"]
+
+[envs.installer]
+python = "3.13"
+
+[envs.installer.scripts]
+build-installer = 'python "{root}/scripts/build_installer.py" {args:}'

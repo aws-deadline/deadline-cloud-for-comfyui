@@ -1,0 +1,134 @@
+<!-- Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved. -->
+<project>
+    <shortName>DeadlineCloudForComfyUISubmitter</shortName>
+    <fullName>AWS Deadline Cloud for ComfyUI</fullName>
+    <version>1.0</version>
+    <vendor>Amazon Web Services, Inc.</vendor>
+    <installerFilename>${product_shortname}-${platform_name}-installer.${platform_exec_suffix}</installerFilename>
+    <enableRollback>1</enableRollback>
+    <rollbackBackupDirectory>${installdir}/rollbackBackupDirectory</rollbackBackupDirectory>
+    <enableTimestamp>1</enableTimestamp>
+    <allowComponentSelection>1</allowComponentSelection>
+    <requireInstallationByRootUser>0</requireInstallationByRootUser>
+    <requestedExecutionLevel>asInvoker</requestedExecutionLevel>
+    <initializationActionList>
+        <setInstallerVariable name="deadline_install_succeeded" value="0" />
+        <throwError text="This installer requires an Apple Silicon Mac. Use an installer built for your Mac's processor.">
+            <ruleList>
+                <compareText text="${runtime_architecture}" value="arm64" logic="equals" />
+                <platformTest type="osx-arm64" negate="1" />
+            </ruleList>
+        </throwError>
+        <throwError text="AWS Deadline Cloud for ComfyUI requires macOS 13 or later.">
+            <ruleList>
+                <platformTest type="osx" />
+                <compareVersions version1="${osx_version}" version2="13.0" logic="less" />
+            </ruleList>
+        </throwError>
+    </initializationActionList>
+    <componentList>
+        <include>
+            <file>../install_builder/deadline-cloud-for-comfyui.xml</file>
+        </include>
+    </componentList>
+    <parameterList>
+        <!-- These paths are populated by the build script, never requested from customers. -->
+        <stringParameter name="payload_directory" value="payload" ask="0" cliOptionShow="0" />
+        <stringParameter name="runtime_python_relative" value="bin/python3" ask="0" cliOptionShow="0" />
+        <stringParameter name="runtime_cli_relative" value="bin/deadline" ask="0" cliOptionShow="0" />
+        <stringParameter name="runtime_architecture" value="arm64" ask="0" cliOptionShow="0" />
+        <directoryParameter>
+            <name>installdir</name>
+            <description>Deadline Cloud installation directory</description>
+            <default>${user_home_directory}/DeadlineCloudForComfyUISubmitter</default>
+            <allowEmptyValue>0</allowEmptyValue>
+            <ask>0</ask>
+            <cliOptionName>prefix</cliOptionName>
+            <mustBeWritable>1</mustBeWritable>
+            <mustExist>0</mustExist>
+        </directoryParameter>
+    </parameterList>
+    <preInstallationActionList>
+        <componentSelection>
+            <select>deadline_cloud_for_comfyui</select>
+        </componentSelection>
+        <setInstallerVariable name="individual_install" value="1" />
+    </preInstallationActionList>
+    <readyToInstallActionList>
+        <throwError text="Select Deadline Cloud for ComfyUI before continuing. No integration files have been installed.">
+            <ruleList>
+                <componentTest name="deadline_cloud_for_comfyui" logic="selected" negate="1" />
+            </ruleList>
+        </throwError>
+    </readyToInstallActionList>
+    <postInstallationActionList>
+        <writeFile path="${installdir}/.deadline-cloud-for-comfyui-installer" text="deadline-cloud-for-comfyui-installer-v1" />
+        <addFilesToUninstaller files="${installdir}/.deadline-cloud-for-comfyui-installer" />
+        <writeFile path="${installdir}/installer_version.txt" text="${project.version}" />
+        <addFilesToUninstaller files="${installdir}/installation.json" />
+        <addFilesToUninstaller files="${installdir}/installer_version.txt" />
+        <!-- Register retained failure backups, then release successful upgrade backups. -->
+        <addFilesToUninstaller files="${project.rollbackBackupDirectory}" />
+        <throwError text="The installer backup path is a symbolic link. Its contents were left unchanged.">
+            <ruleList>
+                <compareText text="${deadline_install_succeeded}" logic="equals" value="1" />
+                <fileTest path="${project.rollbackBackupDirectory}" condition="is_symlink" />
+            </ruleList>
+        </throwError>
+        <deleteFile path="${project.rollbackBackupDirectory}">
+            <ruleList>
+                <compareText text="${deadline_install_succeeded}" logic="equals" value="1" />
+                <fileTest path="${project.rollbackBackupDirectory}" condition="is_symlink" negate="1" />
+            </ruleList>
+        </deleteFile>
+    </postInstallationActionList>
+    <preUninstallationActionList>
+        <throwError text="The installation path contains shell-special characters. Move it to an ordinary folder path before uninstalling.">
+            <ruleEvaluationLogic>or</ruleEvaluationLogic>
+            <ruleList>
+                <regExMatch text="${installdir}" pattern="[&quot;$`\\\r\n]" />
+                <regExMatch text="${runtime_python_relative}" pattern="[&quot;$`\\\r\n]" />
+            </ruleList>
+        </throwError>
+        <throwError text="The Deadline Cloud runtime folder is a symbolic link. Remove the link before uninstalling; its target was left unchanged.">
+            <ruleList>
+                <fileTest path="${installdir}/runtime" condition="is_symlink" />
+            </ruleList>
+        </throwError>
+        <throwError text="The installer backup path is a symbolic link. Remove the link before uninstalling; its target was left unchanged.">
+            <ruleList>
+                <fileTest path="${project.rollbackBackupDirectory}" condition="is_symlink" />
+            </ruleList>
+        </throwError>
+    </preUninstallationActionList>
+    <postUninstallationActionList>
+        <!-- Python may generate caches after installation. This directory is installer-owned. -->
+        <deleteFile path="${installdir}/runtime">
+            <ruleList>
+                <fileTest path="${installdir}/runtime" condition="is_symlink" negate="1" />
+            </ruleList>
+        </deleteFile>
+    </postUninstallationActionList>
+    <customLanguageFileList>
+        <language code="en" file="custom-en.lng" />
+    </customLanguageFileList>
+    <width>600</width>
+    <installationAbortedActionList>
+        <deleteFile path="${deadline_validation_directory}" abortOnError="0">
+            <ruleList>
+                <regExMatch text="${deadline_validation_directory}" pattern="/deadline-comfyui-installer\.[A-Za-z0-9]+$" />
+                <fileTest path="${deadline_validation_directory}" condition="is_directory" />
+                <fileTest path="${deadline_validation_directory}" condition="is_symlink" negate="1" />
+            </ruleList>
+        </deleteFile>
+    </installationAbortedActionList>
+    <onExitActionList>
+        <deleteFile path="${deadline_validation_directory}" abortOnError="0">
+            <ruleList>
+                <regExMatch text="${deadline_validation_directory}" pattern="/deadline-comfyui-installer\.[A-Za-z0-9]+$" />
+                <fileTest path="${deadline_validation_directory}" condition="is_directory" />
+                <fileTest path="${deadline_validation_directory}" condition="is_symlink" negate="1" />
+            </ruleList>
+        </deleteFile>
+    </onExitActionList>
+</project>

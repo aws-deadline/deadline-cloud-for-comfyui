@@ -571,7 +571,8 @@ async def _bridge_process(command: str, cli: str | None = None) -> asyncio.subpr
     Starts bridge.py with the Python of the Deadline Cloud CLI, or of the configured one when cli
     isn't given. Raises SubmitError.
     """
-    python = resolve_cli_python(cli or resolve_deadline_cli(load_config()))
+    config = load_config()
+    python = resolve_cli_python(cli or resolve_deadline_cli(config), config)
     try:
         return await asyncio.create_subprocess_exec(
             # -I keeps this extension's modules and PYTHONPATH out of the CLI's environment.

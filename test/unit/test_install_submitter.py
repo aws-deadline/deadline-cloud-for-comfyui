@@ -428,3 +428,24 @@ def test_build_panel_uses_the_compiled_panel_of_a_copy_without_the_typescript(
 def test_build_panel_needs_the_typescript_or_the_compiled_panel(tmp_path):
     with pytest.raises(install.InstallError, match="neither the panel's TypeScript"):
         install.build_panel(tmp_path)
+
+
+def test_setup_replaces_stale_packaged_python_config(tmp_path):
+    extension = tmp_path / "extension"
+    extension.mkdir()
+    config = extension / install.CONFIG_FILE_NAME
+    config.write_text(
+        json.dumps({"deadline_python": "/removed/runtime/python", "conda_channels": "studio"})
+    )
+    marker = extension / ".deadline-installer.json"
+    marker.write_text("native owner")
+    receipt = extension / ".deadline-installer-uninstalled.json"
+    receipt.write_text("old uninstall receipt")
+    cli = extension / ".deadline-cli" / "bin" / "deadline"
+    install.write_config(extension, cli, None)
+    settings = json.loads(config.read_text())
+    assert "deadline_python" not in settings
+    assert settings["conda_channels"] == "studio"
+    assert settings["deadline_cli"] == ".deadline-cli/bin/deadline"
+    assert not marker.exists()
+    assert not receipt.exists()

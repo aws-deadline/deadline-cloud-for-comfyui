@@ -304,10 +304,16 @@ def write_config(extension_dir: Path, deadline_cli: Path, conda_channels: str | 
         config["deadline_cli"] = deadline_cli.relative_to(extension_dir).as_posix()
     except ValueError:
         config["deadline_cli"] = str(deadline_cli)
+    # The setup script chooses the CLI's own interpreter. An old packaged install
+    # may name a runtime that has since been removed or replaced.
+    config.pop("deadline_python", None)
     if conda_channels is not None:
         config["conda_channels"] = " ".join(conda_channels.split())
     # It names the queue's S3 conda channel, so like job bundles only its owner can read it.
     write_private_text(path, json.dumps(config, indent=2) + "\n")
+    # Source setup now owns this extension; an older native uninstaller must leave it alone.
+    (extension_dir / ".deadline-installer.json").unlink(missing_ok=True)
+    (extension_dir / ".deadline-installer-uninstalled.json").unlink(missing_ok=True)
     log(f"Wrote {path}")
     return path
 

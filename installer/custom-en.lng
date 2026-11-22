@@ -1,0 +1,2 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+Installer.Installation.Finished.Text=Deadline Cloud is installed.\n\nRestart ComfyUI to load the extension:\nComfy Desktop: choose Stop from the instance menu, then Relaunch ComfyUI.\nTerminal: press Control+C, then run your usual startup command again.\nOther launchers: stop and start ComfyUI using the launcher.\n\nReload your browser and open the Deadline sidebar.
