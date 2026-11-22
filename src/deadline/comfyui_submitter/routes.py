@@ -1139,6 +1139,9 @@ async def _watch_download(
         logger.exception("Couldn't read the download of %s", _log_value(job_id))
         if process.returncode is None:
             process.kill()
+        # A line over the limit can leave stdout paused. Drain it while stderr_task
+        # continues reading stderr, so process.wait() can finish closing both pipes.
+        await process.stdout.read()
         await process.wait()
         _send(
             DOWNLOAD_EVENT,

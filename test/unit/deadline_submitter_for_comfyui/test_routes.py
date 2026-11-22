@@ -1958,10 +1958,11 @@ def test_download_reports_a_summary_longer_than_the_default_line_limit(comfy, mo
     assert comfy.server.events[-1][1]["fileCount"] == 3000
 
 
-def test_download_reports_output_it_cant_read(comfy, monkeypatch):
-    """The panel stops showing the download as running, whatever went wrong reading it."""
+@pytest.mark.parametrize("stderr_noise", [0, 600_000])
+def test_download_reports_output_it_cant_read(comfy, monkeypatch, stderr_noise):
+    """An oversized stdout line still reports failure while stderr is drained concurrently."""
     monkeypatch.setattr(comfy.routes, "DOWNLOAD_LINE_LIMIT", 1024)
-    fake_cli(monkeypatch, comfy.tmp_path, json.dumps(_long_summary()))
+    fake_cli(monkeypatch, comfy.tmp_path, json.dumps(_long_summary()), stderr_noise=stderr_noise)
     body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID}
     run(asyncio.wait_for(call(comfy, "/deadline/jobs/download", body), 30))
     [(event, data)] = comfy.server.events

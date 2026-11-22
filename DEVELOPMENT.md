@@ -130,6 +130,34 @@ again from an already staged payload. An optional `--wheelhouse PATH` makes depe
 installation use local wheels with `--no-index`; otherwise the build machine needs package
 index access. Customers never download packages as part of installation.
 
+### Updating the installer dependency lock
+
+`requirements-installer.in` contains the direct SDK/runtime versions. The generated
+`requirements-installer.txt` pins every transitive dependency and records artifact SHA256
+hashes. The builder requires those hashes for both package-index and local-wheelhouse
+installs, and reinstalls the locked wheels even when the supplied runtime already contains
+these packages. Source distributions are excluded from installer builds.
+
+Regenerate on an Apple silicon Mac with CPython 3.13, using a disposable virtual environment
+and the pinned resolver tools below. Update the direct versions in the input file first.
+Keep the copyright line first in the generated lock:
+
+```sh
+python3.13 -m venv /tmp/comfyui-installer-lock
+/tmp/comfyui-installer-lock/bin/python -m pip install pip==25.3 pip-tools==7.5.2
+/tmp/comfyui-installer-lock/bin/pip-compile --generate-hashes --strip-extras \
+  --resolver=backtracking --no-header --no-emit-index-url --no-emit-trusted-host \
+  --index-url https://pypi.org/simple --output-file requirements-installer.txt requirements-installer.in
+/tmp/comfyui-installer-lock/bin/python -c 'from pathlib import Path; p = Path("requirements-installer.txt"); p.write_text("# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.\n" + p.read_text())'
+```
+
+Review all changed versions and hashes. Verify wheel availability for both supported Python
+versions with `pip download --require-hashes --only-binary=:all: --implementation cp
+--platform macosx_13_0_arm64 --python-version 3.13 -r requirements-installer.txt --dest PATH`,
+then repeat with Python version `3.14` and another destination. A local wheelhouse must
+contain these same hash-verified wheels. Run the dependency unit tests and rebuild the
+installer/native tests before accepting a lock update.
+
 The wizard always shows the standard folder picker, with `~/ComfyUI` as the suggested
 location, and an optional base folder for separate active custom nodes. Validation runs
 from a temporary, standard-library-only copy of the supplied portable Python, so selecting

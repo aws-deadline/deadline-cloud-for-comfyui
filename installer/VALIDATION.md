@@ -15,17 +15,19 @@ Python's license files remain in the runtime.
 | Check | Result |
 |---|---|
 | `hatch run lint` | Passed: ruff, black, and mypy. |
-| `hatch run test` | 664 passed, 1 Windows-only test skipped, 1 upstream test failed. |
+| `hatch run test` | 681 passed, 1 Windows-only test skipped. |
 | `hatch build` | Source distribution and wheel built successfully. |
 | Fresh native installer build | Passed with a newly staged payload and compiled panel. |
 | `hatch run test-installer` | 14 passed, 2 production release checks skipped. |
+| Hash-verified macOS ARM wheel downloads and dependency closure | Passed for Python 3.13 and 3.14; all 20 dependencies pinned. |
+| actionlint and the shared zizmor policy | Passed. |
 | XML/JSON parsing, pipeline shell syntax, `git diff --check` | Passed. |
 
-The unit failure is
-`test/unit/deadline_submitter_for_comfyui/test_routes.py::test_download_reports_output_it_cant_read`.
-It times out after the download reader rejects an oversized stdout line. The same test
-failed with the same Python and timeout on an untouched export of `main` at `1fe90a2`.
-The installer diff does not change that download path.
+The download regression now passes, including large concurrent stderr output. The reader
+drains stdout after terminating the CLI, allowing process cleanup and the failure event
+to complete. The unit suite also checks bytecode cleanup across CPython tags and optimization
+levels, safe retry after partial cache removal, preserved customer caches and symlinks, and
+offline rejection of modified wheels or dependencies missing from the hash lock.
 
 The fresh payload copied the current integration and installation hooks and compiled the
 current TypeScript directly into staging. Copied source files matched the checkout byte
@@ -36,8 +38,8 @@ are not committed.
 The native suite uses disposable synthetic host folders and isolated configuration. It
 checks suggested defaults, component and selected-folder CLI options, offline dependencies,
 relocated private Python and Deadline CLI, TLS and bridge imports, ownership and permissions,
-clean uninstall, and split-layout upgrade/uninstall/reinstall with preserved customer
-settings. Negative cases reject missing sources, occupied prefixes, source/node overlap,
+clean uninstall after compiling the packaged modules, and split-layout
+upgrade/uninstall/reinstall with preserved customer settings, modules, and bytecode. Negative cases reject missing sources, occupied prefixes, source/node overlap,
 symbolic links, and unsupported shell-special paths before installation. Test runtimes and
 ownership markers were removed; expected customer files and settings remained preserved.
 

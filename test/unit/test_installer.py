@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import json
 import os
+import py_compile
 from pathlib import Path
 from typing import Any
 
@@ -633,3 +635,153 @@ def test_builder_rejects_paths_unsupported_by_native_command_interpolation(tmp_p
 def test_windows_direct_path_accepts_normal_directory_separators(tmp_path):
     source = tmp_path / "Artist folder" / "ComfyUI"
     assert hooks.direct_path(source) == source.resolve()
+
+
+def valid_python_payload(payload: Path) -> None:
+    for module in payload.rglob("*.py"):
+        module.write_text("# Synthetic packaged module.\nVALUE = 1\n", encoding="utf-8")
+
+
+def compile_module(module: Path, optimization: int = 0) -> Path:
+    cached = py_compile.compile(str(module), doraise=True, optimize=optimization)
+    assert cached is not None
+    return Path(cached)
+
+
+def test_clean_uninstall_removes_generated_packaged_module_bytecode(setup):
+    comfy, payload, runtime, state = setup
+    valid_python_payload(payload)
+    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    cached = [
+        compile_module(module, optimization)
+        for module in destination.rglob("*.py")
+        for optimization in (0, 1, 2)
+    ]
+    # ComfyUI and the supplied installer may use different CPython versions.
+    alternate = cached[0].with_name("__init__.cpython-999.pyc")
+    alternate_content = bytearray(cached[0].read_bytes())
+    alternate_content[0] ^= 1  # Synthetic alternate magic; never require this interpreter's magic.
+    alternate.write_bytes(alternate_content)
+    assert all(path.is_file() for path in cached)
+    assert hooks.uninstall(state) == []
+    assert not destination.exists()
+    assert not state.exists()
+
+
+def test_uninstall_preserves_edited_and_customer_module_bytecode(setup):
+    comfy, payload, runtime, state = setup
+    valid_python_payload(payload)
+    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    edited = destination / "__init__.py"
+    edited.write_text("# Customer changes.\nVALUE = 2\n", encoding="utf-8")
+    edited_cache = compile_module(edited)
+    packaged = destination / "src/deadline/comfyui_submitter/bridge.py"
+    packaged_cache = compile_module(packaged)
+    customer = packaged.with_name("customer.py")
+    customer.write_text("# Customer module.\nVALUE = 3\n", encoding="utf-8")
+    customer_cache = compile_module(customer)
+    note = packaged_cache.parent / "customer.txt"
+    note.write_text("keep customer cache extras", encoding="utf-8")
+    misleading = packaged_cache.with_name("bridge.cpython-999.pyc")
+    misleading.write_text("customer file with a cache-like name", encoding="utf-8")
+    keep = {
+        path: path.read_bytes()
+        for path in (edited_cache, customer, customer_cache, note, misleading)
+    }
+    assert hooks.uninstall(state) == ["__init__.py"]
+    assert not packaged_cache.exists()
+    assert all(path.read_bytes() == content for path, content in keep.items())
+    assert hooks.uninstalled_receipt(destination)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Symlink permissions differ on Windows")
+@pytest.mark.parametrize("link_directory", [False, True])
+def test_uninstall_does_not_follow_bytecode_symlinks(setup, tmp_path, link_directory):
+    comfy, payload, runtime, state = setup
+    valid_python_payload(payload)
+    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    module = destination / "src/deadline/comfyui_submitter/bridge.py"
+    cached = compile_module(module)
+    outside = tmp_path / "Customer bytecode outside integration"
+    outside.mkdir()
+    external = outside / cached.name
+    external.write_bytes(cached.read_bytes())
+    expected = external.read_bytes()
+    cached.unlink()
+    if link_directory:
+        cached.parent.rmdir()
+        cached.parent.symlink_to(outside, target_is_directory=True)
+    else:
+        cached.symlink_to(external)
+    assert hooks.uninstall(state) == []
+    assert external.read_bytes() == expected
+    assert (cached.parent if link_directory else cached).is_symlink()
+    assert hooks.uninstalled_receipt(destination)
+
+
+def test_uninstall_cache_removal_failure_preserves_source_ownership_for_retry(setup, monkeypatch):
+    comfy, payload, runtime, state = setup
+    valid_python_payload(payload)
+    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    manifest = json.loads(state.read_text())
+    owned_files = {
+        destination / name: (destination / name).read_bytes() for name in manifest["files"]
+    }
+    caches = [compile_module(module) for module in destination.rglob("*.py")]
+    assert len(caches) >= 2
+    marker = destination / hooks.MARKER_NAME
+    marker_content = marker.read_bytes()
+    state_content = state.read_bytes()
+    configuration = destination / hooks.CONFIG_NAME
+    configuration_content = configuration.read_bytes()
+    original = Path.unlink
+    cache_unlinks = 0
+
+    def deny_second_cache_once(path, missing_ok=False):
+        nonlocal cache_unlinks
+        if path.suffix == ".pyc":
+            cache_unlinks += 1
+            if cache_unlinks == 2:
+                raise PermissionError(errno.EACCES, "cache access denied", str(path))
+        return original(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", deny_second_cache_once)
+    with pytest.raises(PermissionError, match="cache access denied"):
+        hooks.uninstall(state)
+    # Partial cache progress must leave all ownership evidence and source intact.
+    assert sum(cached.exists() for cached in caches) == len(caches) - 1
+    assert all(path.read_bytes() == expected for path, expected in owned_files.items())
+    assert marker.read_bytes() == marker_content
+    assert state.read_bytes() == state_content
+    assert configuration.read_bytes() == configuration_content
+    assert hooks.uninstall(state) == []
+    assert not destination.exists()
+    assert not state.exists()
+
+
+@pytest.mark.parametrize("root_folder", [False, True])
+def test_uninstall_reports_unexpected_directory_cleanup_errors_and_allows_retry(
+    setup, monkeypatch, root_folder
+):
+    comfy, payload, runtime, state = setup
+    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    target = destination if root_folder else destination / "src/deadline/comfyui_submitter"
+    original = Path.rmdir
+    failed = False
+
+    def fail_once(path):
+        nonlocal failed
+        if path == target and not failed:
+            failed = True
+            raise PermissionError(errno.EACCES, "access denied", str(path))
+        return original(path)
+
+    monkeypatch.setattr(Path, "rmdir", fail_once)
+    with pytest.raises(hooks.InstallError, match="Cannot remove empty integration folder"):
+        hooks.uninstall(state)
+    assert state.is_file()
+    assert json.loads((destination / hooks.MARKER_NAME).read_text()) == json.loads(
+        state.read_text()
+    )
+    assert hooks.uninstall(state) == []
+    assert not destination.exists()

@@ -276,9 +276,21 @@ def test_user_ownership_and_permissions(user_installation: Layout) -> None:
     assert stat.S_IMODE((user_installation.extension / CONFIG).stat().st_mode) == 0o600
 
 
+def compile_installed_modules(layout: Layout) -> None:
+    # Compile without importing or executing the integration or any customer module.
+    python = layout.prefix / "runtime/bin/python3"
+    assert_success(
+        run_program(
+            python, ["-I", "-m", "compileall", "-q", "-f", str(layout.extension)], layout=layout
+        )
+    )
+    assert list(layout.extension.rglob("*.pyc")), "The bytecode regression must create real caches"
+
+
 def test_clean_uninstall(installer_path: Path, tmp_path: Path) -> None:
     layout = make_layout(tmp_path)
     install(installer_path, layout)
+    compile_installed_modules(layout)
     uninstall(layout)
     assert not layout.extension.exists()
 
@@ -306,7 +318,17 @@ def test_upgrade_uninstall_reinstall_preserves_split_customer_settings(
     assert upgraded_state["comfyui_source"] == str(layout.source)
     assert upgraded_state["custom_nodes"] == str(layout.nodes)
     assert not (layout.prefix / "rollbackBackupDirectory").exists()
+    customer_module = layout.extension / "src/deadline/comfyui_submitter/customer.py"
+    customer_module.write_text("# Customer customization.\nVALUE = 1\n", encoding="utf-8")
+    compile_installed_modules(layout)
+    customer_caches = {
+        cached: cached.read_bytes()
+        for cached in customer_module.parent.joinpath("__pycache__").glob("customer.*.pyc")
+    }
+    assert customer_caches
     uninstall(layout)
+    assert all(cached.read_bytes() == expected for cached, expected in customer_caches.items())
+    assert not list(customer_module.parent.joinpath("__pycache__").glob("bridge.*.pyc"))
     preserved = json.loads(configuration.read_text(encoding="utf-8"))
     assert preserved["conda_channels"] == "studio-channel" and preserved["custom_setting"] == "keep"
     assert "deadline_python" not in preserved and "deadline_cli" not in preserved
@@ -322,6 +344,8 @@ def test_upgrade_uninstall_reinstall_preserves_split_customer_settings(
     assert restored["conda_channels"] == "studio-channel"
     uninstall(layout)
     assert (layout.extension / "customer.txt").read_text(encoding="utf-8") == "keep customer file"
+    assert customer_module.is_file()
+    assert all(cached.read_bytes() == expected for cached, expected in customer_caches.items())
     assert (layout.source / "custom_nodes/source-sentinel.txt").read_text(
         encoding="utf-8"
     ) == "inactive source"

@@ -144,6 +144,24 @@ def build_frontend(extension: Path) -> None:
     run([npm, "run", "build", "--", "--outDir", str(output)], cwd=frontend)
 
 
+def install_dependencies(python: Path, wheelhouse: Path | None) -> None:
+    """Install only pinned, hash-verified wheels, including into a supplied runtime."""
+    command = [
+        str(python),
+        "-I",
+        "-m",
+        "pip",
+        "install",
+        "--only-binary=:all:",
+        "--require-hashes",
+        "--force-reinstall",
+    ]
+    if wheelhouse is not None:
+        command += ["--no-index", "--find-links", str(wheelhouse.resolve())]
+    command += ["-r", str(ROOT / "requirements-installer.txt")]
+    run(command)
+
+
 def attribution(python: Path, output: Path) -> None:
     code = r"""
 import importlib.metadata as m, json, pathlib, sys
@@ -206,11 +224,7 @@ def stage_payload(python_runtime: Path, output: Path, target: str, wheelhouse: P
         if Path(info["prefix"]).resolve() != runtime.resolve():
             raise ValueError("The supplied Python distribution cannot run after relocation.")
         run([str(python), "-I", "-m", "ensurepip", "--upgrade"])
-        command = [str(python), "-I", "-m", "pip", "install", "--only-binary=:all:", "--upgrade"]
-        if wheelhouse:
-            command += ["--no-index", "--find-links", str(wheelhouse.resolve())]
-        command += ["-r", str(ROOT / "requirements-installer.txt")]
-        run(command)
+        install_dependencies(python, wheelhouse)
         extension = temporary / "extension"
         extension.mkdir()
         for name in ("__init__.py", "LICENSE", "NOTICE"):
