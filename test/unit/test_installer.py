@@ -565,8 +565,9 @@ def test_launcher_parser_identifies_actual_python_script_operand(args, expected)
 def test_launcher_refuses_mismatched_source_and_missing_exec(setup, tmp_path):
     comfy, _, _, _ = setup
     launcher, _ = make_launcher(tmp_path / "Home", comfy)
+    other_main = (tmp_path / "Other source" / "main.py").as_posix()
     (launcher / "launch.sh").write_text(
-        'exec python "/somewhere/else/main.py" --base-directory "$ROOT/runtime"'
+        f'exec python "{other_main}" --base-directory "$ROOT/runtime"'
     )
     with pytest.raises(hooks.InstallError, match="does not match"):
         hooks.resolve_layout(launcher)
