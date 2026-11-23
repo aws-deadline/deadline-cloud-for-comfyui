@@ -26,7 +26,7 @@ GPU workers, with the models, input files and custom nodes it uses attached to t
     `deadline bundle submit`. The bundle keeps the parameters, host requirements, priority,
     initial state, and the failed task, retry and worker limits. Pass the job name with `--name`.
 - A **Deadline** button next to **Run**, and **Workflow > Submit to Deadline Cloud…**, which open a
-  short dialog: farm, queue and **Submit**.
+  short dialog: farm, queue, the attachments the job uploads, and **Submit**.
 
 When you submit, the extension:
 

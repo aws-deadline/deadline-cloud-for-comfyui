@@ -109,6 +109,37 @@ def test_absolute_paths(comfy, tmp_path):
     assert assets(workflow, comfy) == LocalAssets([video], [])
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        r"\\attacker\share\a.png",
+        "//attacker/share/a.png",
+        r"\\attacker@SSL\DavWWWRoot\a.png",
+        r"\\?\UNC\attacker\share\a.png",
+        r"\\.\pipe\a.png",
+        r"/\attacker\share\a.png",
+    ],
+)
+def test_never_checks_network_or_device_paths(comfy, monkeypatch, value):
+    # On Windows, checking these paths contacts the server they name.
+    checked: list[Path] = []
+
+    def check(self: Path) -> bool:
+        checked.append(self)
+        return True
+
+    monkeypatch.setattr(Path, "is_file", check)
+    monkeypatch.setattr(Path, "is_dir", check)
+    assert not assets({"1": node(image=value)}, comfy)
+    assert not checked
+
+
+def test_refuses_an_absolute_path_that_starts_with_two_separators(comfy, tmp_path):
+    video = touch(tmp_path / "elsewhere" / "v.mov")
+    # POSIX treats //path as /path, but on Windows it's a UNC path.
+    assert not assets({"1": node(video="/" + video.as_posix())}, comfy)
+
+
 def test_rejects_paths_that_leave_the_directory(comfy, tmp_path):
     touch(tmp_path / "secret.png")
     workflow = {
@@ -430,6 +461,21 @@ def test_find_workflow_local_models_searches_registered_folders_without_a_direct
     found, directories = find_workflow_local_models(ui, api, folders)
     assert found == {"checkpoints/other.ckpt": other, "loras/style.pt": path}
     assert directories == {"checkpoints/other.ckpt": "checkpoints", "loras/style.pt": "loras"}
+
+
+@pytest.mark.parametrize("declared", [None, "custom_nodes"])
+def test_find_workflow_local_models_never_attaches_files_from_custom_nodes(tmp_path, declared):
+    """A pack's cache or settings file isn't a model, even when a workflow names it as one."""
+    touch(tmp_path / "custom_nodes" / "SomePack" / "cache" / "session.pkl")
+    folders = {
+        "checkpoints": ([str(tmp_path / "checkpoints")], set[str]()),
+        "custom_nodes": ([str(tmp_path / "custom_nodes")], set[str]()),
+    }
+    name = "SomePack/cache/session.pkl"
+    models = [{"directory": declared, "name": name}] if declared else []
+    ui = {"nodes": [{"properties": {"models": models}, "widgets_values": [name]}]}
+    api = {"1": {"inputs": {"ckpt_name": name}}}
+    assert find_workflow_local_models(ui, api, folders) == ({}, {})
 
 
 @pytest.mark.parametrize(

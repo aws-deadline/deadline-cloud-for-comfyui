@@ -2320,6 +2320,10 @@ export function renderPanel(element: HTMLElement): () => void {
 
 let dialog: { overlay: HTMLElement; view: View | null } | null = null;
 
+// The dialog lists the attachments too, so the artist sees every file the job uploads before
+// Submit, wherever they submit from.
+const DIALOG_SECTIONS: SectionName[] = ["account", "target", "status", "attachments", "submit"];
+
 export function openDialog() {
   injectStyles();
   if (dialog) {
@@ -2382,7 +2386,7 @@ export function openDialog() {
   document.body.append(overlay);
   document.addEventListener("keydown", onKey);
   dialog = { overlay, view: null };
-  dialog.view = createView(body, ["account", "target", "status", "submit"]);
+  dialog.view = createView(body, DIALOG_SECTIONS);
   loadAccount();
   loadPlan();
 }

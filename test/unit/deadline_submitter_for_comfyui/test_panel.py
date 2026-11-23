@@ -16,9 +16,11 @@ import pytest
 NODE = shutil.which("node")
 FRONTEND = Path(__file__).resolve().parents[3] / "frontend"
 TSC = FRONTEND / "node_modules" / ".bin" / ("tsc.cmd" if os.name == "nt" else "tsc")
-pytestmark = pytest.mark.skipif(
-    NODE is None or not TSC.exists(), reason="Needs Node.js, and npm ci run in frontend/"
-)
+MISSING_TOOLS = NODE is None or not TSC.exists()
+# CI sets this so that the frontend job fails, rather than passing with no panel tests run.
+if MISSING_TOOLS and os.environ.get("COMFYUI_DEADLINE_REQUIRE_PANEL_TESTS") == "1":
+    raise RuntimeError("The panel tests need Node.js, and npm ci run in frontend/")
+pytestmark = pytest.mark.skipif(MISSING_TOOLS, reason="Needs Node.js, and npm ci run in frontend/")
 
 PANEL = Path(__file__).parent / "panel"
 
@@ -58,7 +60,7 @@ def _run_scenario(tmp_path: Path, ui_source: str, scenario: str) -> dict:
         " parameterControl as __parameterControl, RENDERERS as __renderers,"
         " pollJobs as __pollJobs, formFromRequirements as __formFromRequirements,"
         " requirementsFromForm as __requirementsFromForm,"
-        " createView as __createView,"
+        " createView as __createView, DIALOG_SECTIONS as __dialogSections,"
         " answerConfirmation as __answerConfirmation, cancelSubmission as __cancelSubmission };\n"
     )
     (web / "deadline_ui.js").write_text(ui_source + exports, encoding="utf-8")
@@ -289,3 +291,10 @@ def test_a_finished_download_says_where_the_files_are(run_scenario, scenario, de
 def test_bool_parameters_are_read_as_openjd_reads_them(run_scenario):
     """So the Attach Custom Nodes checkbox and the attachments agree with what the job does."""
     assert run_scenario("parse-bool")["values"] == [True] * 6 + [False] * 6 + [None] * 5
+
+
+def test_the_dialog_lists_the_attachments_before_submit(run_scenario):
+    # The Deadline button opens the dialog, which must show every file the job uploads.
+    sections = run_scenario("dialog-sections")["sections"]
+    assert "attachments" in sections
+    assert sections.index("attachments") < sections.index("submit")

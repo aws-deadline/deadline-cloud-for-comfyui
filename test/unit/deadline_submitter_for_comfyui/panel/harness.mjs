@@ -401,6 +401,9 @@ if (scenario === "answer-confirmation") {
   api.emit("deadline.download", { jobId: "job-1", status: "DOWNLOADED", message, fileCount: 2, directory });
   result.toasts = app.toasts.map(({ detail }) => detail);
 }
+if (scenario === "dialog-sections") {
+  result.sections = ui.__dialogSections;
+}
 if (scenario === "parse-bool") {
   // The panel reads a BOOL parameter as OpenJD and the submitter do.
   result.values = [

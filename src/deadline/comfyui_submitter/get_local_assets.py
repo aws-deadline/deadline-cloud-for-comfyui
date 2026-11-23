@@ -40,6 +40,8 @@ MEDIA_EXTENSIONS = frozenset(
 # A value can name its directory with a suffix: "example.png [input]".
 _ANNOTATED = re.compile(r"(?P<name>.+) \[(?P<directory>input|output|temp)\]")
 _MAX_VALUE_LENGTH = 1024
+# A path that starts with two separators: a UNC or Windows device path.
+_NETWORK_PATH = re.compile(r"[\\/]{2}")
 
 # folder_paths.folder_names_and_paths maps a folder type to (directories, extensions).
 ModelFolders = Mapping[str, Sequence[Any]]
@@ -696,6 +698,10 @@ def _model_directory(
 
 # Folder names ComfyUI still accepts from older workflows, as its folder_paths.map_legacy does.
 _LEGACY_FOLDERS = {"clip": "text_encoders", "unet": "diffusion_models"}
+# Folders ComfyUI registers that don't hold models. A workflow's model name could otherwise
+# attach any file from them, such as a custom node pack's cache or settings. Packs are attached
+# separately, as a whole.
+_NOT_MODEL_FOLDERS = frozenset({"custom_nodes"})
 
 
 def _search_local_models(
@@ -720,7 +726,8 @@ def _search_local_models(
         located = [
             (path, folder_name)
             for folder_name in candidates
-            if (path := find_local_model(folders, folder_name, name)) is not None
+            if folder_name not in _NOT_MODEL_FOLDERS
+            and (path := find_local_model(folders, folder_name, name)) is not None
         ]
         if located:
             return located
@@ -765,6 +772,11 @@ class _Resolver:
             return accept(path if path is not None and path.is_file() else None, False)
 
         name = value.strip()
+        if _NETWORK_PATH.match(name):
+            # On Windows, checking a UNC (\\server\share) or device (\\?\, \\.\) path contacts
+            # that server or device, which can send the user's credentials to a host that a
+            # downloaded workflow names.
+            return None
         if Path(name).is_absolute():
             path = Path(os.path.normpath(name))
             if path.suffix.lower() in MEDIA_EXTENSIONS and path.is_file():
