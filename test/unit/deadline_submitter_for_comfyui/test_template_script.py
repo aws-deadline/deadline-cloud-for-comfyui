@@ -11,6 +11,7 @@ import http.server
 import io
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -962,7 +963,14 @@ def test_requirements_check_accepts_packages_and_https_urls(tmp_path, text, writ
     result = _check(tmp_path)
     assert (result.returncode, result.stdout) == (0, "")
     expected = text if written is None else written
-    assert (tmp_path / "copy.txt").read_text() == (expected + "\n" if expected else "")
+
+    def url_separator(requirements: str) -> str:
+        # packaging writes "name@ URL" in older releases and "name @ URL" in newer ones. pip
+        # reads both. An "@" inside a URL, such as a git ref, has no space after it.
+        return re.sub(r"\s*@\s+", " @ ", requirements)
+
+    copy = (tmp_path / "copy.txt").read_text()
+    assert url_separator(copy) == url_separator(expected + "\n" if expected else "")
 
 
 @pytest.mark.parametrize(
