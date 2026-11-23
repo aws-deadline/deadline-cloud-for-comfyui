@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import zipfile
 from datetime import date
 from pathlib import Path
@@ -79,7 +80,9 @@ def build_frontend(extension: Path) -> None:
 def install_dependencies(
     python: Path, wheelhouse: Path | None, target: Path, *, version: str
 ) -> None:
-    """Stage hash-verified wheels for a supported host Python version."""
+    """Resolve and stage wheels for a supported host Python version."""
+    with (ROOT / "pyproject.toml").open("rb") as project_file:
+        requirements: list[str] = tomllib.load(project_file)["dependency-groups"]["installer"]
     command = [
         str(python),
         "-I",
@@ -87,7 +90,6 @@ def install_dependencies(
         "pip",
         "install",
         "--only-binary=:all:",
-        "--require-hashes",
         "--force-reinstall",
         "--no-compile",
         "--target",
@@ -97,15 +99,19 @@ def install_dependencies(
     ]
     if wheelhouse is not None:
         command += ["--no-index", "--find-links", str(wheelhouse.resolve())]
-    command += ["-r", str(ROOT / "requirements-installer.txt")]
-    run(command)
+    run([*command, *requirements])
 
 
-def attribution(output: Path, site_packages: Path) -> None:
+def attribution(output: Path, site_packages: list[Path]) -> None:
     inventory = []
     notices = []
-    distributions = importlib.metadata.distributions(path=[str(site_packages)])
-    for distribution in sorted(distributions, key=lambda d: d.metadata["Name"].lower()):
+    distributions = {
+        (distribution.metadata["Name"].lower(), distribution.version): distribution
+        for distribution in importlib.metadata.distributions(
+            path=[str(path) for path in site_packages]
+        )
+    }
+    for _, distribution in sorted(distributions.items()):
         name = distribution.metadata["Name"]
         inventory.append({"name": name, "version": distribution.version})
         notices.append(f"\n{name} {distribution.version}\n")
@@ -201,7 +207,7 @@ def stage_payload(output: Path, target: str, wheelhouse: Path | None) -> Path:
                 # The GUI installer reuses the already-installed standalone CLI.
                 shutil.rmtree(packages / "bin", ignore_errors=True)
                 shutil.rmtree(packages / "Scripts", ignore_errors=True)
-            attribution(extension, dependencies / PYTHON_VERSIONS[0])
+            attribution(extension, [dependencies / version for version in PYTHON_VERSIONS])
             share_sdk_packages(dependencies)
             create_dependency_bundle(dependencies, temporary / BUNDLE_RELATIVE)
         metadata = {

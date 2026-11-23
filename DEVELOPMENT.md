@@ -30,7 +30,7 @@ npm ci
 | `install_builder/` | Reusable InstallBuilder component definition. |
 | `scripts/build_installer.py` | Allowlisted payload staging and native installer build. |
 | `scripts/build_installer_cli.py` | Build CLI following the other Deadline integrations' options. |
-| `scripts/deps_bundle.py` | Hash-locked SDK dependency ZIP for the selected Python/platform. |
+| `scripts/deps_bundle.py` | SDK dependency ZIP for the selected Python/platform. |
 | `pipeline/build_installer.sh`, `pipeline/build_installer.ps1` | macOS and Windows build entrypoints for release automation. |
 | `pipeline/test_installer.sh`, `pipeline/test_installer.ps1` | Native installer test entrypoints for release automation. |
 | `test/installer/` | Tests that execute built macOS and Windows installers in disposable host folders. |
@@ -104,9 +104,10 @@ Build on the target operating system with Node.js 22 or later, npm, Hatch,
 InstallBuilder, and CPython 3.13 for the Hatch build environment. Use Apple silicon
 for macOS and x64 for Windows.
 
-The build compiles the panel into the installer payload and bundles the locked SDK
-wheels in `dependency_bundle/deadline_cloud_for_comfyui_submitter-deps.zip`, like
-Cinema 4D. The installer uses ComfyUI's Python to validate the selected folder and
+The build compiles the panel and resolves the SDK wheels from the `installer`
+dependency group in `pyproject.toml` for each supported Python version. Like Cinema 4D,
+it bundles the SDK in `dependency_bundle/deadline_cloud_for_comfyui_submitter-deps.zip`.
+The installer uses ComfyUI's Python to validate the selected folder and
 installation prefix. InstallBuilder then extracts the SDK, and the helper checks
 the corresponding native wheels before replacing the extension. The panel loads the
 SDK in a subprocess of ComfyUI's Python and calls the installed CLI for downloads.
@@ -152,30 +153,12 @@ environment lives outside its `.venv`.
 Use the same prefix and ComfyUI folder for upgrades. `hatch run test` runs unit tests
 without an installer.
 
-### Updating the installer dependency lock
+### Updating installer dependencies
 
-`requirements-installer.in` contains the direct SDK/runtime versions. The generated
-`requirements-installer.txt` pins transitive dependencies and artifact SHA256 hashes, with
-platform markers for Windows-only dependencies. The builder uses `pip --target` and requires
-hashes for both package-index and local-wheelhouse builds. Source distributions are excluded.
-The universal lock is generated with the pinned resolver below; update direct versions in
-the input file first. The constraints preserve existing versions while adding platform
-coverage; remove or adjust them when deliberately upgrading dependencies.
-
-```sh
-python -m pip install uv==0.9.26
-uv pip compile --universal --python-version 3.13 --generate-hashes --no-header \
-  --default-index https://pypi.org/simple --constraints requirements-installer.txt \
-  --output-file /tmp/comfyui-installer-requirements.txt requirements-installer.in
-python -c 'from pathlib import Path; p=Path("requirements-installer.txt"); p.write_text("# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.\n" + Path("/tmp/comfyui-installer-requirements.txt").read_text())'
-```
-
-Review every changed version and hash. Check wheel availability and dependency closure for
-Python 3.13 and 3.14 on both `macosx_13_0_arm64` and `win_amd64`, with separate destinations:
-`pip download --require-hashes --only-binary=:all: --implementation cp --platform PLATFORM
---python-version VERSION -r requirements-installer.txt --dest PATH`.
-The offline dependency tests check platform markers and wheel selection. Rebuild the
-installer and run its native tests before accepting a lock update.
+Edit the `installer` dependency group in `pyproject.toml`. The builder resolves
+transitive dependencies at build time and installs wheels into the SDK payload.
+`software-inventory.json` in the payload records the versions that were bundled.
+Rebuild the installer and run its native tests after changing the dependency group.
 
 ### Shared build and release
 
