@@ -96,7 +96,7 @@ def resolve_deadline_cli(config: dict[str, Any] | None = None) -> str:
 _EXEC_LAUNCHER = re.compile(r"^'''exec' \"?(?P<python>[^\"\n]+?)\"? \"\$0\" \"\$@\"$", re.MULTILINE)
 
 
-def resolve_cli_python(cli: str, config: dict[str, Any] | None = None) -> str:
+def resolve_cli_python(cli: str) -> str:
     """
     Returns the Python the Deadline Cloud CLI runs with, from its shebang or pip launcher, or
     otherwise the python next to it.
@@ -108,11 +108,6 @@ def resolve_cli_python(cli: str, config: dict[str, Any] | None = None) -> str:
                 f"{PYTHON_ENV_VAR} is set to {configured}, which isn't an executable file."
             )
         return configured
-    if not os.environ.get(CLI_ENV_VAR) and (config or {}).get("deadline_python"):
-        python = config_path().parent / str((config or {})["deadline_python"])
-        if not (python.is_file() and os.access(python, os.X_OK)):
-            raise SubmitError(f"deadline_python in {config_path()} is not an executable file.")
-        return str(python)
     candidates = []
     try:
         with open(cli, "rb") as f:

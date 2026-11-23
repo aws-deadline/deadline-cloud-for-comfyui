@@ -43,7 +43,6 @@ installer = [
   "botocore==1.44.4",
   "PySide6-Essentials==6.10.3",
   "colorama==0.4.6; sys_platform == 'win32'",
-  "pywin32==312; sys_platform == 'win32'",
 ]
 
 [tool.hatch.version]

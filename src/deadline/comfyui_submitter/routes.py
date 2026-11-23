@@ -575,7 +575,7 @@ async def _bridge_process(command: str, cli: str | None = None) -> asyncio.subpr
         python = sys.executable
         arguments = ["-IBS", str(BRIDGE), "--sdk", str(config_path().parent / str(sdk)), command]
     else:
-        python = resolve_cli_python(cli or resolve_deadline_cli(config), config)
+        python = resolve_cli_python(cli or resolve_deadline_cli(config))
         arguments = ["-I", str(BRIDGE), command]
     try:
         return await asyncio.create_subprocess_exec(

@@ -535,32 +535,3 @@ def test_picker_command_on_linux(monkeypatch):
     assert "--multiple" in (submit.picker_command("files", "linux") or [])
     monkeypatch.setattr(submit.shutil, "which", lambda name: None)
     assert submit.picker_command("files", "linux") is None
-
-
-def test_resolve_cli_python_uses_installer_config(monkeypatch, tmp_path):
-    monkeypatch.delenv(submit.PYTHON_ENV_VAR, raising=False)
-    monkeypatch.delenv(submit.CLI_ENV_VAR, raising=False)
-    config = tmp_path / "settings.json"
-    python = tmp_path / "runtime" / "python.exe"
-    python.parent.mkdir()
-    python.write_text("runtime")
-    python.chmod(0o755)
-    monkeypatch.setenv(submit.CONFIG_ENV_VAR, str(config))
-    assert submit.resolve_cli_python(
-        "deadline.exe", {"deadline_python": "runtime/python.exe"}
-    ) == str(python)
-
-
-def test_resolve_cli_python_rejects_invalid_installer_runtime(monkeypatch):
-    monkeypatch.delenv(submit.PYTHON_ENV_VAR, raising=False)
-    monkeypatch.delenv(submit.CLI_ENV_VAR, raising=False)
-    with pytest.raises(SubmitError, match="deadline_python"):
-        submit.resolve_cli_python("deadline.exe", {"deadline_python": "/missing/python"})
-
-
-def test_resolve_cli_python_environment_wins_over_installer_config(monkeypatch, tmp_path):
-    python = tmp_path / "python"
-    python.write_text("python")
-    python.chmod(0o755)
-    monkeypatch.setenv(submit.PYTHON_ENV_VAR, str(python))
-    assert submit.resolve_cli_python("deadline.exe", {"deadline_python": "/missing"}) == str(python)

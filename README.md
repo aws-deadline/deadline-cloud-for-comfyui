@@ -163,7 +163,7 @@ the environment that starts ComfyUI.
 
 | Environment variable | Default | Description |
 |---|---|---|
-| `COMFYUI_DEADLINE_PYTHON` | `deadline_python` in the config, then the CLI's Python | Overrides the Python used for source installations. Native installations use ComfyUI's Python. |
+| `COMFYUI_DEADLINE_PYTHON` | The CLI's Python | Overrides the Python used for source installations. Native installations use ComfyUI's Python. |
 | `COMFYUI_DEADLINE_CLI` | `deadline_cli` in the config, then `deadline` on the `PATH` | The Deadline Cloud CLI executable. |
 | `COMFYUI_DEADLINE_CONDA_CHANNELS` | `conda_channels` in the config | Optional **Conda Channels** to fill in. When neither is set, the queue's default, the Deadline Cloud channels, is used. |
 | `COMFYUI_DEADLINE_CONFIG` | `deadline_cloud_submitter.json` in the extension folder | Another config file to read. |
