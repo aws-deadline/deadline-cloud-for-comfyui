@@ -610,6 +610,7 @@ def test_launcher_variable_expansion_does_not_replace_other_variable_prefix(setu
         "ComfyUI $variable",
         "ComfyUI $(command)",
         "ComfyUI `command`",
+        "ComfyUI %variable%",
         "ComfyUI\nline",
     ],
 )
@@ -625,7 +626,8 @@ def test_macos_selected_folder_rejects_literal_backslash_paths(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "path", ['build "quote"', "build $variable", "build `command`", "build\\literal", "build\nline"]
+    "path",
+    ['build "quote"', "build $variable", "build `command`", "build %variable%", "build\nline"],
 )
 def test_builder_rejects_paths_unsupported_by_native_command_interpolation(tmp_path, path):
     with pytest.raises(ValueError, match="Installer build paths must not contain"):
@@ -786,3 +788,106 @@ def test_uninstall_reports_unexpected_directory_cleanup_errors_and_allows_retry(
     )
     assert hooks.uninstall(state) == []
     assert not destination.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Backslash is a Windows directory separator")
+def test_macos_builder_rejects_literal_backslash_paths(tmp_path):
+    with pytest.raises(ValueError, match="Installer build paths must not contain"):
+        builder.validate_native_path(tmp_path / "build\\literal")
+
+
+def test_portable_parent_resolves_only_nested_source_and_active_nodes(tmp_path):
+    portable = tmp_path / "ComfyUI portable with spaces"
+    source = portable / "ComfyUI"
+    (source / "custom_nodes").mkdir(parents=True)
+    (source / "main.py").write_text("# customer source\n")
+    (portable / "custom_nodes").mkdir()
+    sentinel = portable / "custom_nodes/customer.txt"
+    sentinel.write_text("keep")
+    assert hooks.resolve_layout(portable) == (source.resolve(), source / "custom_nodes")
+    assert sentinel.read_text() == "keep"
+
+
+def test_direct_source_takes_precedence_over_a_nested_source(setup):
+    source, _, _, _ = setup
+    (source / "ComfyUI/custom_nodes").mkdir(parents=True)
+    (source / "ComfyUI/main.py").write_text("# nested customer source\n")
+    assert hooks.resolve_layout(source) == (source.resolve(), source / "custom_nodes")
+
+
+def test_resolve_rejects_unowned_prefix_before_writing_layout(setup, tmp_path, capsys):
+    source, _, _, _ = setup
+    prefix = tmp_path / "Customer unrelated data"
+    prefix.mkdir()
+    sentinel = prefix / "customer.txt"
+    sentinel.write_text("keep")
+    output = tmp_path / "resolved"
+    assert (
+        hooks.main(
+            [
+                "resolve",
+                "--comfyui",
+                str(source),
+                "--prefix",
+                str(prefix),
+                "--output-dir",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    assert "contains other files" in capsys.readouterr().err
+    assert not output.exists()
+    assert sentinel.read_text() == "keep"
+
+
+@pytest.mark.parametrize("target", ["source", "nodes", "ancestor"])
+def test_prefix_overlap_is_rejected_before_payload_copy(setup, target):
+    source, _, _, _ = setup
+    nodes = source / "custom_nodes"
+    prefix = {"source": source, "nodes": nodes / "Deadline", "ancestor": source.parent}[target]
+    with pytest.raises(hooks.InstallError, match="must be separate"):
+        hooks.validate_prefix(prefix, source, nodes)
+
+
+def test_existing_managed_prefix_can_only_target_its_original_host(setup, tmp_path):
+    source, _, runtime, state = setup
+    prefix = runtime.parent
+    (prefix / ".deadline-cloud-for-comfyui-installer").write_text(
+        "deadline-cloud-for-comfyui-installer-v1"
+    )
+    (prefix / "installer_version.txt").write_text("1.0")
+    state.write_text(json.dumps({"extension": str(source / "custom_nodes" / hooks.EXTENSION_NAME)}))
+    hooks.validate_prefix(prefix, source, source / "custom_nodes")
+    other = tmp_path / "Other ComfyUI"
+    (other / "custom_nodes").mkdir(parents=True)
+    with pytest.raises(hooks.InstallError, match="another ComfyUI installation"):
+        hooks.validate_prefix(prefix, other, other / "custom_nodes")
+
+
+def test_prefix_rejects_relative_paths(setup):
+    source, _, _, _ = setup
+    with pytest.raises(hooks.InstallError, match="absolute"):
+        hooks.validate_prefix(Path("Deadline Runtime"), source, source / "custom_nodes")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Directory junctions require Windows")
+def test_windows_junction_aliases_cannot_bypass_prefix_or_host_guards(setup, tmp_path):
+    import subprocess
+
+    source, _, _, _ = setup
+    alias = tmp_path / "ComfyUI junction"
+    result = subprocess.run(
+        ["cmd.exe", "/c", "mklink", "/J", str(alias), str(source)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    try:
+        with pytest.raises(hooks.InstallError, match="symbolic links"):
+            hooks.resolve_layout(alias)
+        with pytest.raises(hooks.InstallError, match="symbolic links"):
+            hooks.validate_prefix(alias / "Deadline Runtime", source, source / "custom_nodes")
+    finally:
+        alias.rmdir()

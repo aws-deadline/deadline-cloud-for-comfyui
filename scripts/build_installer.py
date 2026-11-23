@@ -8,16 +8,28 @@ import importlib.util
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from datetime import date
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
+# Direct execution and importlib-based tests must both resolve these repository build tools.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts.deps_bundle import (
+    BUNDLE_RELATIVE,
+    create_dependency_bundle,
+    extract_dependency_bundle,
+)
+from scripts.find_installbuilder import resolve_builder
+
 ROOT = Path(__file__).resolve().parents[1]
-PLATFORMS = {"MacOS": "osx"}
+PLATFORMS = {"MacOS": "osx", "Windows": "windows-x64"}
 
 
 def run(args: list[str], **kwargs: Any) -> str:
@@ -32,12 +44,11 @@ def runtime_python(runtime: Path) -> Path:
 
 
 def validate_native_path(path: Path) -> None:
-    if any(
-        character in str(path.expanduser().absolute())
-        for character in ('"', "$", "`", "\\", "\n", "\r")
-    ):
+    unsafe = ('"', "$", "%", "`", "\n", "\r") + (("\\",) if os.name != "nt" else ())
+    if any(character in str(path.expanduser().absolute()) for character in unsafe):
         raise ValueError(
-            "Installer build paths must not contain quotes, dollar signs, backticks, backslashes, or line breaks."
+            "Installer build paths must not contain quotes, dollar or percent signs, backticks, "
+            "literal backslashes on macOS, or line breaks."
         )
 
 
@@ -56,7 +67,6 @@ def copy_runtime(source: Path, destination: Path) -> None:
         symlinks=True,
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
-    # Absolute internal links must point at the relocated copy, not the builder's installation.
     for path in destination.rglob("*"):
         if path.is_symlink() and Path(os.readlink(path)).is_absolute():
             target = source / path.relative_to(destination)
@@ -73,13 +83,74 @@ def runtime_metadata(python: Path) -> dict[str, Any]:
                 "-I",
                 "-c",
                 (
-                    "import json,sys,platform; print(json.dumps({'prefix':sys.prefix,"
+                    "import json,sys,platform,sysconfig,os; "
+                    "print(json.dumps({'prefix':sys.prefix,"
                     "'version':list(sys.version_info[:2]),'system':platform.system(),"
-                    "'machine':platform.machine()}))"
+                    "'machine':platform.machine(),'site_packages_relative':"
+                    "os.path.relpath(sysconfig.get_path('purelib'),sys.prefix).replace(os.sep,'/')}))"
                 ),
             ]
         )
     )
+
+
+def runtime_site_packages(runtime: Path, info: dict[str, Any]) -> Path:
+    relative = PurePosixPath(info["site_packages_relative"])
+    if (
+        relative.is_absolute()
+        or ".." in relative.parts
+        or "\\" in str(relative)
+        or ":" in str(relative)
+    ):
+        raise ValueError("The runtime site-packages directory must be inside the portable runtime.")
+    output = runtime.joinpath(*relative.parts)
+    if not output.resolve().is_relative_to(runtime.resolve()):
+        raise ValueError("The runtime site-packages directory leaves its portable runtime.")
+    expected = (
+        "Lib/site-packages"
+        if info["system"] == "Windows"
+        else f"lib/python{info['version'][0]}.{info['version'][1]}/site-packages"
+    )
+    if str(relative) != expected:
+        raise ValueError(
+            f"The portable runtime requires a standard site-packages layout: {expected}"
+        )
+    return output
+
+
+def strip_runtime_dependencies(runtime: Path, info: dict[str, Any]) -> None:
+    """Keep CPython separate from the SDK, including when the supplied seed has build tools."""
+    site_packages = runtime_site_packages(runtime, info)
+    if site_packages.exists():
+        shutil.rmtree(site_packages)
+    scripts = runtime / ("Scripts" if info["system"] == "Windows" else "bin")
+    if scripts.is_dir():
+        for path in scripts.iterdir():
+            if path.name.lower().startswith("python"):
+                continue
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+
+
+def validate_bare_runtime(runtime: Path, info: dict[str, Any]) -> None:
+    site_packages = runtime_site_packages(runtime, info)
+    if not site_packages.exists():
+        return
+    build_tools = {
+        "pip",
+        "setuptools",
+        "wheel",
+        "_distutils_hack",
+        "distutils-precedence.pth",
+        "__pycache__",
+    }
+    for path in site_packages.iterdir():
+        if path.name not in build_tools and not re.fullmatch(
+            r"(?:pip|setuptools|wheel)-.+\.dist-info", path.name
+        ):
+            raise ValueError(f"The packed runtime must not contain SDK dependencies: {path}")
 
 
 def stage_bootstrap(runtime: Path, output: Path) -> None:
@@ -87,45 +158,60 @@ def stage_bootstrap(runtime: Path, output: Path) -> None:
     if output.exists():
         raise ValueError(f"Bootstrap output already exists: {output}")
     copied = output / "runtime"
-    copied.mkdir(parents=True)
-    (copied / "bin").mkdir()
-    for path in (runtime / "bin").glob("python3*"):
-        if not path.name.endswith("-config"):
-            shutil.copy2(path, copied / "bin" / path.name, follow_symlinks=False)
-    (copied / "lib").mkdir()
-    for path in (runtime / "lib").glob("*.dylib"):
-        shutil.copy2(path, copied / "lib" / path.name, follow_symlinks=False)
-    for library in (runtime / "lib").glob("python3.*"):
-        if library.is_dir():
-            shutil.copytree(
-                library,
-                copied / "lib" / library.name,
-                symlinks=True,
-                ignore=shutil.ignore_patterns(
-                    "site-packages", "__pycache__", "*.pyc", "test", "tests", "idlelib", "ensurepip"
-                ),
-            )
-    # Preserve portable runtime license notices in both copies.
-    for path in runtime.iterdir():
-        if path.is_file() and any(
-            word in path.name.lower() for word in ("license", "notice", "copying")
-        ):
-            shutil.copy2(path, copied / path.name)
-    for path in copied.rglob("*"):
-        if path.is_symlink():
-            original = runtime / path.relative_to(copied)
-            target = original.resolve()
-            if not target.is_relative_to(runtime.resolve()):
-                raise ValueError(f"Bootstrap runtime link leaves its directory: {original}")
-            relative = target.relative_to(runtime.resolve())
-            path.unlink()
-            path.symlink_to(os.path.relpath(copied / relative, path.parent))
-            if not path.exists():
-                raise ValueError(f"Bootstrap runtime is missing a link target: {relative}")
+    if os.name == "nt":
+        copy_runtime(runtime, copied)
+        info = runtime_metadata(runtime_python(copied))
+        strip_runtime_dependencies(copied, info)
+        for name in ("ensurepip", "idlelib", "test", "tests"):
+            directory = copied / "Lib" / name
+            if directory.is_dir():
+                shutil.rmtree(directory)
+    else:
+        copied.mkdir(parents=True)
+        (copied / "bin").mkdir()
+        for path in (runtime / "bin").glob("python3*"):
+            if not path.name.endswith("-config"):
+                shutil.copy2(path, copied / "bin" / path.name, follow_symlinks=False)
+        (copied / "lib").mkdir()
+        for path in (runtime / "lib").glob("*.dylib"):
+            shutil.copy2(path, copied / "lib" / path.name, follow_symlinks=False)
+        for library in (runtime / "lib").glob("python3.*"):
+            if library.is_dir():
+                shutil.copytree(
+                    library,
+                    copied / "lib" / library.name,
+                    symlinks=True,
+                    ignore=shutil.ignore_patterns(
+                        "site-packages",
+                        "__pycache__",
+                        "*.pyc",
+                        "test",
+                        "tests",
+                        "idlelib",
+                        "ensurepip",
+                    ),
+                )
+        for path in runtime.iterdir():
+            if path.is_file() and any(
+                word in path.name.lower() for word in ("license", "notice", "copying")
+            ):
+                shutil.copy2(path, copied / path.name)
+        for path in copied.rglob("*"):
+            if path.is_symlink():
+                original = runtime / path.relative_to(copied)
+                target = original.resolve()
+                if not target.is_relative_to(runtime.resolve()):
+                    raise ValueError(f"Bootstrap runtime link leaves its directory: {original}")
+                relative = target.relative_to(runtime.resolve())
+                path.unlink()
+                path.symlink_to(os.path.relpath(copied / relative, path.parent))
+                if not path.exists():
+                    raise ValueError(f"Bootstrap runtime is missing a link target: {relative}")
     shutil.copy2(ROOT / "installer/install.py", output / "install.py")
     info = runtime_metadata(runtime_python(copied))
     if Path(info["prefix"]).resolve() != copied.resolve():
         raise ValueError("The bootstrap Python is not relocatable.")
+    validate_bare_runtime(copied, info)
     run([str(runtime_python(copied)), "-I", str(output / "install.py"), "--help"])
 
 
@@ -137,15 +223,25 @@ def build_frontend(extension: Path) -> None:
     if int(version.split(".")[0]) < 22:
         raise ValueError("Building an installer requires Node.js 22 or later.")
     frontend = ROOT / "frontend"
-    run([npm, "ci", "--no-audit", "--no-fund"], cwd=frontend)
+    # npm.cmd needs the Windows command processor; use npm's JS entry point through Node.
+    command = [npm]
+    if os.name == "nt":
+        npm_cli = Path(node).parent / "node_modules/npm/bin/npm-cli.js"
+        if not npm_cli.is_file():
+            raise ValueError("The Windows Node installation is missing npm-cli.js.")
+        command = [node, str(npm_cli)]
     output = extension / "src/deadline/comfyui_submitter/web"
     output.mkdir(parents=True, exist_ok=True)
-    # Build directly into the payload; generated JavaScript never changes the checkout.
-    run([npm, "run", "build", "--", "--outDir", str(output)], cwd=frontend)
+    # Use the same source and package lock without mutating checkout tooling or racing panel tests.
+    with tempfile.TemporaryDirectory(prefix="comfyui-installer-frontend-") as directory:
+        staged = Path(directory) / "frontend"
+        shutil.copytree(frontend, staged, ignore=shutil.ignore_patterns("node_modules"))
+        run([*command, "ci", "--no-audit", "--no-fund"], cwd=staged)
+        run([*command, "run", "build", "--", "--outDir", str(output.resolve())], cwd=staged)
 
 
-def install_dependencies(python: Path, wheelhouse: Path | None) -> None:
-    """Install only pinned, hash-verified wheels, including into a supplied runtime."""
+def install_dependencies(python: Path, wheelhouse: Path | None, target: Path | None = None) -> None:
+    """Install only pinned, hash-verified wheels; a target stages the separate SDK bundle."""
     command = [
         str(python),
         "-I",
@@ -155,19 +251,23 @@ def install_dependencies(python: Path, wheelhouse: Path | None) -> None:
         "--only-binary=:all:",
         "--require-hashes",
         "--force-reinstall",
+        "--no-compile",
     ]
+    if target is not None:
+        command += ["--target", str(target.resolve())]
     if wheelhouse is not None:
         command += ["--no-index", "--find-links", str(wheelhouse.resolve())]
     command += ["-r", str(ROOT / "requirements-installer.txt")]
     run(command)
 
 
-def attribution(python: Path, output: Path) -> None:
+def attribution(python: Path, output: Path, site_packages: Path | None = None) -> None:
     code = r"""
 import importlib.metadata as m, json, pathlib, sys
 inventory = []
 notices = []
-for distribution in sorted(m.distributions(), key=lambda d: d.metadata['Name'].lower()):
+distributions = m.distributions(path=[sys.argv[2]]) if len(sys.argv) > 2 else m.distributions()
+for distribution in sorted(distributions, key=lambda d: d.metadata['Name'].lower()):
     name = distribution.metadata['Name']
     inventory.append({'name': name, 'version': distribution.version})
     notices.append('\n' + name + ' ' + distribution.version + '\n')
@@ -184,19 +284,22 @@ root = pathlib.Path(sys.argv[1])
 (root / 'software-inventory.json').write_text(json.dumps(inventory, indent=2) + '\n', encoding='utf-8')
 (root / 'THIRD_PARTY_LICENSES').write_text('\n'.join(notices) + '\n', encoding='utf-8')
 """
-    run([str(python), "-I", "-c", code, str(output)])
+    command = [str(python), "-I", "-c", code, str(output)]
+    if site_packages is not None:
+        command.append(str(site_packages))
+    run(command)
 
 
 def validate_architecture(info: dict[str, Any], target: str) -> None:
-    if target != "MacOS":
-        raise ValueError("Installer builds currently support macOS only.")
-    expected_system = "Darwin"
-    if info["system"] != expected_system:
+    if target not in PLATFORMS:
+        raise ValueError("Installer builds support macOS and Windows only.")
+    if info["system"] != {"MacOS": "Darwin", "Windows": "Windows"}[target]:
         raise ValueError("The supplied runtime is for a different operating system.")
-    machine = info["machine"].lower()
-    allowed = ("arm64", "aarch64", "x86_64", "amd64")
-    if machine not in allowed:
-        raise ValueError("macOS installers require an arm64 or x64 runtime.")
+    allowed = (
+        ("x86_64", "amd64") if target == "Windows" else ("arm64", "aarch64", "x86_64", "amd64")
+    )
+    if info["machine"].lower() not in allowed:
+        raise ValueError("Windows installers require an x64 runtime; macOS supports arm64 or x64.")
 
 
 def stage_payload(python_runtime: Path, output: Path, target: str, wheelhouse: Path | None) -> Path:
@@ -204,10 +307,8 @@ def stage_payload(python_runtime: Path, output: Path, target: str, wheelhouse: P
         validate_native_path(path)
     if wheelhouse is not None:
         validate_native_path(wheelhouse)
-    if target != "MacOS":
-        raise ValueError("Installer builds currently support macOS only.")
     host = "MacOS" if platform.system() == "Darwin" else platform.system()
-    if target != host:
+    if target not in PLATFORMS or target != host:
         raise ValueError("Build on the target operating system; dependencies contain native code.")
     if output.exists():
         raise ValueError(f"Payload output already exists: {output}. Choose a new build directory.")
@@ -223,8 +324,9 @@ def stage_payload(python_runtime: Path, output: Path, target: str, wheelhouse: P
             raise ValueError("Supply a portable CPython 3.13 or 3.14 distribution.")
         if Path(info["prefix"]).resolve() != runtime.resolve():
             raise ValueError("The supplied Python distribution cannot run after relocation.")
+        strip_runtime_dependencies(runtime, info)
         run([str(python), "-I", "-m", "ensurepip", "--upgrade"])
-        install_dependencies(python, wheelhouse)
+        validate_bare_runtime(runtime, info)
         extension = temporary / "extension"
         extension.mkdir()
         for name in ("__init__.py", "LICENSE", "NOTICE"):
@@ -237,12 +339,17 @@ def stage_payload(python_runtime: Path, output: Path, target: str, wheelhouse: P
         build_frontend(extension)
         shutil.copy2(ROOT / "installer/install.py", temporary / "install.py")
         stage_bootstrap(runtime, temporary / "bootstrap")
-        attribution(python, extension)
-        metadata = {**info, "platform": target}
+        with tempfile.TemporaryDirectory(prefix=".sdk-", dir=temporary) as directory:
+            dependencies = Path(directory) / "site-packages"
+            install_dependencies(python, wheelhouse, dependencies)
+            attribution(python, extension, dependencies)
+            create_dependency_bundle(dependencies, temporary / BUNDLE_RELATIVE)
+        metadata = {**info, "platform": target, "dependency_bundle": BUNDLE_RELATIVE}
         metadata.pop("prefix")
-        (temporary / "build.json").write_text(json.dumps(metadata, indent=2) + "\n")
+        (temporary / "build.json").write_text(
+            json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+        )
         temporary.rename(output)
-        # Exercise the installed interpreter after a second relocation and regenerate launchers.
         verify_payload(output, target)
         return output
     except Exception:
@@ -254,18 +361,38 @@ def stage_payload(python_runtime: Path, output: Path, target: str, wheelhouse: P
 
 
 def verify_payload(payload: Path, target: str) -> None:
+    """Exercise the relocated, extracted SDK without putting SDK bytes into the packed runtime."""
     validate_native_path(payload)
-    info = runtime_metadata(runtime_python(payload / "runtime"))
+    runtime = payload / "runtime"
+    info = runtime_metadata(runtime_python(runtime))
     validate_architecture(info, target)
-    recorded = json.loads((payload / "build.json").read_text())
-    if any(info[key] != recorded[key] for key in ("version", "system", "machine")):
+    recorded = json.loads((payload / "build.json").read_text(encoding="utf-8"))
+    if any(
+        info[key] != recorded[key]
+        for key in ("version", "system", "machine", "site_packages_relative")
+    ):
         raise ValueError("The staged runtime does not match its build metadata.")
+    if Path(info["prefix"]).resolve() != runtime.resolve():
+        raise ValueError("The staged runtime is not relocatable.")
+    validate_bare_runtime(runtime, info)
+    if recorded.get("dependency_bundle") != BUNDLE_RELATIVE:
+        raise ValueError(
+            "The staged payload has no separate SDK dependency archive; stage it again."
+        )
     spec = importlib.util.spec_from_file_location("installer_hooks", payload / "install.py")
     if spec is None or spec.loader is None:
         raise RuntimeError("Cannot load installer hooks.")
     hooks = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(hooks)
-    hooks.prepare_runtime(payload / "runtime")
+    with tempfile.TemporaryDirectory(
+        prefix=".comfyui-verification-", dir=payload.parent
+    ) as directory:
+        verification = Path(directory) / "runtime"
+        copy_runtime(runtime, verification)
+        extract_dependency_bundle(
+            payload / BUNDLE_RELATIVE, runtime_site_packages(verification, info)
+        )
+        hooks.prepare_runtime(verification)
     hooks.payload_files(payload / "extension")
     bootstrap = payload / "bootstrap"
     if not bootstrap.is_dir():
@@ -273,32 +400,46 @@ def verify_payload(payload: Path, target: str) -> None:
     if (bootstrap / "install.py").read_bytes() != (payload / "install.py").read_bytes():
         raise ValueError("The validation and installation helpers do not match.")
     bootstrap_info = runtime_metadata(runtime_python(bootstrap / "runtime"))
-    if any(bootstrap_info[key] != info[key] for key in ("version", "system", "machine")):
+    if any(
+        bootstrap_info[key] != info[key]
+        for key in ("version", "system", "machine", "site_packages_relative")
+    ):
         raise ValueError("The validation runtime does not match the installer runtime.")
+    validate_bare_runtime(bootstrap / "runtime", bootstrap_info)
+    validate_bare_runtime(runtime, info)
 
 
 def build(
-    payload: Path, builder: Path, output: Path, target: str, version: str, local_dev: bool
-) -> None:
-    for path in (ROOT, payload, builder, output):
+    payload: Path,
+    builder: Path,
+    output: Path,
+    target: str,
+    version: str,
+    local_dev: bool,
+    installer_source_path: Path | None = None,
+) -> Path:
+    source = installer_source_path or ROOT / "installer/DeadlineCloudForComfyUISubmitter.xml"
+    for path in (ROOT, payload, builder, output, source):
         validate_native_path(path)
     if not builder.is_file():
         raise ValueError(f"InstallBuilder executable does not exist: {builder}")
+    if not source.is_file():
+        raise ValueError(f"InstallBuilder project does not exist: {source}")
     output.mkdir(parents=True, exist_ok=True)
-    python_relative = "bin/python3"
-    cli_relative = "bin/deadline"
-    info = json.loads((payload / "build.json").read_text())
+    info = json.loads((payload / "build.json").read_text(encoding="utf-8"))
     validate_architecture(info, target)
-    suffix = "app"
-    platform_name = PLATFORMS[target]
-    architecture = "arm64" if info["machine"].lower() in ("arm64", "aarch64") else "x86_64"
-    platform_name += "-" + architecture
-    filename = f"DeadlineCloudForComfyUISubmitter-{platform_name}-installer.{suffix}"
+    if target == "Windows":
+        python_relative, cli_relative = "python.exe", "Scripts/deadline.exe"
+        architecture, filename = "x64", "DeadlineCloudForComfyUISubmitter-windows-x64-installer.exe"
+    else:
+        python_relative, cli_relative = "bin/python3", "bin/deadline"
+        architecture = "arm64" if info["machine"].lower() in ("arm64", "aarch64") else "x86_64"
+        filename = f"DeadlineCloudForComfyUISubmitter-osx-{architecture}-installer.app"
     text = run(
         [
             str(builder),
             "build",
-            str(ROOT / "installer/DeadlineCloudForComfyUISubmitter.xml"),
+            str(source),
             PLATFORMS[target],
             "--setvars",
             f"project.outputDirectory={output.resolve()}",
@@ -307,60 +448,180 @@ def build(
             f"project.parameter(payload_directory).value={payload.resolve()}",
             f"project.parameter(runtime_python_relative).value={python_relative}",
             f"project.parameter(runtime_cli_relative).value={cli_relative}",
+            f"project.parameter(runtime_site_packages_relative).value={info['site_packages_relative']}",
             f"project.parameter(runtime_architecture).value={architecture}",
         ]
     )
     if "Built with an evaluation version of InstallBuilder" in text and not local_dev:
         raise ValueError("Release installers require a licensed InstallBuilder build.")
     artifact = output / filename
-    if not artifact.exists():
+    if (
+        not artifact.exists()
+        or (target == "Windows" and not artifact.is_file())
+        or (target == "MacOS" and not artifact.is_dir())
+    ):
         raise ValueError(f"InstallBuilder did not produce the expected installer: {artifact}")
     print(f"Installer: {artifact}")
+    return artifact
+
+
+def git_output(*arguments: str) -> str:
+    """Read local Git metadata without modifying the checkout or fetching tags."""
+    try:
+        return subprocess.check_output(
+            ["git", *arguments], cwd=ROOT, text=True, stderr=subprocess.DEVNULL, timeout=15
+        ).strip()
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return ""
+
+
+def semantic_version(tag: str) -> str | None:
+    match = re.fullmatch(
+        r"v?((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+        r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)",
+        tag,
+    )
+    if match is None:
+        return None
+    version = match.group(1)
+    release = version.split("+", 1)[0]
+    if "-" in release:
+        prerelease = release.split("-", 1)[1]
+        if any(
+            part.isdigit() and len(part) > 1 and part.startswith("0")
+            for part in prerelease.split(".")
+        ):
+            return None
+    return version
+
+
+def installer_version() -> str:
+    """Use release tags for licensed builds and identify untagged development checkouts."""
+    override = os.environ.get("INSTALLER_VERSION")
+    if override:
+        return override
+    short_head = git_output("rev-parse", "--short", "HEAD") or "unknown"
+    for tag in git_output("tag", "--points-at", "HEAD", "--sort=-version:refname").splitlines():
+        version = semantic_version(tag)
+        if version is not None:
+            return version
+    tags = [
+        tag
+        for tag in git_output("tag", "--merged", "HEAD").splitlines()
+        if semantic_version(tag) is not None
+    ]
+    if tags:
+        patterns = [argument for tag in tags for argument in ("--match", tag)]
+        nearest = git_output("describe", "--tags", "--abbrev=0", *patterns, "HEAD")
+        version = semantic_version(nearest)
+        if version is not None:
+            return version + "." + short_head
+    return f"development-{date.today()}.{short_head}"
+
+
+def normalize_platform(value: str) -> str:
+    for name in PLATFORMS:
+        if value.lower() == name.lower():
+            return name
+    raise argparse.ArgumentTypeError("Supported platforms are MacOS and Windows.")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--python-runtime", type=Path)
+    parser.add_argument(
+        "--python-runtime", type=Path, default=os.environ.get("COMFYUI_INSTALLER_PYTHON_RUNTIME")
+    )
     parser.add_argument("--reuse-payload", action="store_true")
     parser.add_argument("--payload-dir", type=Path, default=ROOT / "build/installer-payload")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "dist/installers")
-    parser.add_argument("--platform", choices=PLATFORMS, default="MacOS")
+    host = "MacOS" if platform.system() == "Darwin" else platform.system()
+    parser.add_argument("--platform", type=normalize_platform, default=host)
     parser.add_argument("--wheelhouse", type=Path)
     parser.add_argument("--install-builder-path", type=Path)
+    parser.add_argument("--install-builder-s3-bucket")
+    parser.add_argument("--install-builder-s3-key")
+    parser.add_argument("--install-builder-license-path", type=Path)
+    parser.add_argument("--installer-source-path", type=Path)
     parser.add_argument("--stage-only", action="store_true")
-    parser.add_argument("--local-dev", action="store_true")
+    development = parser.add_mutually_exclusive_group()
+    development.add_argument("--dev", action="store_true")
+    development.add_argument("--local-dev", action="store_true")
     parser.add_argument(
-        "--version", default=os.environ.get("INSTALLER_VERSION", f"development-{date.today()}")
+        "--override-installer-version",
+        "--version",
+        dest="version",
+        default=installer_version(),
     )
     args = parser.parse_args(argv)
     try:
-        if not args.stage_only and not args.install_builder_path:
+        if args.platform not in PLATFORMS:
+            raise ValueError("Specify --platform MacOS or Windows on a supported native host.")
+        if args.local_dev and "CODEBUILD_BUILD_ID" in os.environ:
             raise ValueError(
-                "Specify --install-builder-path (the builder executable), or --stage-only."
+                "--local-dev cannot be used when CODEBUILD_BUILD_ID is set; use --dev."
             )
-        if args.reuse_payload:
-            payload = args.payload_dir
-            if not (payload / "build.json").is_file():
-                raise ValueError("--reuse-payload requires an existing verified payload directory.")
-            verify_payload(payload, args.platform)
-        else:
-            if args.python_runtime is None:
-                raise ValueError("Specify --python-runtime to stage a new payload.")
-            payload = stage_payload(
-                args.python_runtime, args.payload_dir, args.platform, args.wheelhouse
+        if args.install_builder_path is not None and args.install_builder_s3_bucket is not None:
+            raise ValueError(
+                "--install-builder-path and --install-builder-s3-bucket are mutually exclusive."
             )
-        print(f"Verified offline payload: {payload}")
-        if not args.stage_only:
-            build(
-                payload,
-                args.install_builder_path,
-                args.output_dir,
-                args.platform,
-                args.version,
-                args.local_dev,
-            )
+        if args.install_builder_s3_key is not None and args.install_builder_s3_bucket is None:
+            raise ValueError("--install-builder-s3-key requires --install-builder-s3-bucket.")
+        with tempfile.TemporaryDirectory(prefix="comfyui-installbuilder-") as directory:
+            builder = None
+            if not args.stage_only:
+                for path in (args.install_builder_path, args.install_builder_license_path):
+                    if path is not None:
+                        validate_native_path(path)
+                builder = resolve_builder(
+                    args.install_builder_path,
+                    args.install_builder_s3_bucket,
+                    args.install_builder_s3_key,
+                    args.install_builder_license_path,
+                    Path(directory),
+                    args.platform,
+                )
+                if (
+                    not (args.dev or args.local_dev)
+                    and args.install_builder_license_path is None
+                    and not (builder.parent.parent / "license.xml").is_file()
+                ):
+                    raise ValueError(
+                        "Release builds require --install-builder-license-path or a licensed InstallBuilder installation."
+                    )
+            if args.reuse_payload:
+                payload = args.payload_dir
+                if not (payload / "build.json").is_file():
+                    raise ValueError(
+                        "--reuse-payload requires an existing verified payload directory."
+                    )
+                verify_payload(payload, args.platform)
+            else:
+                if args.python_runtime is None:
+                    raise ValueError(
+                        "Specify --python-runtime or COMFYUI_INSTALLER_PYTHON_RUNTIME to stage a new payload."
+                    )
+                payload = stage_payload(
+                    Path(args.python_runtime), args.payload_dir, args.platform, args.wheelhouse
+                )
+            print(f"Verified offline payload: {payload}")
+            if builder is not None:
+                build(
+                    payload,
+                    builder,
+                    args.output_dir,
+                    args.platform,
+                    args.version,
+                    args.dev or args.local_dev,
+                    args.installer_source_path,
+                )
         return 0
-    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
+    except (
+        OSError,
+        ValueError,
+        RuntimeError,
+        subprocess.CalledProcessError,
+        zipfile.BadZipFile,
+    ) as error:
         print(f"Installer build failed: {error}", file=sys.stderr)
         if isinstance(error, subprocess.CalledProcessError):
             print(error.stdout or "", file=sys.stderr)

@@ -26,6 +26,7 @@ python = ["3.13", "3.14"]
 
 [envs.installer]
 python = "3.13"
+dependencies = ["boto3==1.44.4"]
 
 [envs.installer.scripts]
-build-installer = 'python "{root}/scripts/build_installer.py" {args:}'
+build-installer = 'python "{root}/scripts/build_installer_cli.py" --installer-source-path "{root}/installer/DeadlineCloudForComfyUISubmitter.xml" {args:}'

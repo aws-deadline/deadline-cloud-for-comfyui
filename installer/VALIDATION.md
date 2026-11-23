@@ -1,75 +1,72 @@
 <!-- Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved. -->
-# Local macOS installer validation
+# Installer validation
 
-Validated on November 22, 2026, after rebasing onto fork and upstream `main` at
-`1fe90a296746ddd6f4e661c9e0d861eba3945a1f`. The host was an Apple silicon Mac running
-macOS 26.7.3, with InstallBuilder 26.8.0 evaluation, portable CPython 3.13.18,
-and Node.js 22.17.0. Python repository checks used Python 3.13.5.
+The supported installer targets are Windows x64 and Apple silicon macOS 13 or later.
+ComfyUI, model weights, workflows, and sample assets are not bundled.
 
-The local artifact is
-`dist/installers/DeadlineCloudForComfyUISubmitter-osx-arm64-installer.app`.
-It contains Deadline 0.60.11, boto3/botocore 1.44.4, and PySide6-Essentials 6.10.3.
-Package inventory and dependency license notices accompany the extension; portable
-Python's license files remain in the runtime.
+The November 23, 2026 local checks used an Apple silicon Mac, InstallBuilder 26.8.0
+evaluation, portable CPython 3.13.18, and Node.js 22.17.0. Python repository checks used
+Python 3.13.5. The default artifacts are:
+
+- `dist/installers/DeadlineCloudForComfyUISubmitter-osx-arm64-installer.app`
+- `dist/installers/DeadlineCloudForComfyUISubmitter-windows-x64-installer.exe`
 
 | Check | Result |
 |---|---|
-| `hatch run lint` | Passed: ruff, black, and mypy. |
-| `hatch run test` | 681 passed, 1 Windows-only test skipped. |
+| `hatch run lint` | Passed: Ruff, Black, and mypy. |
+| `hatch run test` | 732 passed, 2 Windows-only tests skipped on the local Mac. |
 | `hatch build` | Source distribution and wheel built successfully. |
-| Fresh native installer build | Passed with a newly staged payload and compiled panel. |
-| `hatch run test-installer` | 14 passed, 2 production release checks skipped. |
-| Hash-verified macOS ARM wheel downloads and dependency closure | Passed for Python 3.13 and 3.14; all 20 dependencies pinned. |
-| actionlint and the shared zizmor policy | Passed. |
-| XML/JSON parsing, pipeline shell syntax, `git diff --check` | Passed. |
+| Fresh native macOS installer build | Passed with a new payload and freshly compiled TypeScript. |
+| `hatch run test-installer` on macOS | 15 passed; 3 production/platform checks skipped. |
+| SDK wheel hashes and dependency closure | Passed: Python 3.13/3.14, macOS ARM (20 wheels each) and Windows x64 (22 wheels each). |
+| Native tool downloads | Actual Python and InstallBuilder release bytes verified against pinned hashes for both platforms. |
+| actionlint and the shared zizmor policy | Passed for all four installer workflows. |
 
-The download regression now passes, including large concurrent stderr output. The reader
-drains stdout after terminating the CLI, allowing process cleanup and the failure event
-to complete. The unit suite also checks bytecode cleanup across CPython tags and optimization
-levels, safe retry after partial cache removal, preserved customer caches and symlinks, and
-offline rejection of modified wheels or dependencies missing from the hash lock.
+The SDK is packaged in a separate dependency ZIP, following Cinema 4D's bundling layout.
+The packed portable runtime contains only build tooling; its early validation bootstrap is
+SDK-free. The archive records ordinary files with 0644/0755 modes and explicit parent
+directories with 0755 modes. A disposable extracted runtime is tested for TLS, SDK/Qt imports,
+relocation, and regenerated Deadline CLI launchers before the installer is built.
 
-The fresh payload copied the current integration and installation hooks and compiled the
-current TypeScript directly into staging. Copied source files matched the checkout byte
-for byte. The exact tested app was copied to `dist/installers/` and compared in file
-hashes, permissions, and symbolic links. Generated JavaScript and installer binaries
-are not committed.
-
-The native suite uses disposable synthetic host folders and isolated configuration. It
-checks suggested defaults, component and selected-folder CLI options, offline dependencies,
-relocated private Python and Deadline CLI, TLS and bridge imports, ownership and permissions,
-clean uninstall after compiling the packaged modules, and split-layout
-upgrade/uninstall/reinstall with preserved customer settings, modules, and bytecode. Negative cases reject missing sources, occupied prefixes, source/node overlap,
-symbolic links, and unsupported shell-special paths before installation. Test runtimes and
-ownership markers were removed; expected customer files and settings remained preserved.
+`Installer CI` builds the actual evaluation installer and runs `hatch run test-installer`
+on Windows x64 and macOS ARM. Consult the PR's native checks for the exact current results;
+Windows native execution is performed on the Windows runner, not emulated on the local Mac.
+The suite checks source and portable-parent selection, separate active custom nodes,
+spaced paths, packaged dependencies, permissions, install/upgrade/uninstall/reinstall,
+preserved settings and additions, and rejection of invalid or linked destinations.
+Uninstall must leave no managed product files; an entirely empty private installation
+folder is also accepted. Windows directory junctions are treated as links.
 
 Run the native suite against the default local artifact:
 
-```
+```sh
 hatch run test-installer
 ```
 
-Or select a specific built artifact:
+Or select a specific built artifact (PowerShell uses `$env:COMFYUI_INSTALLER_PATH`):
 
-```
+```sh
 COMFYUI_INSTALLER_PATH="/absolute/path/installer.app" hatch run test-installer
 ```
 
-`pipeline/test_installer.sh` runs the same suite for build automation. Unit tests cover
-rollback, ownership, path validation, safe launcher parsing, selected-folder resolution,
-and the reusable component interface. See [development instructions](../DEVELOPMENT.md)
-for fresh-payload build commands and release-check gates.
+`pipeline/test_installer.sh` and `pipeline/test_installer.ps1` run the same suite. Unit tests
+cover transaction rollback, ownership, safe launcher parsing, selected-folder resolution,
+platform build contracts, dependency-lock enforcement, and safe SDK/tool extraction.
+See [development instructions](../DEVELOPMENT.md#building-the-installers) for build commands,
+platform requirements, and release gates.
 
-This validation did not run a real ComfyUI or Desktop installation or submit a job.
-Operating-system dialogs and GUI Back-button navigation still require manual validation.
-The completion page provides restart instructions; it opens no browser or Deadline Cloud
-configuration window.
+These tests use disposable synthetic hosts. They do not install into a real ComfyUI,
+start ComfyUI, submit jobs, or use customer models. Operating-system dialogs and wizard
+Back-button navigation still require manual validation. The finish page provides restart
+instructions and opens no browser or Deadline configuration window.
 
-The artifact is an unsigned, watermarked evaluation build for local development.
-Customer distribution requires a licensed build, signing/notarization, testing across
-supported Apple silicon Macs and macOS versions, and a real panel/job submission against
-a configured farm and queue. Production CodeBuild builds require the two release checks
-that were skipped locally.
+Evaluation artifacts are unsigned development builds. Customer distribution requires licensed
+InstallBuilder, Windows Authenticode signing, macOS signing/notarization, testing on supported
+systems, and a real panel/job submission against a configured farm and queue. Production
+CodeBuild runs enforce release checks when `CODEBUILD_SRC_DIR` is present and `IS_DEV_BUILD`
+is not `true`. The shared AWS build/signing projects and protected environments must be
+configured before release workflows can publish installers.
 
-The supported target is Apple silicon on macOS 13 or later. Intel, Windows, and Linux
-installers are deferred. ComfyUI, model weights, and sample assets are not bundled.
+The shared installer-XML check is an advisory requiring coordination of XML changes with
+release infrastructure. It intentionally flags changed installer definitions; it is separate
+from functional native-test results.

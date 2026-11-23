@@ -80,38 +80,42 @@ The library runs in the Deadline Cloud CLI's own Python environment, not ComfyUI
 
 ## Installing
 
-### macOS installer
+### Windows and macOS installers
 
-When your studio supplies a macOS installer built from this repository, quit ComfyUI and
-open the `osx-arm64` installer on an Apple silicon Mac.
+When your studio supplies an installer built from this repository, quit ComfyUI and open
+`DeadlineCloudForComfyUISubmitter-windows-x64-installer.exe` on 64-bit Windows, or the
+`osx-arm64` installer on an Apple silicon Mac with macOS 13 or later.
 Select the ComfyUI submitter on the component page, then choose your existing ComfyUI
-folder. The folder picker suggests `~/ComfyUI`. Choose the source folder containing
-`main.py`, or a launcher folder containing `comfyui-source.txt` and a supported `launch.sh`.
+folder. The folder picker suggests `ComfyUI` in your home folder. Choose the source folder
+containing `main.py`, a portable installation's parent containing `ComfyUI/main.py`, or a
+launcher folder containing `comfyui-source.txt` and a supported `launch.sh`.
 The installer validates only the selected folder and its referenced source/base folders.
 For installations using `--base-directory`, select that base folder when it cannot be
 identified from the selected launcher metadata; Deadline belongs in its active
 `custom_nodes`, which can be separate from the source. The custom-node folder must already
-exist and be writable, without symbolic links. Folder names cannot contain double quotes,
-dollar signs, backticks, backslashes, or line breaks. The installer requires macOS 13 or
-later. Windows installers are planned separately; Intel Mac support is deferred.
+exist and be writable, without symbolic links or Windows directory junctions. Paths with
+spaces and normal Windows directory separators are supported. Double quotes, dollar signs,
+backticks, percent signs, and line breaks are rejected; literal backslashes in macOS folder
+names are also rejected. Intel Mac and Linux installers remain deferred.
 
-The installer includes the compiled panel and a private Deadline Cloud Python runtime. You
-need no Node.js, setup script, or package downloads to install it. The runtime lives in
-`~/DeadlineCloudForComfyUISubmitter`; keep that folder while you use the extension.
-Restart ComfyUI after installation to load the extension. The finish page provides restart
-instructions. Deadline Cloud monitor credentials and AWS profiles still need to be set up
-for your account.
+The installer includes the compiled panel, a private Python runtime, and the bundled
+Deadline Cloud dependencies. You need no Python, Node.js, setup script, or package downloads
+to install it. The runtime lives in `DeadlineCloudForComfyUISubmitter` in your home folder;
+keep that folder while you use the extension. Restart ComfyUI after installation to load the
+extension; the finish page provides instructions. Deadline Cloud monitor credentials and
+AWS profiles still need to be set up for your account.
 
 Run the newer installer with the same ComfyUI folder to upgrade. It preserves existing
 submitter settings and unrelated custom nodes. To remove an installer installation, quit
-ComfyUI, open `~/DeadlineCloudForComfyUISubmitter/uninstall.app`, and follow its prompts. Start
-ComfyUI again after uninstalling. The uninstaller removes unchanged integration files and
-its own runtime, and keeps customer additions and edited settings. ComfyUI, models,
-workflows, and Deadline Cloud credentials stay in place.
+ComfyUI and run `uninstall.exe` on Windows or `uninstall.app` on macOS from the Deadline
+installation folder. Start ComfyUI again after uninstalling. The uninstaller removes
+unchanged integration files and its own runtime, and keeps customer additions and edited
+settings. ComfyUI, models, workflows, and Deadline Cloud credentials stay in place.
 
-This repository currently provides the installer build pipeline; it does not publish a
-signed customer installer. See [Development](DEVELOPMENT.md#building-the-macos-installer) for
-build and release prerequisites.
+The shared installer build workflow uses the AWS-managed build/signing projects, which
+must be provisioned for this integration before producing a customer release. Local and
+pull-request builds use evaluation InstallBuilder and are not signed customer releases.
+See [Development](DEVELOPMENT.md#building-the-installers) for build and release prerequisites.
 
 ### Installing from source
 

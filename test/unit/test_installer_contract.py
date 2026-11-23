@@ -87,3 +87,30 @@ def test_component_packages_a_private_runtime_and_uses_the_resolved_active_nodes
         uninstaller.findtext("programArguments") or ""
     )
     assert uninstaller.findtext("abortOnError") == "1"
+
+
+def test_dependency_bundle_is_unpacked_before_runtime_validation() -> None:
+    component = ET.parse(ROOT / "install_builder/deadline-cloud-for-comfyui.xml").getroot()
+    post_installation = component.find("postInstallationActionList")
+    assert post_installation is not None
+    actions = list(post_installation)
+    unzip = next(action for action in actions if action.tag == "unzip")
+    runtime_hook = next(action for action in actions if action.tag == "runProgram")
+    assert actions.index(unzip) < actions.index(runtime_hook)
+    assert (
+        unzip.findtext("destinationDirectory")
+        == "${installdir}/runtime/${runtime_site_packages_relative}"
+    )
+    assert unzip.findtext("addToUninstaller") == "1"
+    assert (unzip.findtext("zipFile") or "").endswith(
+        "deadline_cloud_for_comfyui_submitter-deps.zip"
+    )
+
+
+def test_selected_target_and_prefix_are_validated_before_payload_copy() -> None:
+    component = ET.parse(ROOT / "install_builder/deadline-cloud-for-comfyui.xml").getroot()
+    resolution = component.find(
+        "readyToInstallActionList/setInstallerVariable[@name='deadline_resolve_arguments']"
+    )
+    assert resolution is not None
+    assert '--prefix "${installdir}"' in resolution.get("value", "")

@@ -29,9 +29,12 @@ npm ci
 | `installer/` | Standalone InstallBuilder project, offline installation hooks, and installer text. |
 | `install_builder/` | Reusable InstallBuilder component definition. |
 | `scripts/build_installer.py` | Allowlisted payload staging and native installer build. |
-| `pipeline/build_installer.sh` | macOS build entrypoint for release automation. |
-| `pipeline/test_installer.sh` | Native installer test entrypoint for release automation. |
-| `test/installer/` | Tests that execute a built macOS installer in disposable host folders. |
+| `scripts/build_installer_cli.py` | Build CLI following the other Deadline integrations' options. |
+| `scripts/deps_bundle.py` | Hash-locked SDK dependency ZIP for the selected Python/platform. |
+| `scripts/provision_installer_tools.py` | Hash-verified evaluation tooling for native CI; separate from production provisioning. |
+| `pipeline/build_installer.sh`, `pipeline/build_installer.ps1` | macOS and Windows build entrypoints for release automation. |
+| `pipeline/test_installer.sh`, `pipeline/test_installer.ps1` | Native installer test entrypoints for release automation. |
+| `test/installer/` | Tests that execute built macOS and Windows installers in disposable host folders. |
 | `test/unit/` | Unit tests, including installer ownership, rollback, relocation, and safe removal. |
 
 ## Commands
@@ -96,72 +99,103 @@ echo '{}' | /path/to/deadline-cli-python -I src/deadline/comfyui_submitter/bridg
 ```
 
 
-## Building the macOS installer
+## Building the installers
 
-Build on macOS with Node.js 22 or later, npm, Hatch, InstallBuilder, and a **portable CPython
-3.13 or 3.14 distribution** for Apple silicon (arm64). A normal virtual environment or
-system Python is not a portable runtime. Supply a trusted distribution and retain its
-license files. Build/installation paths support spaces; double quotes, dollar signs, backticks,
-backslashes, and line breaks are rejected before native command interpolation. The build copies it, checks relocation, installs the pinned Deadline Cloud
-GUI/console dependencies from `requirements-installer.txt`, and records package versions and
-license notices in the payload. It compiles TypeScript directly into the staged extension,
-without adding generated JavaScript to the checkout.
+Build on the target operating system with Node.js 22 or later, npm, Hatch, InstallBuilder,
+and a trusted **portable CPython 3.13 or 3.14 distribution**: Apple silicon on macOS, or
+x64 on Windows. A virtual environment or framework-dependent system Python is not a
+portable runtime. Retain the distribution's license files. Windows embeddable distributions
+must be configured to support normal isolated imports and pip; an untouched `._pth`
+distribution is unsuitable.
 
-The supported installer target is macOS on Apple silicon. Its Qt runtime requires macOS
-13 or later. Native validation uses CPython 3.13 and the InstallBuilder macOS builder;
-testing across supported macOS versions remains a release prerequisite. Intel, Windows,
-and Linux installers are deferred. See [installer validation](installer/VALIDATION.md)
-for commands and the local results.
+Like Cinema 4D, the build creates a separate dependency archive:
+`dependency_bundle/deadline_cloud_for_comfyui_submitter-deps.zip`. Its contents are the SDK
+site packages resolved for the selected runtime and platform. The packed interpreter and
+early validation bootstrap remain SDK-free. InstallBuilder unpacks the archive into the
+installed runtime's site-packages; the helper regenerates the Deadline CLI at its final
+location. The builder tests an extracted copy for relocation, TLS, SDK imports, and launchers,
+and records dependency versions and license notices. It compiles TypeScript directly into
+the staged extension, without adding generated JavaScript to the checkout.
 
-```
+Keeping a runnable Python is necessary for the existing `python -I bridge.py` integration.
+Cinema 4D imports its SDK inside the application's embedded Python. ComfyUI deliberately
+calls a separate Deadline environment so its Python packages cannot conflict with AWS or
+Qt. Dependency ZIP bundling follows Cinema 4D; the additional interpreter preserves this
+existing isolation.
+
+For macOS:
+
+```sh
 hatch run installer:build-installer \
+  --platform MacOS \
   --python-runtime /path/to/portable-python \
-  --install-builder-path /path/to/installbuilder/bin/builder \
-  --version 0.1.0 \
+  --install-builder-path /path/to/installbuilder \
+  --override-installer-version 0.1.0 \
   --local-dev
 ```
 
-`--local-dev` permits InstallBuilder's watermarked evaluation artifacts for local testing.
-A release build requires a licensed builder. The command emits
-`dist/installers/DeadlineCloudForComfyUISubmitter-osx-arm64-installer.app`. Payload staging must use a new directory; the default is
-`build/installer-payload`. Use `--payload-dir PATH` for separate builds. Use `--stage-only` to
-validate the complete offline payload without InstallBuilder, and `--reuse-payload` to build
-again from an already staged payload. An optional `--wheelhouse PATH` makes dependency
-installation use local wheels with `--no-index`; otherwise the build machine needs package
-index access. Customers never download packages as part of installation.
+For Windows PowerShell:
+
+```powershell
+hatch run installer:build-installer `
+  --platform Windows `
+  --python-runtime 'C:\Build Tools\Portable Python' `
+  --install-builder-path 'C:\Build Tools\InstallBuilder' `
+  --override-installer-version 0.1.0 `
+  --local-dev
+```
+
+`--install-builder-path` accepts an installation directory, as in Cinema 4D, or the builder
+executable for compatibility. `--local-dev` permits watermarked evaluation builds locally;
+`--dev` is the corresponding build-automation flag. Production builds require a licensed
+builder. Artifacts are emitted under `dist/installers/`:
+
+- `DeadlineCloudForComfyUISubmitter-osx-arm64-installer.app`
+- `DeadlineCloudForComfyUISubmitter-windows-x64-installer.exe`
+
+Set `COMFYUI_INSTALLER_PYTHON_RUNTIME` instead of `--python-runtime` when a build runner
+provisions its runtime. Build automation can use `--install-builder-s3-bucket`, optional
+`--install-builder-s3-key`, and `--install-builder-license-path` following Cinema 4D's
+private tool provisioning contract. Runtime acquisition belongs to the trusted build
+runner; product builds do not fetch arbitrary interpreters or ComfyUI.
+
+Payload staging must use a new directory; the default is `build/installer-payload`.
+Use `--payload-dir PATH` for separate builds, `--stage-only` to validate the offline payload
+without InstallBuilder, and `--reuse-payload` to build again from verified staging.
+An optional `--wheelhouse PATH` resolves dependencies from local wheels with `--no-index`;
+otherwise the build machine needs package-index access. Customers never download packages
+as part of installation.
 
 ### Updating the installer dependency lock
 
 `requirements-installer.in` contains the direct SDK/runtime versions. The generated
-`requirements-installer.txt` pins every transitive dependency and records artifact SHA256
-hashes. The builder requires those hashes for both package-index and local-wheelhouse
-installs, and reinstalls the locked wheels even when the supplied runtime already contains
-these packages. Source distributions are excluded from installer builds.
-
-Regenerate on an Apple silicon Mac with CPython 3.13, using a disposable virtual environment
-and the pinned resolver tools below. Update the direct versions in the input file first.
-Keep the copyright line first in the generated lock:
+`requirements-installer.txt` pins transitive dependencies and artifact SHA256 hashes, with
+platform markers for Windows-only dependencies. The builder uses `pip --target` and requires
+hashes for both package-index and local-wheelhouse builds. Source distributions are excluded.
+The universal lock is generated with the pinned resolver below; update direct versions in
+the input file first. The constraints preserve existing versions while adding platform
+coverage; remove or adjust them when deliberately upgrading dependencies.
 
 ```sh
-python3.13 -m venv /tmp/comfyui-installer-lock
-/tmp/comfyui-installer-lock/bin/python -m pip install pip==25.3 pip-tools==7.5.2
-/tmp/comfyui-installer-lock/bin/pip-compile --generate-hashes --strip-extras \
-  --resolver=backtracking --no-header --no-emit-index-url --no-emit-trusted-host \
-  --index-url https://pypi.org/simple --output-file requirements-installer.txt requirements-installer.in
-/tmp/comfyui-installer-lock/bin/python -c 'from pathlib import Path; p = Path("requirements-installer.txt"); p.write_text("# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.\n" + p.read_text())'
+python -m pip install uv==0.9.26
+uv pip compile --universal --python-version 3.13 --generate-hashes --no-header \
+  --default-index https://pypi.org/simple --constraints requirements-installer.txt \
+  --output-file /tmp/comfyui-installer-requirements.txt requirements-installer.in
+python -c 'from pathlib import Path; p=Path("requirements-installer.txt"); p.write_text("# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.\n" + Path("/tmp/comfyui-installer-requirements.txt").read_text())'
 ```
 
-Review all changed versions and hashes. Verify wheel availability for both supported Python
-versions with `pip download --require-hashes --only-binary=:all: --implementation cp
---platform macosx_13_0_arm64 --python-version 3.13 -r requirements-installer.txt --dest PATH`,
-then repeat with Python version `3.14` and another destination. A local wheelhouse must
-contain these same hash-verified wheels. Run the dependency unit tests and rebuild the
-installer/native tests before accepting a lock update.
+Review every changed version and hash. Check wheel availability and dependency closure for
+Python 3.13 and 3.14 on both `macosx_13_0_arm64` and `win_amd64`, with separate destinations:
+`pip download --require-hashes --only-binary=:all: --implementation cp --platform PLATFORM
+--python-version VERSION -r requirements-installer.txt --dest PATH`.
+The offline dependency tests check platform markers and wheel selection. Rebuild the
+installer and run its native tests before accepting a lock update.
 
 The wizard always shows the standard folder picker, with `~/ComfyUI` as the suggested
 location, and an optional base folder for separate active custom nodes. Validation runs
 from a temporary, standard-library-only copy of the supplied portable Python, so selecting
-a folder requires no system Python. It reads only the selected folder's `main.py`,
+a folder requires no system Python. It reads only the selected folder's `main.py`, literal
+`ComfyUI/main.py` child for portable layouts,
 `comfyui-source.txt`, and a supported literal Python `launch.sh` command plus the referenced
 source/base folders. Launcher scripts are parsed as metadata. Dynamic launchers require
 explicit source and base selection. The temporary validator is removed after resolution
@@ -185,8 +219,8 @@ marks the standalone wizard. Its public CLI options are `--comfyui-directory` an
 optional `--comfyui-base-directory`; `--comfyui-custom-nodes-directory` is available for
 unattended wrappers that already know the exact active folder. The per-user `--prefix`
 contains the private runtime. A combined installer's application selection page belongs to
-its wrapper project, which launches the built standalone installer unattended. Shared build
-and signing onboarding remains a separate release task.
+its wrapper project, which launches the built standalone installer unattended. The shared build/signing workflow
+is provided; AWS-managed build-project onboarding remains a release prerequisite.
 The private runtime includes a runnable interpreter because the ComfyUI routes launch
 `bridge.py` with it. A standalone frozen Deadline CLI does not replace this runtime. The
 installer regenerates the CLI launcher at its final path and validates imports, TLS, Python
@@ -200,21 +234,23 @@ Cloud integrations:
 hatch run test-installer
 ```
 
-The suite reads `dist/installers/DeadlineCloudForComfyUISubmitter-osx-arm64-installer.app`
+The suite selects the corresponding `.app` or `windows-x64` `.exe` under `dist/installers/`
 by default. To test an artifact elsewhere:
 
 ```
 COMFYUI_INSTALLER_PATH="/absolute/path/installer.app" hatch run test-installer
 ```
 
-`pipeline/test_installer.sh` runs the same suite for build automation. These tests launch
+`pipeline/test_installer.sh` and `pipeline/test_installer.ps1` run the same suite for build automation. These tests launch
 the real installer and uninstaller with explicit temporary source, custom-node, and runtime
 folders; they do not use an existing ComfyUI installation or run ComfyUI. They check CLI
 options and defaults, packaged dependencies and permissions, install/upgrade/uninstall,
 split layouts, preserved customer settings, and rejected paths. The ordinary `hatch run test`
 continues to run only unit tests, and does not require a built installer. Native tests skip
-on platforms other than Apple silicon macOS; on a supported Mac, a missing artifact fails
-with build instructions. Licensed-build and macOS signing checks run for production
+outside Apple silicon macOS and Windows x64; a missing artifact on a supported platform fails
+with build instructions. Windows uses unattended execution because its GUI installer has no
+text-mode console help. Licensed-build, macOS signing/notarization, and Windows Authenticode
+checks run for production
 CodeBuild builds (`CODEBUILD_SRC_DIR` set and `IS_DEV_BUILD` other than `true`), matching the
 peer installer suites. Local evaluation builds skip those release checks.
 
@@ -259,10 +295,27 @@ cover rollback and ownership edge cases, but do not validate operating-system di
 Deadline Cloud submission. A real submission still requires your own configured farm, queue,
 worker environment, and ComfyUI installation.
 
-Before distributing a customer artifact, use a licensed InstallBuilder build, apply macOS
-signing and notarization, and validate on supported Macs. Onboarding to the shared
-AWS-managed installer build/signing project and its public reusable release workflows is a
-separate release task. This change provides the local project/component and build entrypoints;
-it does not deploy build infrastructure or publish an installer. The installer payload
-contains only this integration, its compiled panel, and the Deadline runtime dependencies;
-ComfyUI and model assets are supplied separately by the customer.
+`.github/workflows/installer_ci.yml` builds evaluation installers and runs the actual native
+suite on Windows x64 and macOS ARM for pull requests. Its pinned, hash-verified tools are
+provided by `scripts/provision_installer_tools.py`; the workflow uses no release credentials.
+`.github/workflows/installer_xml_check.yml` uses the organization's shared XML change advisory.
+`.github/workflows/build_installers.yml` invokes the same shared AWS installer build workflow
+as Cinema 4D for MacOS and Windows, with repository-scoped OIDC and protected environments.
+`.github/workflows/release_installers.yml` validates an existing version tag and calls the
+shared release-installer workflow for both platforms under the protected `release` environment.
+It provides the installer release stage, without adding unrelated PyPI or Conda publication.
+
+Before producing a customer release, provision the AWS-managed
+`deadline-cloud-for-comfyui-MacOSInstaller` and
+`deadline-cloud-for-comfyui-WindowsInstaller` build/signing projects and their protected
+GitHub environments/role, the shared `ReleaseInstallerProject`, licensed InstallBuilder,
+and trusted portable runtime. Runners must
+set `COMFYUI_INSTALLER_PYTHON_RUNTIME` and install Node.js 22+. Release builds require Windows
+Authenticode signing and macOS signing/notarization, native validation on supported systems,
+and a real panel/job submission against a configured farm and queue. The release gates run
+when `CODEBUILD_SRC_DIR` is set and `IS_DEV_BUILD` is not `true`.
+
+The shared workflow invocation and compatible build/test entrypoints are included here;
+this PR does not provision cloud infrastructure or publish installers. The payload contains
+only this integration, its compiled panel, and Deadline runtime dependencies. ComfyUI and
+model assets are supplied separately by the customer.

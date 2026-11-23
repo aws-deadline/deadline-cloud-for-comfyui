@@ -70,15 +70,20 @@ def uninstalled_receipt(destination: Path) -> bool:
     return True
 
 
+def linked_path(path: Path) -> bool:
+    """Treat Windows junctions like symlinks when guarding customer folders."""
+    return path.is_symlink() or (os.name == "nt" and path.is_junction())
+
+
 def direct_path(path: Path) -> Path:
     """Normalize a local path without allowing aliases to bypass ownership guards."""
     expanded = path.expanduser().absolute()
-    unsupported = ("\n", "\r", '"', "$", "`") + (("\\",) if os.name != "nt" else ())
+    unsupported = ("\n", "\r", '"', "$", "`", "%") + (("\\",) if os.name != "nt" else ())
     if any(character in str(expanded) for character in unsupported):
         raise InstallError(
-            "Folder paths must not contain quotes, dollar signs, backticks, backslashes, or line breaks."
+            "Folder paths must not contain quotes, dollar signs, backticks, percent signs, or line breaks; backslashes are only supported on Windows."
         )
-    if ".." in expanded.parts or any(item.is_symlink() for item in (expanded, *expanded.parents)):
+    if ".." in expanded.parts or any(linked_path(item) for item in (expanded, *expanded.parents)):
         raise InstallError(f"Use an actual folder path without symbolic links or ..: {expanded}")
     return expanded.resolve()
 
@@ -254,12 +259,16 @@ def resolve_layout(
         else:
             root, inferred_nodes = launcher_layout(root)
     else:
+        # Windows portable distributions place the source below the selected parent.
+        # Inspect only this literal child, never execute a launcher or search the drive.
+        if not (root / "main.py").is_file() and (root / "ComfyUI/main.py").is_file():
+            root = root / "ComfyUI"
         inferred_nodes = root / "custom_nodes"
     root = direct_path(root)
     selected_nodes = custom_nodes or (
         base_directory / "custom_nodes" if base_directory else inferred_nodes
     )
-    if selected_nodes.is_symlink():
+    if linked_path(selected_nodes):
         raise InstallError("The custom_nodes folder is a symbolic link. Choose its actual folder.")
     nodes = direct_path(selected_nodes)
     if not (root / "main.py").is_file() or not nodes.is_dir() or nodes.name != "custom_nodes":
@@ -271,7 +280,7 @@ def resolve_layout(
     if not os.access(nodes, os.W_OK | os.X_OK):
         raise InstallError(f"The custom_nodes folder is not writable: {nodes}")
     destination = nodes / EXTENSION_NAME
-    if destination.is_symlink():
+    if linked_path(destination):
         raise InstallError(
             f"{destination} is a development link. Remove the link before installing."
         )
@@ -286,6 +295,54 @@ def resolve_layout(
     ):
         raise InstallError(f"{destination} exists and is not the Deadline extension.")
     return root, nodes
+
+
+def validate_prefix(prefix: Path, source: Path, nodes: Path) -> None:
+    """Reject unsafe destinations before InstallBuilder copies any product files."""
+    if not prefix.expanduser().is_absolute():
+        raise InstallError("Use an absolute Deadline Cloud installation directory.")
+    prefix = direct_path(prefix)
+    for host in (source, nodes):
+        if prefix.is_relative_to(host) or host.is_relative_to(prefix):
+            raise InstallError(
+                "The Deadline Cloud installation directory must be separate from "
+                "the ComfyUI source and custom_nodes folders."
+            )
+    if not prefix.exists():
+        return
+    if not prefix.is_dir():
+        raise InstallError("Choose an empty installation folder or the existing Deadline folder.")
+    if not any(prefix.iterdir()):
+        return
+    marker = prefix / ".deadline-cloud-for-comfyui-installer"
+    if (
+        linked_path(marker)
+        or not marker.is_file()
+        or marker.read_text(encoding="utf-8").strip() != "deadline-cloud-for-comfyui-installer-v1"
+        or not (prefix / "installer_version.txt").is_file()
+    ):
+        raise InstallError(
+            "This installation directory contains other files. Choose an empty folder "
+            "or the existing Deadline Cloud for ComfyUI installation directory."
+        )
+    for name in (
+        "payload",
+        "runtime",
+        "dependency_bundle",
+        "install.py",
+        "installation.json",
+        "installer_version.txt",
+        ".deadline-cloud-for-comfyui-installer",
+        "rollbackBackupDirectory",
+    ):
+        if linked_path(prefix / name):
+            raise InstallError("The existing Deadline installation contains linked managed files.")
+    state = prefix / "installation.json"
+    if state.exists() and read_json(state).get("extension") != str(nodes / EXTENSION_NAME):
+        raise InstallError(
+            "This installer already manages another ComfyUI installation. "
+            "Uninstall it before selecting another folder."
+        )
 
 
 def validate_comfyui(path: Path, custom_nodes: Path | None = None) -> Path:
@@ -385,7 +442,7 @@ def safe_file(root: Path, name: str) -> Path:
     for current in (path, *path.parents):
         if current == root:
             return path
-        if current.is_symlink():
+        if linked_path(current):
             raise InstallError(f"Cannot modify a symbolic link: {current}")
     raise InstallError("The installation manifest contains an invalid file path.")
 
@@ -505,7 +562,7 @@ def install(
 def module_bytecode(module: Path) -> list[Path]:
     """Find generated caches for one unchanged packaged module without following links."""
     cache = module.parent / "__pycache__"
-    if cache.is_symlink() or not cache.is_dir():
+    if linked_path(cache) or not cache.is_dir():
         return []
     name = re.compile(rf"{re.escape(module.stem)}\.cpython-\d+(?:\.opt-[012])?\.pyc")
     generated = []
@@ -538,7 +595,7 @@ def uninstall(state: Path) -> list[str]:
     ):
         raise InstallError("The installer state has an invalid extension path.")
     marker = destination / MARKER_NAME
-    if any(path.is_symlink() for path in (destination, *destination.parents)):
+    if any(linked_path(path) for path in (destination, *destination.parents)):
         state.unlink()
         return ["extension path now contains a symbolic link"]
     if not marker.is_file() or marker.is_symlink() or read_json(marker) != manifest:
@@ -594,7 +651,7 @@ def uninstall(state: Path) -> list[str]:
         for directory in sorted(
             destination.rglob("*"), key=lambda item: len(item.parts), reverse=True
         ):
-            if directory.is_dir() and not directory.is_symlink():
+            if directory.is_dir() and not linked_path(directory):
                 try:
                     directory.rmdir()
                 except OSError as error:
@@ -643,6 +700,7 @@ def main(argv: list[str] | None = None) -> int:
     resolve.add_argument("--comfyui", required=True, type=Path)
     resolve.add_argument("--custom-nodes", type=Path)
     resolve.add_argument("--base-directory", type=Path)
+    resolve.add_argument("--prefix", type=Path)
     resolve.add_argument("--output-dir", type=Path)
     setup = commands.add_parser("install")
     for name in ("payload", "runtime", "comfyui", "state"):
@@ -659,6 +717,8 @@ def main(argv: list[str] | None = None) -> int:
             validate_comfyui(args.comfyui, args.custom_nodes)
         elif args.command == "resolve":
             source, nodes = resolve_layout(args.comfyui, args.custom_nodes, args.base_directory)
+            if args.prefix is not None:
+                validate_prefix(args.prefix, source, nodes)
             result = {"schema": 1, "source": str(source), "custom_nodes": str(nodes)}
             if args.output_dir:
                 layout_output(args.output_dir, source, nodes)

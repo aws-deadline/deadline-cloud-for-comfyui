@@ -1,8 +1,12 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-# Direct dependencies for the private installer runtime, never ComfyUI itself.
+# Direct dependencies for the private installer SDK bundle, never ComfyUI itself.
 # Regenerate the complete hash lock as documented in DEVELOPMENT.md.
 deadline[gui,console]==0.60.11
 boto3==1.44.4
 botocore==1.44.4
 PySide6-Essentials==6.10.3
 distlib==0.4.4
+
+# Windows-only dependencies of Click and Deadline job attachments.
+colorama==0.4.6 ; sys_platform == "win32"
+pywin32==312 ; sys_platform == "win32"

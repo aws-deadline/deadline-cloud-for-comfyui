@@ -1,0 +1,47 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+name: "Release: Installers"
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build, sign, and publish
+        required: true
+        type: string
+
+concurrency:
+  group: release-installers
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  ValidateTag:
+    if: github.repository == 'aws-deadline/deadline-cloud-for-comfyui'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Require an existing version tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "::error::Select an existing semantic version tag, such as v0.1.0."
+            exit 1
+          fi
+          gh api --silent "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG"
+
+  ReleaseInstaller:
+    needs: ValidateTag
+    uses: aws-deadline/.github/.github/workflows/reusable_release_installers.yml@mainline
+    secrets: inherit
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      tag: ${{ inputs.tag }}
+      oses: "['Windows', 'MacOS']"
+      project_name: deadline-cloud-for-comfyui
