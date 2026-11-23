@@ -15,6 +15,7 @@ import logging
 import re
 import secrets
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -95,6 +96,10 @@ SAVED_JOB_SETTINGS = (
 _SUBMISSION_ID = re.compile(r"[0-9a-f]{32}")
 
 BRIDGE = Path(__file__).resolve().parent / "bridge.py"
+# The Deadline Cloud library and its dependencies, which the Windows and macOS installers unpack
+# next to the extension's __init__.py. A source installation doesn't have them, and runs the bridge
+# with the Deadline Cloud CLI's Python instead.
+INSTALLED_DEPENDENCIES = Path(__file__).resolve().parents[3] / "dependencies"
 # The bridge commands the panel can run directly.
 CLOUD_COMMANDS = ("status", "login", "farms", "queues", "queue", "set-defaults", "jobs")
 BRIDGE_TIMEOUT = 120
@@ -889,23 +894,29 @@ async def plan_submission(request: web.Request) -> web.Response:
 
 async def _bridge_process(command: str, cli: str | None = None) -> asyncio.subprocess.Process:
     """
-    Starts bridge.py with the Python of the Deadline Cloud CLI, or of the configured one when cli
-    isn't given. Raises SubmitError.
+    Starts bridge.py with ComfyUI's Python and the installer's dependencies, or otherwise with the
+    Python of the Deadline Cloud CLI, or of the configured one when cli isn't given. Raises
+    SubmitError.
     """
-    python = resolve_cli_python(cli or resolve_deadline_cli(load_config()))
+    # -I keeps this extension's modules and PYTHONPATH out of the bridge's environment.
+    if INSTALLED_DEPENDENCIES.is_dir():
+        # -S leaves ComfyUI's own packages out, so the bridge imports only the installed ones.
+        python = sys.executable
+        arguments = ["-I", "-S", str(BRIDGE), "--dependencies", str(INSTALLED_DEPENDENCIES)]
+    else:
+        python = resolve_cli_python(cli or resolve_deadline_cli(load_config()))
+        arguments = ["-I", str(BRIDGE)]
     try:
         return await asyncio.create_subprocess_exec(
-            # -I keeps this extension's modules and PYTHONPATH out of the CLI's environment.
             python,
-            "-I",
-            str(BRIDGE),
+            *arguments,
             command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
     except OSError as e:
-        raise SubmitError(f"Couldn't run the Deadline Cloud CLI's Python {python}: {e}")
+        raise SubmitError(f"Couldn't run the Deadline Cloud bridge with {python}: {e}")
 
 
 def _parse_event(line: bytes) -> dict[str, Any] | None:
@@ -1257,9 +1268,13 @@ async def submit_job(request: web.Request) -> web.Response:
         settings = _string_map(body.get("settings"), "settings")
     except SubmitError as e:
         return _error(400, str(e))
-    cli = await _checked_cli(config)
-    if isinstance(cli, web.Response):
-        return cli
+    cli = None
+    # The installer's dependencies submit without the Deadline Cloud CLI.
+    if not INSTALLED_DEPENDENCIES.is_dir():
+        checked_cli = await _checked_cli(config)
+        if isinstance(checked_cli, web.Response):
+            return checked_cli
+        cli = checked_cli
     try:
         bundle = await _build_bundle(body, workflow, template, config)
     except SubmitError as e:

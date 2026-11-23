@@ -736,6 +736,46 @@ def test_cloud_runs_the_bridge_with_the_cli_python(comfy, monkeypatch):
     assert request["request"] == {"region": "eu-west-2"}
 
 
+def installed_dependencies(comfy, monkeypatch, responses: dict) -> tuple[Path, Path]:
+    """
+    An installer's installation: the dependencies next to the extension, ComfyUI's Python running
+    the fake bridge, and no Deadline Cloud CLI. Returns the dependencies and the bridge's requests.
+    """
+    dependencies = comfy.tmp_path / "dependencies"
+    dependencies.mkdir()
+    monkeypatch.setattr(comfy.routes, "INSTALLED_DEPENDENCIES", dependencies)
+    monkeypatch.setenv(submit.CLI_ENV_VAR, str(comfy.tmp_path / "missing-deadline"))
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, responses)
+    monkeypatch.setattr(sys, "executable", os.environ[submit.PYTHON_ENV_VAR])
+    return dependencies, requests
+
+
+def test_cloud_runs_the_bridge_with_the_installed_dependencies(comfy, monkeypatch):
+    farms = {"farms": [{"farmId": "farm-1", "displayName": "Render"}]}
+    dependencies, requests = installed_dependencies(comfy, monkeypatch, {"farms": [result(farms)]})
+    status, body = run(call(comfy, "/deadline/cloud/farms", {}))
+    assert (status, body) == (200, farms)
+    [request] = bridge_requests(requests)
+    assert request["argv"] == [
+        "-I",
+        "-S",
+        str(comfy.routes.BRIDGE),
+        "--dependencies",
+        str(dependencies),
+        "farms",
+    ]
+
+
+def test_jobs_submits_with_the_installed_dependencies_without_the_cli(comfy, monkeypatch):
+    dependencies, requests = installed_dependencies(
+        comfy, monkeypatch, {"submit": [result({"jobId": "job-1"})]}
+    )
+    status, _ = run(call(comfy, "/deadline/jobs", JOB))
+    assert status == 202
+    [request] = bridge_requests(requests)
+    assert request["argv"][-3:] == ["--dependencies", str(dependencies), "submit"]
+
+
 def test_cloud_reports_library_errors(comfy, monkeypatch):
     fake_cli(monkeypatch, comfy.tmp_path, "")
     error = {"event": "error", "message": "The security token included in the request is expired"}
