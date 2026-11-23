@@ -41,7 +41,7 @@ npm ci
 | Command | Description |
 |---|---|
 | `hatch run test` | Run the unit tests with coverage. |
-| `hatch run test-installer` | Test the built Apple silicon installer without coverage. |
+| `hatch run test-installer` | Test the built macOS or Windows installer. |
 | `hatch run all:test` | Run the unit tests on Python 3.13 and 3.14. |
 | `hatch run lint` | Run ruff, black and mypy. |
 | `hatch run fmt` | Format with black, then run ruff. |
@@ -141,8 +141,9 @@ with `--reuse-payload`, or resolve SDK wheels from a local `--wheelhouse`.
 Run `hatch run test-installer` on the target operating system. The suite picks the
 installer under `dist/installers/`. Set `COMFYUI_INSTALLER_PATH` to use another artifact.
 It runs the native installer and uninstaller against disposable folders with a Python
-`.venv`, `main.py` and `custom_nodes`. It checks packaged dependencies, permissions, upgrade,
-uninstall, customer file preservation, and invalid destinations.
+`.venv`, `main.py` and `custom_nodes`. It checks SDK imports, TLS certificate loading,
+bridge startup, permissions, upgrades, uninstall, preservation of user files, and invalid
+destinations.
 
 For unattended installation, pass `--comfyui-directory` with the absolute path to
 the ComfyUI folder and `--prefix` with the separate Deadline installation directory.
@@ -181,5 +182,5 @@ installer and run its native tests before accepting a lock update.
 The repository calls the shared installer build, release, and XML-change workflows.
 Customer releases require the managed macOS and Windows build/signing projects, the
 shared release project, protected GitHub environments and role, and licensed InstallBuilder.
-Verify Windows Authenticode, macOS signing and notarization,
-and a real panel submission for the release. See [Installer validation](installer/VALIDATION.md).
+Verify Windows Authenticode and macOS signing and notarization. Walk through the installer
+wizard and submit a job from the running ComfyUI panel.
