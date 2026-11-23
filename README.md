@@ -249,16 +249,21 @@ the same machine.
 **What the extension adds.**
 
 - The routes require a loopback peer address. A request from another address, or one
-  with a `Forwarded`, `X-Forwarded-For` or `X-Real-IP` header from a reverse proxy, gets a 403.
+  with a header that a reverse proxy adds, such as `Forwarded`, `X-Forwarded-For`, `X-Real-IP` or
+  `Via`, gets a 403. A proxy or port forwarder on this machine that adds none of these headers
+  can't be told apart from a local client, so don't put one in front of ComfyUI.
 - They only accept requests addressed to `localhost` or a loopback address such as `127.0.0.1`,
   so a website that points its own domain name at this machine can't pass for ComfyUI's page.
+  Names under `.localhost`, and names with a trailing dot, are refused too.
 - They refuse requests that a browser marks as coming from another website, even when
   `--enable-cors-header` turns off ComfyUI's own check. When an `Origin` header is present, its
   scheme, host and port must match the ComfyUI request, even without browser fetch metadata.
 - They only accept JSON, which a page from another website can't send without the server's
   permission.
-- Submission progress, confirmation prompts and errors, and download progress go only to the
-  browser tab that started them, not to every tab connected to the server.
+- Submission progress, confirmation prompts and errors, and download progress are sent to the
+  browser client ID that started them, not to every tab connected to the server. A client ID
+  isn't a secret: ComfyUI lists it in the queue and history, and anyone who can reach ComfyUI can
+  connect with it, so this keeps tabs apart rather than protecting the messages.
 - A submission requires a valid browser client ID. Only that client can confirm or cancel it,
   and confirmation answers are accepted only while a prompt is pending.
 - Job bundles in `ComfyUI/user/deadline_submissions/` hold your workflows, prompts and file paths.
@@ -268,6 +273,9 @@ the same machine.
   your files and keep their permissions, but they can only be reached through the bundle, which
   is deleted once its job is created. On Windows, bundles inherit the permissions of the ComfyUI
   user folder. The `deadline_cloud_submitter.json` config file is also `0600`.
+- **Download** only writes files inside the Output Directory the job was submitted with. Output
+  manifests come from the queue's job attachments, where any job on the queue can write, so the
+  extension checks every file's destination first, and downloads nothing when one is elsewhere.
 - Custom node packs are uploaded with their files to the queue's job attachments bucket, where
   anyone who can use the queue can read them. Credential files, such as `.env`, `*.key` and `*.pem`,
   are left out. A pack's settings files, such as `config.json`, are attached as they are, so keep

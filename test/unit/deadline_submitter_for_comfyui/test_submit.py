@@ -385,6 +385,8 @@ def test_host_requirements_openjd_accepts(requirements, tmp_path):
         ({"amounts": [{"name": "amount.worker.gpu", "min": -1}]}, "positive number"),
         ({"amounts": [{"name": "amount.worker.gpu", "min": True}]}, "positive number"),
         ({"amounts": [{"name": "amount.worker.gpu", "min": "1"}]}, "positive number"),
+        ({"amounts": [{"name": "amount.worker.gpu", "min": float("nan")}]}, "positive number"),
+        ({"amounts": [{"name": "amount.worker.gpu", "max": float("inf")}]}, "positive number"),
         ({"amounts": [{"name": "amount.worker.gpu", "min": 2, "max": 1}]}, "more than its max"),
         ({"amounts": [{"name": "amount.worker.other", "min": 1}]}, "doesn't start with"),
         ({"amounts": [{"name": "amount.job.x", "min": 1}]}, "doesn't start with"),

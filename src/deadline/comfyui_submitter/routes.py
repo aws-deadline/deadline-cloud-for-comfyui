@@ -12,7 +12,6 @@ import asyncio
 import ipaddress
 import json
 import logging
-import os
 import re
 import shutil
 import threading
@@ -73,11 +72,8 @@ CONFIRM_EVENT = "deadline.confirm"
 # The job template's switch for loading the attached custom node packs on the worker.
 ATTACH_NODES = "AttachCustomNodes"
 DOWNLOAD_EVENT = "deadline.download"
-# A farm, queue or job ID, which goes on the CLI's command line.
+# A farm, queue or job ID.
 _RESOURCE_ID = re.compile(r"(farm|queue|job)-[0-9a-f]{32}")
-# download-output's JSON summary is one line that lists every downloaded file, so it can be far
-# longer than asyncio's default 64 KiB line limit.
-DOWNLOAD_LINE_LIMIT = 64 * 1024 * 1024
 # The job settings that a saved bundle keeps as deadline:<name> parameter values, which `deadline
 # bundle submit` reads.
 SAVED_JOB_SETTINGS = (
@@ -289,11 +285,14 @@ def _is_loopback(remote: str | None) -> bool:
 
 
 def _is_local_host(host: str | None) -> bool:
-    """Whether a Host header names this machine by localhost or a loopback address."""
+    """
+    Whether a Host header names this machine by localhost or a loopback address. Names under
+    .localhost, and names with a trailing dot, can be resolved through DNS, so they're refused.
+    """
     if host is None:
         return False
-    host = host.strip("[]").rstrip(".").lower()
-    return host == "localhost" or host.endswith(".localhost") or _is_loopback(host)
+    host = host.strip("[]").lower()
+    return host == "localhost" or _is_loopback(host)
 
 
 _CLIENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
@@ -305,8 +304,10 @@ def _client_id(body: dict[str, Any]) -> str | None:
     return client_id if isinstance(client_id, str) and _CLIENT_ID.fullmatch(client_id) else None
 
 
-def _send(event: str, data: dict[str, Any], client_id: str | None) -> None:
-    """Sends an event to its browser tab, or broadcasts tool requests without a websocket ID."""
+def _send(event: str, data: dict[str, Any], client_id: str) -> None:
+    """Sends an event to the browser tab that started it. It's never broadcast to every tab."""
+    if not isinstance(client_id, str) or not _CLIENT_ID.fullmatch(client_id):
+        raise ValueError("A Deadline Cloud event needs the client ID of its browser tab")
     PromptServer.instance.send_sync(event, data, client_id)
 
 
@@ -324,9 +325,35 @@ def _log_block(text: str) -> str:
     return text.rstrip().replace("\r\n", "\n").replace("\n", "\n    ").replace("\r", "\\r")
 
 
+# An ARN's account and resource, such as an assumed role's session name, which is often an email.
+_ARN = re.compile(r"\b(arn:aws[\w-]*:[\w-]*:[\w-]*:)\d{12}:[^\s\"',;]*")
+_ACCESS_KEY_ID = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
+
+
+def _redact_aws(text: str) -> str:
+    """
+    AWS error text without account IDs, ARNs or access key IDs. ComfyUI keeps its log in memory
+    and serves it from /internal/logs, which doesn't check the Host header, so a website that
+    points its domain at this machine could read the log. The browser tab still gets the full
+    error.
+    """
+    return _ACCESS_KEY_ID.sub("<access key ID>", _ARN.sub(r"\1<account>:<redacted>", text))
+
+
 # Headers that identify a forwarded request. A local proxy can connect from loopback on
-# behalf of other browsers.
-_FORWARDING_HEADERS = ("Forwarded", "X-Forwarded-For", "X-Real-IP")
+# behalf of other browsers. A proxy that adds none of them can't be told apart from a local
+# client, which is why the README says to reach ComfyUI through localhost only.
+_FORWARDING_HEADERS = (
+    "Forwarded",
+    "X-Forwarded-For",
+    "X-Forwarded-Host",
+    "X-Forwarded-Proto",
+    "X-Real-IP",
+    "Via",
+    "CF-Connecting-IP",
+    "True-Client-IP",
+    "X-Client-IP",
+)
 
 
 def _has_local_host(request: web.Request) -> bool:
@@ -797,12 +824,32 @@ def _parse_event(line: bytes) -> dict[str, Any] | None:
     return event if isinstance(event, dict) and isinstance(event.get("event"), str) else None
 
 
+async def _stop(process: asyncio.subprocess.Process) -> None:
+    """
+    Kills a child whose output can't be read any more, and waits for it. asyncio waits for the
+    pipes to close as well as the process to exit, so the unread rest of stdout is read too.
+    """
+    if process.returncode is None:
+        process.kill()
+    if process.stdout is not None:
+        try:
+            while await process.stdout.read(1 << 16):
+                pass
+        except (OSError, ValueError) as e:
+            logger.debug("Couldn't read the rest of a stopped process's output: %s", e)
+    await process.wait()
+
+
 def _bridge_failure(events: list[dict[str, Any]], stderr: bytes, returncode: int | None) -> str:
     for event in events:
         if event["event"] == "error":
             return str(event.get("message"))
     errors = stderr.decode(errors="replace").strip()
-    logger.error("The Deadline Cloud bridge exited with code %s:\n%s", returncode, errors)
+    logger.error(
+        "The Deadline Cloud bridge exited with code %s:\n    %s",
+        returncode,
+        _log_block(_redact_aws(errors)),
+    )
     last_line = next((line for line in reversed(errors.splitlines()) if line.strip()), "")
     return f"The Deadline Cloud library failed. {last_line.strip()}".strip()
 
@@ -1098,27 +1145,36 @@ async def _watch_submission(submission_id: str) -> None:
     # stdout, so reading stderr only after stdout ends would wait forever.
     stderr_task = asyncio.create_task(process.stderr.read())
     try:
-        async for line in process.stdout:
-            event = _parse_event(line)
-            if event is None:
-                continue
-            events.append(event)
-            kind = event["event"]
-            data = {key: value for key, value in event.items() if key != "event"}
-            if kind in ("progress", "message"):
-                _send(PROGRESS_EVENT, {**base, **data, "kind": kind}, submission.client_id)
-            elif kind == "confirm":
-                submission.confirms += 1
-                _send(CONFIRM_EVENT, {**base, **data}, submission.client_id)
-                submission.timers.append(
-                    asyncio.create_task(
-                        _decline_unanswered(submission_id, submission, submission.confirms)
+        try:
+            async for line in process.stdout:
+                event = _parse_event(line)
+                if event is None:
+                    continue
+                events.append(event)
+                kind = event["event"]
+                data = {key: value for key, value in event.items() if key != "event"}
+                if kind in ("progress", "message"):
+                    _send(PROGRESS_EVENT, {**base, **data, "kind": kind}, submission.client_id)
+                elif kind == "confirm":
+                    submission.confirms += 1
+                    _send(CONFIRM_EVENT, {**base, **data}, submission.client_id)
+                    submission.timers.append(
+                        asyncio.create_task(
+                            _decline_unanswered(submission_id, submission, submission.confirms)
+                        )
                     )
-                )
-            elif kind == "result":
-                result = event.get("data")
-        stderr = await stderr_task
-        await process.wait()
+                elif kind == "result":
+                    result = event.get("data")
+            stderr = await stderr_task
+            await process.wait()
+        except Exception as e:
+            # Any failure, such as a line over the limit, still stops the bridge and ends the
+            # panel's submission.
+            logger.exception("Couldn't read the submission of %s", _log_value(submission.name))
+            await _stop(process)
+            message = f"Couldn't read the Deadline Cloud library's output: {e}"
+            events.insert(0, {"event": "error", "message": message})
+            stderr = b""
     finally:
         stderr_task.cancel()
         for timer in submission.timers:
@@ -1146,7 +1202,7 @@ async def _watch_submission(submission_id: str) -> None:
         logger.error(
             "Couldn't submit %s to Deadline Cloud: %s",
             _log_value(submission.name),
-            _log_block(str(error)),
+            _log_block(_redact_aws(str(error))),
         )
         _send(SUBMITTED_EVENT, {**base, "status": "FAILED", "error": error}, submission.client_id)
 
@@ -1155,17 +1211,6 @@ def _output_dir(values: dict[str, Any]) -> str | None:
     """The OutputDir a job is submitted with. The CLI downloads the job's outputs there."""
     value = values.get("OutputDir")
     return str(value) if value else None
-
-
-def _download_directory(files: Any) -> str | None:
-    """The folder that holds every file the CLI downloaded, from its summary's list of files."""
-    if not isinstance(files, list) or not files or not all(isinstance(f, str) for f in files):
-        return None
-    try:
-        return os.path.commonpath([os.path.dirname(f) for f in files])
-    except ValueError:
-        # Files on different Windows drives have no folder in common.
-        return None
 
 
 async def _write_line(process: asyncio.subprocess.Process, data: dict[str, Any]) -> bool:
@@ -1283,15 +1328,6 @@ async def choose_paths(request: web.Request) -> web.Response:
     return web.json_response({"paths": [str(Path(path)) for path in paths if path]})
 
 
-def _cli_message(line: bytes) -> dict[str, Any] | None:
-    """A JSON line from the CLI's --output json."""
-    try:
-        message = json.loads(line)
-    except ValueError:
-        return None
-    return message if isinstance(message, dict) and "messageType" in message else None
-
-
 @PromptServer.instance.routes.post("/deadline/jobs/download")
 async def download_outputs(request: web.Request) -> web.Response:
     """Downloads a job's outputs in the background, to the paths the job was submitted with."""
@@ -1312,96 +1348,75 @@ async def download_outputs(request: web.Request) -> web.Response:
     cli = await _checked_cli(config)
     if isinstance(cli, web.Response):
         return cli
-    command = [
-        cli,
-        "job",
-        "download-output",
-        "--farm-id",
-        farm_id,
-        "--queue-id",
-        queue_id,
-        "--job-id",
-        job_id,
-        "--conflict-resolution",
-        "create_copy",
-        "--output",
-        "json",
-        "--yes",
-    ]
+    # The bridge downloads with the library, so it can check every file's destination against
+    # the job's Output Directory before writing any.
     try:
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            limit=DOWNLOAD_LINE_LIMIT,
-        )
-    except OSError as e:
-        return _error(500, f"Couldn't run the Deadline Cloud CLI: {e}")
+        process = await _bridge_process("download", cli)
+    except SubmitError as e:
+        return _error(500, str(e))
+    if not await _write_line(process, {"farmId": farm_id, "queueId": queue_id, "jobId": job_id}):
+        await _stop(process)
+        return _error(500, "The Deadline Cloud CLI's Python exited before it could download.")
     _start(_watch_download(process, job_id, client_id))
     return web.json_response({"jobId": job_id}, status=202)
 
 
 async def _watch_download(process: asyncio.subprocess.Process, job_id: str, client_id: str) -> None:
     assert process.stdout is not None and process.stderr is not None
-    summary = None
-    errors = []
+    events: list[dict[str, Any]] = []
+    result = None
     # Read stderr while reading stdout, as _watch_submission does.
     stderr_task = asyncio.create_task(process.stderr.read())
     try:
         async for line in process.stdout:
-            message = _cli_message(line)
-            if message is None:
+            event = _parse_event(line)
+            if event is None:
                 continue
-            kind = message["messageType"]
-            if kind == "progress":
+            events.append(event)
+            if event["event"] == "progress":
                 _send(
                     DOWNLOAD_EVENT,
-                    {"jobId": job_id, "status": "DOWNLOADING", "progress": message["value"]},
+                    {"jobId": job_id, "status": "DOWNLOADING", "progress": event.get("progress")},
                     client_id,
                 )
-            elif kind == "summary":
-                summary = message
-            elif kind == "error":
-                errors.append(str(message.get("value")))
+            elif event["event"] == "result":
+                result = event.get("data")
         stderr = await stderr_task
         await process.wait()
     except Exception as e:
         # Any failure, such as a line over the limit, still ends the panel's download.
         logger.exception("Couldn't read the download of %s", _log_value(job_id))
-        if process.returncode is None:
-            process.kill()
-        await process.wait()
+        await _stop(process)
         _send(
             DOWNLOAD_EVENT,
-            {"jobId": job_id, "status": "FAILED", "error": f"Couldn't read the CLI's output: {e}"},
+            {
+                "jobId": job_id,
+                "status": "FAILED",
+                "error": f"Couldn't read the Deadline Cloud library's output: {e}",
+            },
             client_id,
         )
         return
     finally:
         stderr_task.cancel()
-    if process.returncode == 0 and summary is not None:
+    if process.returncode == 0 and isinstance(result, dict):
         downloaded = {
             "jobId": job_id,
             "status": "DOWNLOADED",
-            "message": str(summary.get("value")),
-            "fileCount": summary.get("fileCount", 0),
+            "message": str(result.get("message", "")),
+            "fileCount": result.get("fileCount", 0),
         }
-        directory = _download_directory(summary.get("files"))
-        if directory:
-            downloaded["directory"] = directory
+        if isinstance(result.get("directory"), str):
+            downloaded["directory"] = result["directory"]
         _send(DOWNLOAD_EVENT, downloaded, client_id)
         return
-    text = stderr.decode(errors="replace")
+    error = _bridge_failure(events, stderr, process.returncode)
     logger.error(
-        "Couldn't download the outputs of %s:\n    %s", _log_value(job_id), _log_block(text)
+        "Couldn't download the outputs of %s:\n    %s",
+        _log_value(job_id),
+        _log_block(_redact_aws(error)),
     )
-    last_line = next((line for line in reversed(text.splitlines()) if line.strip()), "")
-    _send(
-        DOWNLOAD_EVENT,
-        {"jobId": job_id, "status": "FAILED", "error": (errors or [last_line.strip()])[-1]},
-        client_id,
-    )
+    _send(DOWNLOAD_EVENT, {"jobId": job_id, "status": "FAILED", "error": error}, client_id)
 
 
 # Deletes old bundles in the background, so ComfyUI's start doesn't wait on slow storage.

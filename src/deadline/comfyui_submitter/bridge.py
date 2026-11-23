@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import sys
 import time
 from collections.abc import Callable
@@ -275,6 +276,87 @@ def submit(request: dict[str, Any]) -> dict[str, Any]:
     return {"jobId": job_id, "farmId": request.get("farmId"), "queueId": request.get("queueId")}
 
 
+def _inside(directory: str, path: str) -> bool:
+    """Whether path is inside directory once links are resolved, compared as the OS compares."""
+    base = os.path.normcase(os.path.realpath(directory))
+    target = os.path.normcase(os.path.realpath(path))
+    try:
+        return target != base and os.path.commonpath([base, target]) == base
+    except ValueError:
+        # Paths on different Windows drives.
+        return False
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def download(request: dict[str, Any]) -> dict[str, Any]:
+    """
+    Downloads a job's outputs into the Output Directory it was submitted with, and nowhere else.
+    Output manifests come from the queue's job attachments, which every job on the queue can
+    write to, so the destination of every file is checked against the job's Output Directory
+    before any is written.
+    """
+    from deadline.client import api
+    from deadline.job_attachments.download import OutputDownloader
+    from deadline.job_attachments.models import FileConflictResolution, JobAttachmentS3Settings
+
+    farm_id, queue_id, job_id = (str(request[key]) for key in ("farmId", "queueId", "jobId"))
+    config = _config({})
+    deadline = api.get_boto3_client("deadline", config=config)
+    job = deadline.get_job(farmId=farm_id, queueId=queue_id, jobId=job_id)
+    # Set when the job is created. Workers can't change it.
+    output_dir = ((job.get("parameters") or {}).get("OutputDir") or {}).get("path")
+    if not isinstance(output_dir, str) or not os.path.isabs(output_dir):
+        raise RuntimeError("This job has no Output Directory on this machine to download into.")
+    queue = deadline.get_queue(farmId=farm_id, queueId=queue_id)
+    session = api.get_queue_user_boto3_session(
+        deadline=deadline,
+        config=config,
+        farm_id=farm_id,
+        queue_id=queue_id,
+        queue_display_name=queue["displayName"],
+    )
+    with contextlib.redirect_stdout(sys.stderr):
+        downloader = OutputDownloader(
+            s3_settings=JobAttachmentS3Settings(**queue["jobAttachmentSettings"]),
+            farm_id=farm_id,
+            queue_id=queue_id,
+            job_id=job_id,
+            session=session,
+        )
+    # download() writes the same plan that get_paths_by_root() lists.
+    planned = [
+        os.path.join(root, path)
+        for root, paths in downloader.get_paths_by_root().items()
+        for path in paths
+    ]
+    if not planned:
+        return {"fileCount": 0, "directory": output_dir, "message": "The job has no outputs yet."}
+    outside = [path for path in planned if not _inside(output_dir, path)]
+    if outside:
+        raise RuntimeError(
+            f"Nothing was downloaded: {_plural(len(outside), 'output file')} of {len(planned)} "
+            f"would be written outside the job's Output Directory {output_dir}, such as "
+            f"{outside[0][:300]!r}."
+        )
+    with contextlib.redirect_stdout(sys.stderr):
+        summary = downloader.download(
+            file_conflict_resolution=FileConflictResolution.CREATE_COPY,
+            on_downloading_files=_progress("downloading"),
+        )
+    downloaded = [str(path) for path in getattr(summary, "downloaded_files", [])]
+    if any(not _inside(output_dir, path) for path in downloaded):
+        raise RuntimeError(f"Some output files were written outside {output_dir}.")
+    count = len(downloaded) or int(getattr(summary, "processed_files", 0) or 0)
+    return {
+        "fileCount": count,
+        "directory": output_dir,
+        "message": f"Downloaded {_plural(count, 'file')}",
+    }
+
+
 COMMANDS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "status": status,
     "login": login,
@@ -284,6 +366,7 @@ COMMANDS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "set-defaults": set_defaults,
     "jobs": jobs,
     "submit": submit,
+    "download": download,
 }
 
 

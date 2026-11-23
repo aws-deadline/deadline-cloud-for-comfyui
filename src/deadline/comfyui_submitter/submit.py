@@ -471,7 +471,13 @@ def _host_amount(amount: Any) -> dict[str, Any]:
         value = amount.get(key)
         if value is None:
             continue
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        # JSON from the panel can hold NaN and Infinity, which OpenJD doesn't accept.
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
             raise SubmitError(f"The {key} of host requirement {name} must be a positive number.")
         result[key] = value
     if len(result) == 1:
