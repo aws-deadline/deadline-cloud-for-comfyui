@@ -2036,6 +2036,9 @@ def test_download_failures_log_the_error_indented(comfy, monkeypatch, caplog):
     ]
 
 
+# A made-up AWS error. 123456789012 is the example account ID from the AWS documentation, and
+# ASIAABCDEFGHIJKLMNOP is a fake access key ID: "ASIA" followed by the letters A to P. Neither
+# is real. They only check that logged errors leave out account IDs and access key IDs.
 ACCESS_DENIED = (
     "An error occurred (AccessDeniedException): User: "
     "arn:aws:sts::123456789012:assumed-role/Artist/artist@example.com is not authorized to "
