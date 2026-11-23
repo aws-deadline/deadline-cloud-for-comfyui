@@ -1,0 +1,66 @@
+<!-- Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved. -->
+<project>
+    <shortName>DeadlineCloudForComfyUISubmitter</shortName>
+    <fullName>AWS Deadline Cloud for ComfyUI Submitter</fullName>
+    <version>1.0</version>
+    <vendor>Amazon Web Services, Inc.</vendor>
+    <installerFilename>${product_shortname}-${platform_name}-installer.${platform_exec_suffix}</installerFilename>
+    <enableRollback>1</enableRollback>
+    <enableTimestamp>1</enableTimestamp>
+    <allowComponentSelection>1</allowComponentSelection>
+
+    <!-- Images and icons -->
+    <logoImage>logoImage.png</logoImage>
+    <leftImage>leftImage.png</leftImage>
+    <splashImage>splashImage.png</splashImage>
+    <osxApplicationBundleIcon>icon.icns</osxApplicationBundleIcon>
+    <osxUninstallerApplicationBundleIcon>icon.icns</osxUninstallerApplicationBundleIcon>
+    <windowsExecutableIcon>icon.ico</windowsExecutableIcon>
+    <windowsUninstallerExecutableIcon>icon.ico</windowsUninstallerExecutableIcon>
+
+    <!-- Allow Windows installer to run as regular user, since running as Admin is forced by default -->
+    <requireInstallationByRootUser>0</requireInstallationByRootUser>
+    <requestedExecutionLevel>asInvoker</requestedExecutionLevel>
+
+    <componentList>
+        <include>
+            <file>../install_builder/deadline-cloud-for-comfyui.xml</file>
+        </include>
+    </componentList>
+
+    <!-- Installer-wide parameters. These are displayed before component parameters -->
+    <parameterList>
+        <directoryParameter>
+            <name>installdir</name>
+            <description>Installer.Parameter.installdir.description</description>
+            <explanation>Installer.Parameter.installdir.explanation</explanation>
+            <value></value>
+            <default>${user_home_directory}/${product_shortname}</default>
+            <allowEmptyValue>0</allowEmptyValue>
+            <ask>yes</ask>
+            <cliOptionName>prefix</cliOptionName>
+            <mustBeWritable>yes</mustBeWritable>
+            <mustExist>0</mustExist>
+            <width>40</width>
+        </directoryParameter>
+    </parameterList>
+
+    <preInstallationActionList>
+        <componentSelection>
+            <select>deadline_cloud_for_comfyui</select>
+        </componentSelection>
+    </preInstallationActionList>
+    <postInstallationActionList>
+        <writeFile>
+            <progressText>Writing version file</progressText>
+            <path>${installdir}/installer_version.txt</path>
+            <text>${project.version}</text>
+        </writeFile>
+        <changePermissions permissions="0644" files="${installdir}/installer_version.txt"/>
+    </postInstallationActionList>
+
+    <preUninstallationActionList>
+        <deleteFile path="${installdir}/installer_version.txt"/>
+    </preUninstallationActionList>
+    <width>550</width>
+</project>

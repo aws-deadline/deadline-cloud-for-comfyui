@@ -1,0 +1,137 @@
+<!-- Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved. -->
+<component>
+    <name>deadline_cloud_for_comfyui</name>
+    <description>Deadline Cloud for ComfyUI</description>
+    <detailedDescription>ComfyUI extension for submitting workflows to AWS Deadline Cloud.</detailedDescription>
+    <canBeEdited>1</canBeEdited>
+    <selected>0</selected>
+    <show>1</show>
+    <folderList>
+        <folder>
+            <description>ComfyUI Deadline Cloud Extension</description>
+            <destination>${comfyui_submitter_installdir}</destination>
+            <name>comfyuiextension</name>
+            <platforms>all</platforms>
+            <distributionFileList>
+                <distributionFile>
+                    <origin>../__init__.py</origin>
+                </distributionFile>
+                <distributionFile>
+                    <origin>../LICENSE</origin>
+                </distributionFile>
+                <distributionFile>
+                    <origin>../NOTICE</origin>
+                </distributionFile>
+            </distributionFileList>
+        </folder>
+        <folder>
+            <description>Dependency Files</description>
+            <destination>${installdir}/tmp/comfyui_deps</destination>
+            <name>comfyuideps</name>
+            <platforms>all</platforms>
+            <distributionFileList>
+                <distributionDirectory allowWildcards="1">
+                    <origin>../dependency_bundle</origin>
+                </distributionDirectory>
+            </distributionFileList>
+        </folder>
+        <folder>
+            <description>ComfyUI submitter installation directory</description>
+            <destination>${comfyui_submitter_installdir}/src</destination>
+            <name>comfyui</name>
+            <platforms>all</platforms>
+            <distributionFileList>
+                <distributionDirectory allowWildcards="1">
+                    <origin>../src/*</origin>
+                    <filterEvaluationLogic>and</filterEvaluationLogic>
+                    <onPackingFilterList>
+                        <fileNameFilter pattern="*/deadline/comfyui_submitter/*" logic="matches" patternType="glob"/>
+                        <!-- Bytecode from the build checkout, such as from running the tests. -->
+                        <fileNameFilter pattern="*/__pycache__*" logic="does_not_match" patternType="glob"/>
+                    </onPackingFilterList>
+                </distributionDirectory>
+            </distributionFileList>
+        </folder>
+    </folderList>
+    <initializationActionList>
+        <setInstallerVariable name="all_components" value="${all_components} deadline_cloud_for_comfyui" />
+    </initializationActionList>
+    <parameterList>
+        <stringParameter name="deadline_cloud_for_comfyui_summary" ask="0" cliOptionShow="0">
+            <value>Deadline Cloud for ComfyUI
+- Installs the submitter extension into the custom_nodes folder of the selected ComfyUI folder
+- Installs the Deadline Cloud dependencies next to the extension. ComfyUI's Python runs them in a separate process.
+            </value>
+        </stringParameter>
+        <!-- ComfyUI loads extensions from the custom_nodes folder of its installation, so the
+        installer asks for that folder rather than discovering it like other integrations. -->
+        <directoryParameter>
+            <name>comfyui_directory</name>
+            <title>ComfyUI</title>
+            <description>ComfyUI folder</description>
+            <explanation>Choose the ComfyUI folder that contains main.py and custom_nodes.</explanation>
+            <value></value>
+            <default>${user_home_directory}/ComfyUI</default>
+            <allowEmptyValue>0</allowEmptyValue>
+            <ask>yes</ask>
+            <cliOptionName>comfyui-directory</cliOptionName>
+            <mustExist>1</mustExist>
+            <width>40</width>
+            <validationActionList>
+                <throwError text="Choose the ComfyUI folder that contains main.py and custom_nodes.">
+                    <ruleEvaluationLogic>or</ruleEvaluationLogic>
+                    <ruleList>
+                        <fileTest path="${comfyui_directory}/main.py" condition="not_exists"/>
+                        <fileTest path="${comfyui_directory}/custom_nodes" condition="is_directory" negate="1"/>
+                    </ruleList>
+                </throwError>
+                <!-- Uninstalling removes the whole extension folder, so don't take over one that
+                this installer didn't create, such as a clone of this repository. -->
+                <throwError text="${comfyui_directory}/custom_nodes/deadline-cloud-for-comfyui already exists and wasn't installed by this installer. Remove it, then run the installer again.">
+                    <ruleList>
+                        <fileTest path="${comfyui_directory}/custom_nodes/deadline-cloud-for-comfyui" condition="exists"/>
+                        <fileTest path="${comfyui_directory}/custom_nodes/deadline-cloud-for-comfyui/dependencies" condition="not_exists"/>
+                    </ruleList>
+                </throwError>
+            </validationActionList>
+        </directoryParameter>
+    </parameterList>
+    <readyToInstallActionList>
+        <!-- validationActionList doesn't run in unattended mode, so check the folder again. -->
+        <throwError text="Choose the ComfyUI folder that contains main.py and custom_nodes.">
+            <ruleEvaluationLogic>or</ruleEvaluationLogic>
+            <ruleList>
+                <fileTest path="${comfyui_directory}/main.py" condition="not_exists"/>
+                <fileTest path="${comfyui_directory}/custom_nodes" condition="is_directory" negate="1"/>
+            </ruleList>
+        </throwError>
+        <throwError text="${comfyui_directory}/custom_nodes/deadline-cloud-for-comfyui already exists and wasn't installed by this installer. Remove it, then run the installer again.">
+            <ruleList>
+                <fileTest path="${comfyui_directory}/custom_nodes/deadline-cloud-for-comfyui" condition="exists"/>
+                <fileTest path="${comfyui_directory}/custom_nodes/deadline-cloud-for-comfyui/dependencies" condition="not_exists"/>
+            </ruleList>
+        </throwError>
+        <setInstallerVariable name="comfyui_submitter_installdir" value="${comfyui_directory}/custom_nodes/deadline-cloud-for-comfyui"/>
+    </readyToInstallActionList>
+    <postInstallationActionList>
+        <!-- An upgrade replaces the dependencies rather than unpacking over the old versions. -->
+        <deleteFile>
+            <path>${comfyui_submitter_installdir}/dependencies</path>
+        </deleteFile>
+        <createDirectory>
+            <path>${comfyui_submitter_installdir}/dependencies</path>
+        </createDirectory>
+        <unzip>
+            <destinationDirectory>${comfyui_submitter_installdir}/dependencies</destinationDirectory>
+            <zipFile>${installdir}/tmp/comfyui_deps/dependency_bundle/deadline_cloud_for_comfyui_submitter-deps.zip</zipFile>
+        </unzip>
+        <deleteFile>
+            <path>${installdir}/tmp/comfyui_deps</path>
+        </deleteFile>
+        <!-- The extension folder is outside the installation directory. Uninstalling removes it,
+        including the dependencies and the files ComfyUI writes there. -->
+        <addFilesToUninstaller>
+          <files>${comfyui_submitter_installdir}/</files>
+        </addFilesToUninstaller>
+    </postInstallationActionList>
+</component>
