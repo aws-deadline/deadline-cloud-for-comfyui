@@ -50,9 +50,16 @@ CLI_ENV_DIR_NAME = ".deadline-cli"
 CLI_REQUIREMENT = "deadline[gui,console]>={},<0.61".format(".".join(map(str, MIN_CLI_VERSION)))
 BOTO3_REQUIREMENT = "boto3>={}".format(".".join(map(str, MIN_BOTOCORE_VERSION)))
 
-COPY_IGNORE = shutil.ignore_patterns(
+_IGNORE_PATTERNS = shutil.ignore_patterns(
     ".git",
     ".github",
+    # Local settings and credentials that a checkout can hold.
+    ".env",
+    ".env.*",
+    ".aws",
+    ".claude",
+    ".idea",
+    ".vscode",
     ".venv",
     "venv",
     "build",
@@ -70,6 +77,16 @@ COPY_IGNORE = shutil.ignore_patterns(
     CLI_ENV_DIR_NAME,
     CONFIG_FILE_NAME,
 )
+
+
+def COPY_IGNORE(directory: str, names: list[str]) -> set[str]:
+    """
+    What the installer doesn't copy into custom_nodes: the patterns above, and links, which can
+    point anywhere, such as at a models folder or ~/.ssh, and would be copied with their targets.
+    """
+    ignored = set(_IGNORE_PATTERNS(directory, names))
+    ignored.update(name for name in names if os.path.islink(os.path.join(directory, name)))
+    return ignored
 
 
 FRONTEND_DIR = Path("frontend")

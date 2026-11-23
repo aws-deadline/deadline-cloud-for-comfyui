@@ -169,6 +169,9 @@ jobs:
         run: python -m pip install -r requirements-development.txt
 
       - name: Run panel tests
+        env:
+          # Fail instead of skipping the panel tests when the build tools can't be found.
+          COMFYUI_DEADLINE_REQUIRE_PANEL_TESTS: "1"
         run: hatch run test test/unit/deadline_submitter_for_comfyui/test_panel.py
 
   Check:

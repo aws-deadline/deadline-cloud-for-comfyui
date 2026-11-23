@@ -73,6 +73,15 @@ def test_copyright_headers():
                         failed_files.add(e.filepath)
                 file_count += 1
 
+    # The installer and the extension's entry point sit at the root.
+    for path in root_project_dir.glob("*.py"):
+        print(path)
+        try:
+            _check_file(path)
+        except FileMissingCopyRight as e:
+            failed_files.add(e.filepath)
+        file_count += 1
+
     if failed_files:
         formatted_failed_files = "\n\t".join(str(filepath) for filepath in failed_files)
         raise AssertionError(

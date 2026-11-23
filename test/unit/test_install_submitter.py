@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -60,6 +61,29 @@ def test_install_extension_copies_runtime_files(comfyui):
     assert (dest / "src/deadline/comfyui_submitter/comfy_cli_job_template.yaml").is_file()
     for skipped in (".git", "test", "build", "frontend", install.CLI_ENV_DIR_NAME):
         assert not (dest / skipped).exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Creating links needs privileges on Windows.")
+def test_install_extension_leaves_out_local_credentials_and_links(comfyui, tmp_path):
+    checkout = tmp_path / "checkout"
+    shutil.copytree(REPO_ROOT / "src", checkout / "src")
+    shutil.copy(REPO_ROOT / "__init__.py", checkout / "__init__.py")
+    (checkout / ".env").write_text("SECRET=1")
+    (checkout / ".env.local").write_text("SECRET=1")
+    (checkout / ".aws").mkdir()
+    (checkout / ".aws" / "credentials").write_text("[default]")
+    (checkout / ".claude").mkdir()
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "id_ed25519").write_text("key")
+    (checkout / "keys").symlink_to(private, target_is_directory=True)
+    (checkout / "src" / "key.txt").symlink_to(private / "id_ed25519")
+
+    dest = install.install_extension(checkout, install.find_custom_nodes(comfyui))
+
+    assert (dest / "src/deadline/comfyui_submitter/comfy_cli_job_template.yaml").is_file()
+    for skipped in (".env", ".env.local", ".aws", ".claude", "keys", "src/key.txt"):
+        assert not (dest / skipped).exists() and not (dest / skipped).is_symlink()
 
 
 def test_install_extension_update_keeps_cli_env_and_config(comfyui):
