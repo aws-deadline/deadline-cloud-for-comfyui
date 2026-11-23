@@ -112,6 +112,14 @@
             </ruleList>
         </throwError>
         <setInstallerVariable name="comfyui_submitter_installdir" value="${comfyui_directory}/custom_nodes/deadline-cloud-for-comfyui"/>
+        <!-- An upgrade replaces the submitter rather than unpacking over it. ComfyUI loads every
+        .js file in the web folder, so one that a newer version renamed would load twice. -->
+        <deleteFile>
+            <path>${comfyui_submitter_installdir}/src</path>
+            <ruleList>
+                <fileTest path="${comfyui_submitter_installdir}/dependencies" condition="exists"/>
+            </ruleList>
+        </deleteFile>
     </readyToInstallActionList>
     <postInstallationActionList>
         <!-- An upgrade replaces the dependencies rather than unpacking over the old versions. -->

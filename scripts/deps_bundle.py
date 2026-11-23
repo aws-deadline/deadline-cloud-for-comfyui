@@ -9,7 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from _project import Dependency, get_dependencies, get_project_dict
+from _project import Dependency, get_dependencies, get_git_root, get_project_dict
 
 # The Pythons ComfyUI runs on that the bundle carries compiled artifacts for.
 SUPPORTED_PYTHON_VERSIONS = ["3.13", "3.14"]
@@ -160,7 +160,8 @@ def _zip_bundle(base_env: Path, zip_path: Path) -> None:
 
 
 def _copy_zip_to_destination(zip_path: Path) -> Path:
-    dependency_bundle_dir = Path.cwd() / "dependency_bundle"
+    # Where install_builder/deadline-cloud-for-comfyui.xml packs it from, whatever the current folder.
+    dependency_bundle_dir = get_git_root() / "dependency_bundle"
     dependency_bundle_dir.mkdir(exist_ok=True)
     zip_destination = dependency_bundle_dir / zip_path.name
     if zip_destination.exists():

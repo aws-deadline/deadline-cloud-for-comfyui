@@ -130,20 +130,24 @@ def _validate_files(installation: Installation) -> None:
     # The panel is a web page, so the bundle doesn't need Qt.
     assert "PySide6" not in dependency_names
 
-    # xxhash and pyyaml ship a version-specific compiled extension per supported version, and a
-    # missing one is a silent failure: pyyaml falls back to its pure-Python parser, and a
-    # missing xxhash artifact only surfaces as an ImportError under that Python. So check every
-    # supported version by name.
-    for package, module in (("xxhash", "_xxhash"), ("yaml", "_yaml")):
-        artifact_names = {f.name for f in (dependencies / package).glob("*")}
-        for version in SUPPORTED_PYTHON_VERSIONS:
-            tag = version.replace(".", "")
-            # POSIX wheels name the module cpython-<tag>-<platform>.so; Windows wheels name
-            # it cp<tag>-<platform>.pyd -- CPython does not use the "cpython-" spelling there.
-            prefixes = (f"{module}.cpython-{tag}-", f"{module}.cp{tag}-")
-            assert any(
-                name.startswith(prefixes) for name in artifact_names
-            ), f"the bundle carries no compiled {module} artifact for Python {version}"
+    # A compiled module built for one Python version only imports under that version, and
+    # pyyaml hides a missing one by falling back to its pure-Python parser. So every module named
+    # for a version must be there for each supported version. That includes compiled packages
+    # that deps_bundle.py's NATIVE_DEPENDENCIES doesn't list yet. POSIX wheels name the module
+    # <module>.cpython-<tag>-<platform>.so, and Windows wheels <module>.cp<tag>-<platform>.pyd.
+    version_tagged = re.compile(r"(?P<module>[^.]+)\.(?:cpython-|cp)(?P<tag>3\d+)-")
+    tags: defaultdict[str, set[str]] = defaultdict(set)
+    for path in dependencies.rglob("*"):
+        if match := version_tagged.match(path.name):
+            module = (path.parent / match["module"]).relative_to(dependencies).as_posix()
+            tags[module].add(match["tag"])
+    # xxhash and pyyaml ship these today, so the check has something to check.
+    assert {"xxhash/_xxhash", "yaml/_yaml"} <= tags.keys()
+    expected = {version.replace(".", "") for version in SUPPORTED_PYTHON_VERSIONS}
+    missing = {
+        module: sorted(expected - found) for module, found in tags.items() if expected - found
+    }
+    assert not missing, f"compiled modules missing for some supported Pythons: {missing}"
 
 
 @pytest.fixture(scope="session")
