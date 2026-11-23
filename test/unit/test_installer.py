@@ -136,6 +136,53 @@ def test_uninstall_preserves_settings_modified_files_and_other_nodes(setup):
     assert hooks.uninstall(state) == []
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Directory junctions require Windows")
+def test_uninstall_does_not_enter_customer_directory_junction(setup, tmp_path):
+    import subprocess
+
+    comfy, payload, runtime, state = setup
+    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    outside = tmp_path / "Customer directory outside integration"
+    empty = outside / "Customer empty folder" / "Nested empty folder"
+    empty.mkdir(parents=True)
+    sentinel = outside / "customer.txt"
+    sentinel.write_text("keep customer files", encoding="utf-8")
+    junction = destination / "Customer linked folder"
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            (
+                "$ErrorActionPreference='Stop'; New-Item -ItemType Junction "
+                "-Path $env:COMFYUI_TEST_JUNCTION_PATH "
+                "-Target $env:COMFYUI_TEST_JUNCTION_TARGET | Out-Null"
+            ),
+        ],
+        env={
+            **os.environ,
+            "COMFYUI_TEST_JUNCTION_PATH": str(junction),
+            "COMFYUI_TEST_JUNCTION_TARGET": str(outside),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert junction.is_junction()
+    try:
+        assert hooks.uninstall(state) == []
+        assert empty.is_dir()
+        assert sentinel.read_text(encoding="utf-8") == "keep customer files"
+        assert junction.is_junction()
+        assert hooks.uninstalled_receipt(destination)
+        assert not state.exists()
+    finally:
+        junction.rmdir()
+
+
 def test_uninstall_rejects_traversal_before_deleting_anything(setup):
     comfy, payload, runtime, state = setup
     destination = hooks.install(payload, runtime, comfy, state, "1.0")

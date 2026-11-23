@@ -295,7 +295,7 @@ def test_transitive_dependency_without_a_complete_hash_lock_is_rejected(
     "complete_lock", [False, True], ids=["missing-child-hash", "complete-lock"]
 )
 def test_windows_target_wheel_closure_is_hash_verified_offline(
-    tmp_path: Path, python_version: str, complete_lock: bool
+    tmp_path: Path, isolated_runtime: Path, python_version: str, complete_lock: bool
 ) -> None:
     wheels = tmp_path / "Windows wheels with spaces"
     wheels.mkdir()
@@ -323,7 +323,7 @@ def test_windows_target_wheel_closure_is_hash_verified_offline(
     }
     result = subprocess.run(
         [
-            sys.executable,
+            str(isolated_runtime),
             "-I",
             "-m",
             "pip",

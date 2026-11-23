@@ -31,7 +31,6 @@ npm ci
 | `scripts/build_installer.py` | Allowlisted payload staging and native installer build. |
 | `scripts/build_installer_cli.py` | Build CLI following the other Deadline integrations' options. |
 | `scripts/deps_bundle.py` | Hash-locked SDK dependency ZIP for the selected Python/platform. |
-| `scripts/provision_installer_tools.py` | Hash-verified evaluation tooling for native CI; separate from production provisioning. |
 | `pipeline/build_installer.sh`, `pipeline/build_installer.ps1` | macOS and Windows build entrypoints for release automation. |
 | `pipeline/test_installer.sh`, `pipeline/test_installer.ps1` | Native installer test entrypoints for release automation. |
 | `test/installer/` | Tests that execute built macOS and Windows installers in disposable host folders. |
@@ -166,6 +165,30 @@ An optional `--wheelhouse PATH` resolves dependencies from local wheels with `--
 otherwise the build machine needs package-index access. Customers never download packages
 as part of installation.
 
+### Local Windows validation
+
+On a Windows x64 build/test machine, install the developer prerequisites above and supply
+trusted portable CPython plus InstallBuilder. From this checkout, run:
+
+```powershell
+$payload = Join-Path $env:TEMP ('comfyui-installer-payload-' + [guid]::NewGuid().ToString('N'))
+hatch run installer:build-installer `
+  --platform Windows `
+  --python-runtime 'C:\Build Tools\Portable Python' `
+  --install-builder-path 'C:\Build Tools\InstallBuilder' `
+  --payload-dir $payload `
+  --local-dev
+if ($LASTEXITCODE -ne 0) { throw 'Installer build failed.' }
+$env:COMFYUI_INSTALLER_PATH = (Resolve-Path 'dist\installers\DeadlineCloudForComfyUISubmitter-windows-x64-installer.exe').Path
+hatch run test-installer -x --tb=short
+if ($LASTEXITCODE -ne 0) { throw 'Native installer tests failed.' }
+```
+
+The native tests install into disposable synthetic host folders and exercise upgrade and
+uninstall. After they pass, quit a real ComfyUI instance and open the built `.exe` to check
+the wizard, restart ComfyUI, and verify the panel. These are build/test prerequisites;
+customers running a completed installer need none of these developer tools.
+
 ### Updating the installer dependency lock
 
 `requirements-installer.in` contains the direct SDK/runtime versions. The generated
@@ -295,9 +318,9 @@ cover rollback and ownership edge cases, but do not validate operating-system di
 Deadline Cloud submission. A real submission still requires your own configured farm, queue,
 worker environment, and ComfyUI installation.
 
-`.github/workflows/installer_ci.yml` builds evaluation installers and runs the actual native
-suite on Windows x64 and macOS ARM for pull requests. Its pinned, hash-verified tools are
-provided by `scripts/provision_installer_tools.py`; the workflow uses no release credentials.
+Native installer tests run locally on the corresponding operating system; no additional
+native-installer GitHub Actions workflow is configured. The existing Python and frontend
+CI continues to run for pull requests.
 `.github/workflows/installer_xml_check.yml` uses the organization's shared XML change advisory.
 `.github/workflows/build_installers.yml` invokes the same shared AWS installer build workflow
 as Cinema 4D for MacOS and Windows, with repository-scoped OIDC and protected environments.

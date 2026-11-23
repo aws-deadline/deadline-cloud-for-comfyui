@@ -648,9 +648,18 @@ def uninstall(state: Path) -> list[str]:
             except InstallError:
                 preserved.append(CONFIG_NAME)
     if destination.exists():
-        for directory in sorted(
-            destination.rglob("*"), key=lambda item: len(item.parts), reverse=True
-        ):
+        directories = []
+        for parent, children, _ in os.walk(destination, topdown=True, followlinks=False):
+            current = Path(parent)
+            if linked_path(current):
+                children.clear()
+                continue
+            # Junctions can be reported as directories even with followlinks=False.
+            # Prune all linked children before the walk can reach customer files.
+            children[:] = [name for name in children if not linked_path(current / name)]
+            if current != destination:
+                directories.append(current)
+        for directory in reversed(directories):
             if directory.is_dir() and not linked_path(directory):
                 try:
                     directory.rmdir()

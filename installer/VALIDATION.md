@@ -14,13 +14,14 @@ Python 3.13.5. The default artifacts are:
 | Check | Result |
 |---|---|
 | `hatch run lint` | Passed: Ruff, Black, and mypy. |
-| `hatch run test` | 732 passed, 2 Windows-only tests skipped on the local Mac. |
+| `hatch run test` | 732 passed, 3 Windows-only tests skipped on the local Mac. |
 | `hatch build` | Source distribution and wheel built successfully. |
 | Fresh native macOS installer build | Passed with a new payload and freshly compiled TypeScript. |
 | `hatch run test-installer` on macOS | 15 passed; 3 production/platform checks skipped. |
+| Windows executable build | Passed in the initial run; native installation tests reported errors before cancellation. Local Windows reproduction is required. |
 | SDK wheel hashes and dependency closure | Passed: Python 3.13/3.14, macOS ARM (20 wheels each) and Windows x64 (22 wheels each). |
 | Native tool downloads | Actual Python and InstallBuilder release bytes verified against pinned hashes for both platforms. |
-| actionlint and the shared zizmor policy | Passed for all four installer workflows. |
+| actionlint and the shared zizmor policy | Passed for the three shared installer workflows. |
 
 The SDK is packaged in a separate dependency ZIP, following Cinema 4D's bundling layout.
 The packed portable runtime contains only build tooling; its early validation bootstrap is
@@ -28,9 +29,10 @@ SDK-free. The archive records ordinary files with 0644/0755 modes and explicit p
 directories with 0755 modes. A disposable extracted runtime is tested for TLS, SDK/Qt imports,
 relocation, and regenerated Deadline CLI launchers before the installer is built.
 
-`Installer CI` builds the actual evaluation installer and runs `hatch run test-installer`
-on Windows x64 and macOS ARM. Consult the PR's native checks for the exact current results;
-Windows native execution is performed on the Windows runner, not emulated on the local Mac.
+The native suite is run locally against an installer built on the corresponding operating
+system. Windows native installation validation remains incomplete: the initial canceled run showed
+installation errors. Reproduce the first failure locally with `hatch run test-installer -x
+--tb=short` on Windows x64; Windows is not emulated on the local Mac. No additional native-installer CI workflow is configured.
 The suite checks source and portable-parent selection, separate active custom nodes,
 spaced paths, packaged dependencies, permissions, install/upgrade/uninstall/reinstall,
 preserved settings and additions, and rejection of invalid or linked destinations.
