@@ -107,6 +107,9 @@ for macOS and x64 for Windows.
 The build compiles the panel and resolves the SDK wheels from the `installer`
 dependency group in `pyproject.toml` for each supported Python version. Like Cinema 4D,
 it bundles the SDK in `dependency_bundle/deadline_cloud_for_comfyui_submitter-deps.zip`.
+On macOS, the SDK uses a single directory with both versions of the native modules.
+On Windows, it uses separate directories because pywin32 reuses filenames across
+Python versions.
 The installer uses ComfyUI's Python to validate the selected folder and
 installation prefix. InstallBuilder then extracts the SDK, and the helper checks
 the corresponding native wheels before replacing the extension. The panel loads the

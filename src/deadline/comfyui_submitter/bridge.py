@@ -301,7 +301,9 @@ def main(argv: list[str]) -> int:
         return 2
     try:
         if sdk is not None:
-            packages = sdk / f"{sys.version_info.major}.{sys.version_info.minor}"
+            packages = sdk
+            if sys.platform == "win32":
+                packages = sdk / f"{sys.version_info.major}.{sys.version_info.minor}"
             if not packages.is_dir():
                 raise RuntimeError(
                     f"The Deadline Cloud SDK is missing for Python {sys.version_info.major}."
@@ -310,7 +312,8 @@ def main(argv: list[str]) -> int:
                 )
             # Apply only the bundled .pth files, including pywin32's DLL setup on Windows.
             site.addsitedir(str(packages))
-            site.addsitedir(str(sdk / "common"))
+            if sys.platform == "win32":
+                site.addsitedir(str(sdk / "common"))
         request = json.loads(sys.stdin.readline() or "{}")
         if not isinstance(request, dict):
             raise TypeError("The request isn't a JSON object.")

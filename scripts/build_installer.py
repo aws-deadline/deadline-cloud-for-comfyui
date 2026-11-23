@@ -161,6 +161,23 @@ def share_sdk_packages(sdk: Path) -> None:
             shutil.rmtree(second / name)
 
 
+def merge_sdk_packages(base: Path, alternate: Path) -> None:
+    """Put both macOS Python versions' tagged native modules in one SDK directory."""
+    for source in alternate.rglob("*"):
+        if not source.is_file():
+            continue
+        relative = source.relative_to(alternate)
+        destination = base / relative
+        if not destination.exists():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+        elif relative.parent.suffix == ".dist-info" and source.name in ("RECORD", "WHEEL"):
+            # The wheel tag and list of installed files differ for each native wheel.
+            continue
+        elif not filecmp.cmp(source, destination, shallow=False):
+            raise ValueError(f"The SDK wheels contain conflicting files at {relative}.")
+
+
 def validate_architecture(info: dict[str, Any], target: str) -> None:
     if target not in PLATFORMS:
         raise ValueError("Installer builds support macOS and Windows only.")
@@ -207,9 +224,15 @@ def stage_payload(output: Path, target: str, wheelhouse: Path | None) -> Path:
                 # The GUI installer reuses the already-installed standalone CLI.
                 shutil.rmtree(packages / "bin", ignore_errors=True)
                 shutil.rmtree(packages / "Scripts", ignore_errors=True)
-            attribution(extension, [dependencies / version for version in PYTHON_VERSIONS])
-            share_sdk_packages(dependencies)
-            create_dependency_bundle(dependencies, temporary / BUNDLE_RELATIVE)
+            package_dirs = [dependencies / version for version in PYTHON_VERSIONS]
+            attribution(extension, package_dirs)
+            if target == "Windows":
+                share_sdk_packages(dependencies)
+                archive_root = dependencies
+            else:
+                archive_root, alternate = package_dirs
+                merge_sdk_packages(archive_root, alternate)
+            create_dependency_bundle(archive_root, temporary / BUNDLE_RELATIVE)
         metadata = {
             **info,
             "platform": target,
@@ -251,10 +274,13 @@ def verify_payload(payload: Path, target: str) -> None:
     ) as directory:
         dependencies = Path(directory)
         extract_dependency_bundle(payload / BUNDLE_RELATIVE, dependencies)
-        if any(
-            not (dependencies / version / "deadline/client").is_dir() for version in PYTHON_VERSIONS
-        ):
-            raise ValueError("The SDK archive is missing a supported Python version.")
+        package_dirs = (
+            [dependencies / version for version in PYTHON_VERSIONS]
+            if target == "Windows"
+            else [dependencies]
+        )
+        if any(not (packages / "deadline/client").is_dir() for packages in package_dirs):
+            raise ValueError("Stage a fresh payload. The archive is missing the Deadline SDK.")
         hooks.verify_sdk(dependencies)
     hooks.payload_files(payload / "extension")
 

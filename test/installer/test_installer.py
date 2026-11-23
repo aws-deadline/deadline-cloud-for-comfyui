@@ -302,33 +302,36 @@ def test_installed_files_and_dependencies(user_installation: Layout) -> None:
     assert {"deadline", "boto3", "botocore", "pyside6-essentials", "awscrt"} <= names
     configuration = json.loads((layout.extension / CONFIG).read_text(encoding="utf-8"))
     assert configuration == {"deadline_sdk": str(layout.sdk)}
-    assert all((layout.sdk / version / "deadline/client").is_dir() for version in ("3.13", "3.14"))
+    sdk_paths = [layout.sdk]
+    if sys.platform == "win32":
+        assert all(
+            (layout.sdk / version / "deadline/client").is_dir() for version in ("3.13", "3.14")
+        )
+        sdk_paths = [layout.sdk / f"{sys.version_info.major}.{sys.version_info.minor}"]
+        sdk_paths.append(layout.sdk / "common")
+    else:
+        assert (layout.sdk / "deadline/client").is_dir()
+        assert all(not (layout.sdk / version).exists() for version in ("3.13", "3.14"))
     code = (
-        "import json,sys,ssl,site,importlib.util; "
-        "assert not any('site-packages' in path for path in sys.path); "
-        "site.addsitedir(sys.argv[1]); "
-        "site.addsitedir(sys.argv[2]); "
+        "import json,sys,ssl,site,importlib.util\n"
+        "assert not any('site-packages' in path for path in sys.path)\n"
+        "for directory in sys.argv[1:]: site.addsitedir(directory)\n"
         "import deadline.client,boto3,botocore,awscrt; "
         "import psutil,yaml,xxhash,qtpy; from yaml import _yaml; "
         "from PySide6 import QtCore,QtWidgets; "
         "modules=('deadline.client','boto3','botocore','awscrt','PySide6.QtCore',"
-        "'shiboken6','psutil','yaml','xxhash','qtpy'); "
+        "'shiboken6','psutil','yaml._yaml','xxhash._xxhash','qtpy'); "
         "assert xxhash.xxh128(b'Deadline').hexdigest(); "
         "print(json.dumps({'version':list(sys.version_info[:2]),"
         "'tls':bool(ssl.create_default_context().get_ca_certs()),"
         "'modules':{name:importlib.util.find_spec(name).origin for name in modules}}))"
     )
-    site_packages = layout.sdk / f"{sys.version_info.major}.{sys.version_info.minor}"
-    common = layout.sdk / "common"
-    result = run_program(
-        layout.python, ["-IBS", "-c", code, str(site_packages), str(common)], layout=layout
-    )
+    result = run_program(layout.python, ["-IBS", "-c", code, *map(str, sdk_paths)], layout=layout)
     assert_success(result)
     details = json.loads(result.stdout)
     assert details["version"] in ([3, 13], [3, 14]) and details["tls"]
     assert all(
-        Path(path).resolve().is_relative_to(site_packages)
-        or Path(path).resolve().is_relative_to(common)
+        any(Path(path).resolve().is_relative_to(directory) for directory in sdk_paths)
         for path in details["modules"].values()
     ), details
     if sys.platform == "win32":
@@ -340,7 +343,7 @@ def test_installed_files_and_dependencies(user_installation: Layout) -> None:
                     "-IBS",
                     "-c",
                     "import site,sys; site.addsitedir(sys.argv[1]); import colorama,win32api",
-                    str(site_packages),
+                    str(sdk_paths[0]),
                 ],
                 layout=layout,
             )

@@ -173,15 +173,17 @@ def validate_python() -> None:
 def verify_sdk(sdk: Path) -> None:
     """Check the SDK selected by the host interpreter in a fresh Python process."""
     validate_python()
-    packages = sdk / f"{sys.version_info.major}.{sys.version_info.minor}"
+    package_dirs = [sdk]
+    if os.name == "nt":
+        package_dirs = [sdk / f"{sys.version_info.major}.{sys.version_info.minor}", sdk / "common"]
     code = """
 import importlib.metadata as metadata
 import os
 import site
 import ssl
 import sys
-site.addsitedir(sys.argv[1])
-site.addsitedir(sys.argv[2])
+for directory in sys.argv[1:]:
+    site.addsitedir(directory)
 import awscrt
 import boto3
 import deadline.client.api
@@ -195,7 +197,7 @@ xxhash.xxh128(b"Deadline")
 print(metadata.version("deadline"), metadata.version("botocore"))
 """
     result = subprocess.run(
-        [sys.executable, "-IBS", "-c", code, str(packages), str(sdk / "common")],
+        [sys.executable, "-IBS", "-c", code, *map(str, package_dirs)],
         capture_output=True,
         text=True,
         check=False,

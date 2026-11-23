@@ -127,6 +127,35 @@ def test_sdk_bundle_round_trip_is_deterministic_and_excludes_bytecode(tmp_path):
     assert not (installed / "sdk/__pycache__").exists()
 
 
+def test_merge_sdk_packages_keeps_both_tagged_native_modules(tmp_path):
+    base = tmp_path / "3.13"
+    alternate = tmp_path / "3.14"
+    for packages, abi in [(base, "313"), (alternate, "314")]:
+        (packages / "xxhash").mkdir(parents=True)
+        (packages / "xxhash/__init__.py").write_text("from ._xxhash import xxh128\n")
+        (packages / f"xxhash/_xxhash.cpython-{abi}-darwin.so").write_bytes(abi.encode())
+        (packages / "xxhash-1.0.dist-info").mkdir()
+        (packages / "xxhash-1.0.dist-info/WHEEL").write_text(f"Tag: cp{abi}\n")
+
+    builder.merge_sdk_packages(base, alternate)
+
+    assert (base / "xxhash/_xxhash.cpython-313-darwin.so").read_bytes() == b"313"
+    assert (base / "xxhash/_xxhash.cpython-314-darwin.so").read_bytes() == b"314"
+
+
+def test_merge_sdk_packages_rejects_conflicting_code(tmp_path):
+    base = tmp_path / "3.13"
+    alternate = tmp_path / "3.14"
+    base.mkdir()
+    alternate.mkdir()
+    (base / "_native.abi3.so").write_bytes(b"base")
+    (alternate / "_native.abi3.so").write_bytes(b"alternate")
+
+    with pytest.raises(ValueError, match=r"conflicting files at _native\.abi3\.so"):
+        builder.merge_sdk_packages(base, alternate)
+    assert (base / "_native.abi3.so").read_bytes() == b"base"
+
+
 @pytest.mark.parametrize(
     "name", ["../outside", "/outside", "C:/outside", "C:outside", "sdk\\outside"]
 )

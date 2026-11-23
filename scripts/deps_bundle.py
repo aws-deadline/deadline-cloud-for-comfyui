@@ -14,7 +14,7 @@ BUNDLE_RELATIVE = "dependency_bundle/" + BUNDLE_FILENAME
 
 
 def create_dependency_bundle(site_packages: Path, archive: Path) -> Path:
-    """Archive installed, hash-verified wheels with stable names, timestamps and permissions."""
+    """Archive installed wheels with stable names, timestamps and permissions."""
     source = site_packages.resolve()
     if not source.is_dir():
         raise ValueError(f"The SDK site-packages directory does not exist: {source}")
