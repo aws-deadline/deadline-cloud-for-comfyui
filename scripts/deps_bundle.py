@@ -68,23 +68,25 @@ def extract_dependency_bundle(archive: Path, site_packages: Path) -> None:
     names: set[str] = set()
     with zipfile.ZipFile(archive) as source:
         for info in source.infolist():
-            relative = PurePosixPath(info.filename)
+            # ZipInfo normalizes Windows separators; validate the original archive name.
+            name = info.orig_filename
+            relative = PurePosixPath(name)
             if (
-                not info.filename
-                or "\\" in info.filename
-                or ":" in info.filename
+                not name
+                or "\\" in name
+                or ":" in name
                 or relative.is_absolute()
                 or ".." in relative.parts
-                or info.filename in names
+                or name in names
             ):
-                raise ValueError(f"The dependency archive contains an unsafe path: {info.filename}")
-            names.add(info.filename)
+                raise ValueError(f"The dependency archive contains an unsafe path: {name}")
+            names.add(name)
             mode = info.external_attr >> 16
             if stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR):
-                raise ValueError(f"The dependency archive contains a special file: {info.filename}")
+                raise ValueError(f"The dependency archive contains a special file: {name}")
             destination = root.joinpath(*relative.parts)
             if not destination.resolve().is_relative_to(root):
-                raise ValueError(f"The dependency archive leaves site-packages: {info.filename}")
+                raise ValueError(f"The dependency archive leaves site-packages: {name}")
             if info.is_dir():
                 destination.mkdir(parents=True, exist_ok=True)
                 if mode & 0o777:

@@ -61,7 +61,7 @@ def extract_builder_archive(archive: Path, destination: Path) -> None:
     if zipfile.is_zipfile(archive):
         with zipfile.ZipFile(archive) as source:
             for info in source.infolist():
-                path = _archive_path(info.filename)
+                path = _archive_path(info.orig_filename)
                 mode = info.external_attr >> 16
                 if stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR):
                     raise ValueError(

@@ -466,7 +466,10 @@ def test_dependency_bundle_rejects_paths_outside_platform_site_packages(
 ) -> None:
     archive = tmp_path / "Untrusted SDK.zip"
     with zipfile.ZipFile(archive, "w") as bundle:
-        bundle.writestr(unsafe, "synthetic unsafe entry")
+        entry = zipfile.ZipInfo("placeholder")
+        # Preserve malformed separators; Windows normalizes strings in ZipInfo.__init__.
+        entry.filename = unsafe
+        bundle.writestr(entry, "synthetic unsafe entry")
     customer = tmp_path / "customer.txt"
     customer.write_text("keep unrelated file", encoding="utf-8")
     destination = tmp_path / "site-packages"

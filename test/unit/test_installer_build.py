@@ -143,7 +143,10 @@ def test_sdk_bundle_round_trip_is_deterministic_and_excludes_bytecode(tmp_path):
 def test_sdk_and_tool_archives_reject_unsafe_paths(tmp_path, name):
     archive = tmp_path / "unsafe.zip"
     with zipfile.ZipFile(archive, "w") as output:
-        output.writestr(name, "untrusted")
+        entry = zipfile.ZipInfo("placeholder")
+        # Preserve malformed separators; Windows normalizes strings in ZipInfo.__init__.
+        entry.filename = name
+        output.writestr(entry, "untrusted")
     with pytest.raises(ValueError, match="unsafe path"):
         extract_dependency_bundle(archive, tmp_path / "sdk")
     with pytest.raises(ValueError, match="unsafe path"):
