@@ -89,8 +89,13 @@ def _make_comfyui(path: Path) -> Path:
 def _installer_args(installer_path: Path, prefix: Path, comfyui: Path) -> list[str]:
     return [
         str(installer_path),
+        # The Deadline Cloud submitter installer runs this installer with these options.
         "--mode",
         "unattended",
+        "--unattendedmodeui",
+        "none",
+        "--installscope",
+        "user",
         "--prefix",
         str(prefix),
         "--comfyui-directory",

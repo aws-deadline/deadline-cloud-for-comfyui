@@ -30,6 +30,18 @@
 
     <!-- Installer-wide parameters. These are displayed before component parameters -->
     <parameterList>
+        <!-- The Deadline Cloud submitter installer runs each integration's installer with
+        installscope, so accept it. The extension goes into the selected ComfyUI folder either way. -->
+        <choiceParameter>
+            <name>installscope</name>
+            <ask>0</ask>
+            <cliOptionShow>0</cliOptionShow>
+            <default>user</default>
+            <optionList>
+                <option text="User" value="user"/>
+                <option text="System" value="system"/>
+            </optionList>
+        </choiceParameter>
         <directoryParameter>
             <name>installdir</name>
             <description>Installer.Parameter.installdir.description</description>
