@@ -60,8 +60,9 @@ When you submit, the extension:
 4. Shows the hashing and upload progress, asks you to confirm when Deadline Cloud would (for
    example, to upload files outside the storage profile), and then shows the job ID.
 
-The library runs in the Deadline Cloud CLI's own Python environment, not ComfyUI's, through
-`bridge.py`, so ComfyUI doesn't need boto3 or the deadline package.
+The library runs in a separate process through `bridge.py`, with the Deadline Cloud CLI's own
+Python, or with ComfyUI's Python and the installer's `dependencies` folder, so ComfyUI's
+environment doesn't need boto3 or the deadline package.
 
 ## Requirements
 
@@ -89,6 +90,28 @@ The library runs in the Deadline Cloud CLI's own Python environment, not ComfyUI
   See [The job](#the-job).
 
 ## Installing
+
+### Windows and macOS installer
+
+Quit ComfyUI, then run `DeadlineCloudForComfyUISubmitter-windows-x64-installer.exe` or
+`DeadlineCloudForComfyUISubmitter-osx-installer.app`, and choose the ComfyUI folder that contains
+`main.py` and `custom_nodes`. To install without prompts, pass
+`--mode unattended --comfyui-directory /path/to/ComfyUI`. `--prefix` sets the installation folder,
+which holds the uninstaller. It's `~/DeadlineCloudForComfyUISubmitter` by default.
+
+The installer puts the extension in `custom_nodes/deadline-cloud-for-comfyui`, with the Deadline
+Cloud library and its dependencies in the extension's `dependencies` folder. ComfyUI's own Python,
+3.13 or 3.14, runs them in a separate process, so nothing is installed into ComfyUI's environment,
+and the panel submits without the Deadline Cloud CLI. **Download** still runs the Deadline Cloud
+CLI on the `PATH`, or the one `COMFYUI_DEADLINE_CLI` names.
+
+Restart ComfyUI after installing. To upgrade, run a newer installer with the same ComfyUI folder.
+To uninstall, run `uninstall` in the installation folder. It removes the whole extension folder,
+including its `deadline_cloud_submitter.json`. The installer stops if
+`custom_nodes/deadline-cloud-for-comfyui` already exists and it didn't create it, such as a clone of
+this repository.
+
+### Installing from source
 
 Get this repository, then run the setup script with the ComfyUI directory that contains
 `custom_nodes`:

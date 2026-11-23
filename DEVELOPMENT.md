@@ -22,11 +22,16 @@ npm ci
 | `install_submitter.py` | The setup script for users. It's tested in `test/unit/test_install_submitter.py`. |
 | `src/deadline/comfyui_submitter/submit.py` | Pure helpers for building the submitter command. They don't import ComfyUI, so they're unit tested. |
 | `src/deadline/comfyui_submitter/routes.py` | The `/deadline/...` routes on the ComfyUI server: `plan`, `cloud/<command>`, `bundle`, `jobs`, `jobs/confirm`, `jobs/cancel`, `jobs/download` and `choose`. |
-| `src/deadline/comfyui_submitter/bridge.py` | Calls `deadline.client.api` for the routes. It runs in the Deadline Cloud CLI's Python (`python -I bridge.py <command>`) and speaks JSON lines, so it only imports the standard library and `deadline`. |
+| `src/deadline/comfyui_submitter/bridge.py` | Calls `deadline.client.api` for the routes. It runs in the Deadline Cloud CLI's Python (`python -I bridge.py <command>`), or, in an installer's installation, in ComfyUI's Python with the extension's `dependencies` folder (`python -I -S bridge.py --dependencies <folder> <command>`). It speaks JSON lines, so it only imports the standard library and `deadline`. |
 | `frontend/src/extensions/deadline-cloud/` | The frontend extension's TypeScript. `deadline_submit.ts` registers the commands, the action bar button and the sidebar tab; `deadline_ui.ts` is the panel and the dialog, in plain DOM with ComfyUI's theme variables. The folder mirrors where ComfyUI serves the extension. Imports such as `../../scripts/app.js` load ComfyUI's runtime modules; their ambient types are declared in `frontend/src/comfy_app.d.ts` and `frontend/src/comfy_api.d.ts`. |
 | `src/deadline/comfyui_submitter/web/` | The compiled JavaScript that ComfyUI serves. It's built by `npm run build` in `frontend/`, which `install_submitter.py` runs, and isn't committed. |
 | `src/deadline/comfyui_submitter/comfy_cli_job_template.yaml` | The job template. Each submission copies it into a new job bundle under `ComfyUI/user/deadline_submissions/`, with the workflow, the models and custom nodes it attaches and the list of input files. |
+| `installer/` | The InstallBuilder project for the Windows and macOS installer, with its images and icons. |
+| `install_builder/` | The InstallBuilder component that installs the extension and its dependencies into the selected ComfyUI folder. |
+| `scripts/` | The installer build: `build_installer_cli.py` and `build_installer.py` run it, `deps_bundle.py` builds the dependency bundle, and `find_installbuilder.py` finds InstallBuilder. |
+| `pipeline/` | The build and test entry points that the shared installer build runs. |
 | `test/unit/` | Unit tests. |
+| `test/installer/` | Tests that run a built installer and its uninstaller. |
 
 ## Commands
 
@@ -44,6 +49,30 @@ npm ci
 
 The panel tests in `test/unit` compile the TypeScript into a temporary folder and run it in Node.
 They're skipped until `npm ci` has run in `frontend/`.
+
+## Building the installer
+
+The installer is built like the Cinema 4D one, on the operating system it's for, macOS or Windows.
+It needs [InstallBuilder](https://installbuilder.com/), Node.js 22 or later with npm, and Hatch:
+
+```
+hatch run installer:build-installer --local-dev --install-builder-path /path/to/InstallBuilder --output-dir dist
+```
+
+The build:
+
+1. Runs `npm ci` and `npm run build` in `frontend/`, so the installer includes the compiled panel.
+2. Builds `dependency_bundle/deadline_cloud_for_comfyui_submitter-deps.zip` from the `installer`
+   dependency group in `pyproject.toml`. Packages with compiled modules are installed for Python
+   3.13 and 3.14 and flattened into one folder, as in Cinema 4D.
+3. Runs InstallBuilder on `installer/DeadlineCloudForComfyUISubmitter.xml`.
+
+Without a license, InstallBuilder builds an evaluation installer, which `--local-dev` allows.
+Release builds use `--dev` or `--install-builder-license-path`, with `--install-builder-s3-bucket`
+to download InstallBuilder, like Cinema 4D's.
+
+To test the installer, copy it into the repository root and run `hatch run test-installer`, or set
+`COMFYUI_INSTALLER_PATH` to it. The tests install into temporary folders and uninstall again.
 
 ## Testing in ComfyUI
 
