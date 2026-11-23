@@ -25,7 +25,7 @@ from scripts.find_installbuilder import extract_builder_archive, find_builder
 
 
 @pytest.mark.parametrize(
-    "target,system,machine,site,artifact,python,cli",
+    "target,system,machine,site,artifact,python",
     [
         (
             "Windows",
@@ -34,7 +34,6 @@ from scripts.find_installbuilder import extract_builder_archive, find_builder
             "Lib/site-packages",
             "DeadlineCloudForComfyUISubmitter-windows-x64-installer.exe",
             "python.exe",
-            "Scripts/deadline.exe",
         ),
         (
             "MacOS",
@@ -43,12 +42,11 @@ from scripts.find_installbuilder import extract_builder_archive, find_builder
             "lib/python3.13/site-packages",
             "DeadlineCloudForComfyUISubmitter-osx-arm64-installer.app",
             "bin/python3",
-            "bin/deadline",
         ),
     ],
 )
 def test_platform_build_passes_runtime_layout_and_produces_expected_artifact(
-    tmp_path, monkeypatch, target, system, machine, site, artifact, python, cli
+    tmp_path, monkeypatch, target, system, machine, site, artifact, python
 ):
     payload = tmp_path / "Payload with spaces"
     payload.mkdir()
@@ -81,7 +79,6 @@ def test_platform_build_passes_runtime_layout_and_produces_expected_artifact(
     assert result == output / artifact
     assert commands[0][3] == {"Windows": "windows-x64", "MacOS": "osx"}[target]
     assert f"project.parameter(runtime_python_relative).value={python}" in commands[0]
-    assert f"project.parameter(runtime_cli_relative).value={cli}" in commands[0]
     assert f"project.parameter(runtime_site_packages_relative).value={site}" in commands[0]
     assert "project.version=0.1.0" in commands[0]
 

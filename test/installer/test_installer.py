@@ -38,19 +38,16 @@ pytestmark = pytest.mark.skipif(
 class Layout:
     root: Path
     source: Path
-    nodes: Path
     prefix: Path
     environment: dict[str, str] = field(repr=False)
-    launcher: Path | None = None
-    portable_root: Path | None = None
 
     @property
     def extension(self) -> Path:
         return self.nodes / EXTENSION
 
     @property
-    def selection(self) -> Path:
-        return self.launcher or self.portable_root or self.source
+    def nodes(self) -> Path:
+        return self.source / "custom_nodes"
 
     @property
     def python(self) -> Path:
@@ -74,35 +71,15 @@ class Layout:
         return self.prefix / relative
 
 
-def make_layout(root: Path, *, split: bool = False, portable: bool = False) -> Layout:
+def make_layout(root: Path) -> Layout:
     root = root.resolve()
-    portable_root = root / "ComfyUI portable with spaces" if portable else None
-    source = portable_root / "ComfyUI" if portable_root else root / "ComfyUI source with spaces"
-    (source / "custom_nodes").mkdir(parents=True)
+    source = root / "ComfyUI source with spaces"
+    nodes = source / "custom_nodes"
+    (nodes / "studio-node").mkdir(parents=True)
     (source / "main.py").write_text(
         "# Synthetic host; no ComfyUI code or assets.\n", encoding="utf-8"
     )
-    nodes = root / "Active base with spaces/custom_nodes" if split else source / "custom_nodes"
-    nodes.mkdir(parents=True, exist_ok=True)
-    (nodes / "studio-node").mkdir()
     (nodes / "studio-node/customer.txt").write_text("keep studio node", encoding="utf-8")
-    if portable_root:
-        outer_nodes = portable_root / "custom_nodes"
-        outer_nodes.mkdir()
-        (outer_nodes / "customer.txt").write_text("keep outer portable folder", encoding="utf-8")
-    launcher = None
-    if split:
-        (source / "custom_nodes/source-sentinel.txt").write_text(
-            "inactive source", encoding="utf-8"
-        )
-        if sys.platform != "win32":
-            launcher = root / "Selected launcher with spaces"
-            launcher.mkdir()
-            (launcher / "comfyui-source.txt").write_text(str(source), encoding="utf-8")
-            (launcher / "launch.sh").write_text(
-                f'exec python "{source / "main.py"}" --base-directory "{nodes.parent}"\n',
-                encoding="utf-8",
-            )
     configuration = root / "Isolated configuration"
     configuration.mkdir()
     (configuration / "aws-config").write_text("[default]\nregion=us-west-2\n", encoding="utf-8")
@@ -119,15 +96,7 @@ def make_layout(root: Path, *, split: bool = False, portable: bool = False) -> L
         "DEADLINE_CONFIG_FILE_PATH": str(configuration / "deadline-config"),
         "QT_QPA_PLATFORM": "offscreen",
     }
-    return Layout(
-        root,
-        source,
-        nodes,
-        root / "Deadline runtime with spaces",
-        environment,
-        launcher,
-        portable_root,
-    )
+    return Layout(root, source, root / "Deadline runtime with spaces", environment)
 
 
 def run_program(
@@ -154,13 +123,7 @@ def assert_success(result: subprocess.CompletedProcess[str]) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def install(
-    installer: Path,
-    layout: Layout,
-    extra: list[str] | None = None,
-    *,
-    source: Path | None = None,
-) -> None:
+def install(installer: Path, layout: Layout) -> None:
     result = run_program(
         installer,
         [
@@ -173,8 +136,7 @@ def install(
             "--enable-components",
             COMPONENT,
             "--comfyui-directory",
-            str(source or layout.selection),
-            *(extra or []),
+            str(layout.source),
         ],
         layout=layout,
     )
@@ -216,11 +178,6 @@ def uninstall(layout: Layout) -> None:
     assert (layout.nodes / "studio-node/customer.txt").read_text(
         encoding="utf-8"
     ) == "keep studio node"
-    if layout.portable_root:
-        assert (layout.portable_root / "custom_nodes/customer.txt").read_text(
-            encoding="utf-8"
-        ) == "keep outer portable folder"
-        assert not (layout.portable_root / "custom_nodes" / EXTENSION).exists()
 
 
 @pytest.fixture(scope="session")
@@ -272,14 +229,9 @@ def user_installation(
             uninstall(layout)
 
 
-@pytest.mark.parametrize(
-    "option,expected",
-    [
-        ("comfyui-directory", Path.home() / "ComfyUI"),
-        ("comfyui-base-directory", None),
-    ],
-)
-def test_default_locations(installer_help: str | None, option: str, expected: Path | None) -> None:
+def test_default_comfyui_location(installer_help: str | None) -> None:
+    option = "comfyui-directory"
+    expected = Path.home() / "ComfyUI"
     if installer_help is None:
         # Inspect the shared picker contract without opening a blocking Windows help dialog.
         component = ET.parse(ROOT / "install_builder/deadline-cloud-for-comfyui.xml").getroot()
@@ -299,7 +251,7 @@ def test_default_locations(installer_help: str | None, option: str, expected: Pa
         installer_help,
     )
     assert match, f"No documented default for --{option}:\n{installer_help}"
-    assert match.group(1).strip() == (str(expected) if expected else "")
+    assert match.group(1).strip() == str(expected)
 
 
 def test_component_and_selected_folder_cli(installer_help: str | None) -> None:
@@ -312,17 +264,15 @@ def test_component_and_selected_folder_cli(installer_help: str | None) -> None:
             for item in component.iter()
             if item.tag.endswith("Parameter")
         }
-        assert {
-            "comfyui-directory",
-            "comfyui-base-directory",
-            "comfyui-custom-nodes-directory",
-        } <= options
-        assert {"installscope", "comfyui-discovery-home", "discover"}.isdisjoint(options)
+        assert options == {"comfyui-directory"}
         return
     assert "--enable-components" in installer_help and COMPONENT in installer_help
     assert "--comfyui-directory" in installer_help
-    assert "--comfyui-base-directory" in installer_help
-    for removed in ("--installscope", "--comfyui-discovery-home", "--discover"):
+    for removed in (
+        "--installscope",
+        "--comfyui-base-directory",
+        "--comfyui-custom-nodes-directory",
+    ):
         assert removed not in installer_help
 
 
@@ -417,35 +367,26 @@ def compile_installed_modules(layout: Layout) -> None:
     assert list(layout.extension.rglob("*.pyc")), "The bytecode regression must create real caches"
 
 
-@pytest.mark.parametrize("portable", [False, True], ids=["source-folder", "portable-parent"])
-def test_clean_uninstall(installer_path: Path, tmp_path: Path, portable: bool) -> None:
-    layout = make_layout(tmp_path, portable=portable)
+def test_clean_uninstall(installer_path: Path, tmp_path: Path) -> None:
+    layout = make_layout(tmp_path)
     install(installer_path, layout)
     compile_installed_modules(layout)
     uninstall(layout)
     assert not layout.extension.exists()
 
 
-def test_upgrade_uninstall_reinstall_preserves_split_customer_settings(
+def test_upgrade_uninstall_reinstall_preserves_customer_settings(
     installer_path: Path, tmp_path: Path
 ) -> None:
-    layout = make_layout(tmp_path, split=True)
-    initial_options = (
-        ["--comfyui-base-directory", str(layout.nodes.parent)] if sys.platform == "win32" else None
-    )
-    install(installer_path, layout, initial_options)
+    layout = make_layout(tmp_path)
+    install(installer_path, layout)
     configuration = layout.extension / CONFIG
     settings = json.loads(configuration.read_text(encoding="utf-8"))
     settings.update(conda_channels="studio-channel", custom_setting="keep")
     configuration.write_text(json.dumps(settings), encoding="utf-8")
     (layout.extension / "customer.txt").write_text("keep customer file", encoding="utf-8")
     original_state = json.loads((layout.prefix / "installation.json").read_text(encoding="utf-8"))
-    install(
-        installer_path,
-        layout,
-        ["--comfyui-base-directory", str(layout.nodes.parent)],
-        source=layout.source,
-    )
+    install(installer_path, layout)
     upgraded_state = json.loads((layout.prefix / "installation.json").read_text(encoding="utf-8"))
     assert original_state["installation_id"] != upgraded_state["installation_id"]
     assert upgraded_state["extension"] == str(layout.extension)
@@ -467,12 +408,7 @@ def test_upgrade_uninstall_reinstall_preserves_split_customer_settings(
     assert preserved["conda_channels"] == "studio-channel" and preserved["custom_setting"] == "keep"
     assert "deadline_python" not in preserved and "deadline_cli" not in preserved
     assert (layout.extension / ".deadline-installer-uninstalled.json").is_file()
-    install(
-        installer_path,
-        layout,
-        ["--comfyui-custom-nodes-directory", str(layout.nodes)],
-        source=layout.source,
-    )
+    install(installer_path, layout)
     assert not (layout.extension / ".deadline-installer-uninstalled.json").exists()
     restored = json.loads(configuration.read_text(encoding="utf-8"))
     assert restored["conda_channels"] == "studio-channel"
@@ -480,10 +416,6 @@ def test_upgrade_uninstall_reinstall_preserves_split_customer_settings(
     assert (layout.extension / "customer.txt").read_text(encoding="utf-8") == "keep customer file"
     assert customer_module.is_file()
     assert all(cached.read_bytes() == expected for cached, expected in customer_caches.items())
-    assert (layout.source / "custom_nodes/source-sentinel.txt").read_text(
-        encoding="utf-8"
-    ) == "inactive source"
-    assert not (layout.source / "custom_nodes" / EXTENSION).exists()
 
 
 @pytest.mark.parametrize(

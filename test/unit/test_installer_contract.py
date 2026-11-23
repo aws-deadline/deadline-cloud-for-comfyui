@@ -32,19 +32,11 @@ def test_public_component_can_be_selected_by_a_standalone_wrapper() -> None:
 def test_host_picker_and_unattended_options_belong_to_the_component() -> None:
     project = ET.parse(ROOT / "installer/DeadlineCloudForComfyUISubmitter.xml").getroot()
     component = ET.parse(ROOT / "install_builder/deadline-cloud-for-comfyui.xml").getroot()
-    group = component.find("parameterList/parameterGroup")
-    assert group is not None and group.findtext("ask") == "1"
-    source = group.find("parameterList/directoryParameter[name='comfyui_directory']")
-    base = group.find("parameterList/directoryParameter[name='comfyui_base_directory']")
-    assert source is not None and base is not None
+    source = component.find("parameterList/directoryParameter[name='comfyui_directory']")
+    assert source is not None
     assert source.findtext("default") == "${user_home_directory}/ComfyUI"
     assert source.findtext("ask") == "1" and source.findtext("allowEmptyValue") == "0"
     assert source.findtext("cliOptionName") == "comfyui-directory"
-    assert base.findtext("cliOptionName") == "comfyui-base-directory"
-    assert base.findtext("allowEmptyValue") == "1"
-    nodes = component.find("parameterList/stringParameter[@name='custom_nodes_directory']")
-    assert nodes is not None and nodes.get("cliOptionName") == "comfyui-custom-nodes-directory"
-    assert nodes.get("ask") == "0"
     prefix = project.find("parameterList/directoryParameter[name='installdir']")
     assert prefix is not None and prefix.findtext("cliOptionName") == "prefix"
     assert prefix.findtext("default") == "${user_home_directory}/DeadlineCloudForComfyUISubmitter"
@@ -65,10 +57,14 @@ def test_host_picker_and_unattended_options_belong_to_the_component() -> None:
     )
 
 
-def test_component_packages_a_private_runtime_and_uses_the_resolved_active_nodes() -> None:
+def test_component_packages_a_private_runtime_and_uses_the_selected_folder() -> None:
     component = ET.parse(ROOT / "install_builder/deadline-cloud-for-comfyui.xml").getroot()
     folders = {folder.findtext("name"): folder for folder in component.findall("folderList/folder")}
-    assert folders["deadline_runtime"].findtext("destination") == "${installdir}/runtime"
+    assert folders["deadline_runtime"].findtext("destination") == "${installdir}"
+    assert (
+        folders["deadline_runtime"].findtext("distributionFileList/distributionDirectory/origin")
+        == "${payload_directory}/runtime"
+    )
     assert folders["comfyui_payload"].findtext("destination") == "${installdir}/payload"
     assert folders["installation_helper"].findtext("destination") == "${installdir}"
     hooks = component.findall("postInstallationActionList/runProgram")
@@ -76,8 +72,7 @@ def test_component_packages_a_private_runtime_and_uses_the_resolved_active_nodes
         hook for hook in hooks if " install " in (hook.findtext("programArguments") or "")
     )
     arguments = install_hook.findtext("programArguments") or ""
-    assert '--comfyui "${deadline_comfyui_source}"' in arguments
-    assert '--custom-nodes "${custom_nodes_directory}"' in arguments
+    assert '--comfyui "${comfyui_directory}"' in arguments
     assert '--runtime "${installdir}/runtime"' in arguments
     assert '--state "${installdir}/installation.json"' in arguments
     assert install_hook.findtext("abortOnError") == "1"
@@ -109,8 +104,10 @@ def test_dependency_bundle_is_unpacked_before_runtime_validation() -> None:
 
 def test_selected_target_and_prefix_are_validated_before_payload_copy() -> None:
     component = ET.parse(ROOT / "install_builder/deadline-cloud-for-comfyui.xml").getroot()
-    resolution = component.find(
-        "readyToInstallActionList/setInstallerVariable[@name='deadline_resolve_arguments']"
+    ready = component.find("readyToInstallActionList")
+    assert ready is not None
+    unpack = ready.find("unpackDirectory")
+    assert unpack is not None and unpack.get("folder") == "deadline_runtime"
+    assert ready.findtext("runProgram/programArguments") == (
+        '-I install.py validate --comfyui "${comfyui_directory}" --prefix "${installdir}"'
     )
-    assert resolution is not None
-    assert '--prefix "${installdir}"' in resolution.get("value", "")

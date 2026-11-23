@@ -8,21 +8,6 @@
     <show>1</show>
     <folderList>
         <folder>
-            <name>validation_tools</name>
-            <description>Selected ComfyUI folder validation</description>
-            <destination>${installdir}</destination>
-            <platforms>all</platforms>
-            <!-- Packed for private early extraction; never installed into the product prefix. -->
-            <ruleList>
-                <compareText text="0" value="1" logic="equals" />
-            </ruleList>
-            <distributionFileList>
-                <distributionDirectory>
-                    <origin>${payload_directory}/bootstrap</origin>
-                </distributionDirectory>
-            </distributionFileList>
-        </folder>
-        <folder>
             <name>comfyui_payload</name>
             <description>ComfyUI submitter files</description>
             <destination>${installdir}/payload</destination>
@@ -36,11 +21,11 @@
         <folder>
             <name>deadline_runtime</name>
             <description>Deadline Cloud runtime</description>
-            <destination>${installdir}/runtime</destination>
+            <destination>${installdir}</destination>
             <platforms>all</platforms>
             <distributionFileList>
-                <distributionDirectory allowWildcards="1">
-                    <origin>${payload_directory}/runtime/*</origin>
+                <distributionDirectory>
+                    <origin>${payload_directory}/runtime</origin>
                 </distributionDirectory>
             </distributionFileList>
         </folder>
@@ -69,123 +54,30 @@
     </folderList>
     <initializationActionList>
         <setInstallerVariable name="all_components" value="${all_components} deadline_cloud_for_comfyui" />
-        <setInstallerVariable name="deadline_comfyui_source" value="" />
         <setInstallerVariable name="deadline_validation_directory" value="" />
-        <setInstallerVariable name="deadline_custom_nodes_override" value="" />
     </initializationActionList>
     <parameterList>
-        <stringParameter name="custom_nodes_directory" value="" ask="0" cliOptionShow="0" cliOptionName="comfyui-custom-nodes-directory" />
-        <parameterGroup>
-            <name>comfyui_target</name>
-            <title>Choose your ComfyUI installation</title>
-            <explanation>Select the existing ComfyUI source folder containing main.py, a portable folder containing ComfyUI/main.py, or a launcher folder containing comfyui-source.txt. If your custom nodes are stored separately, also select the base folder containing custom_nodes. The installer checks only the folder you select and keeps Deadline Cloud dependencies separate from ComfyUI.</explanation>
+        <directoryParameter>
+            <name>comfyui_directory</name>
+            <description>ComfyUI folder containing main.py and custom_nodes</description>
+            <value>${user_home_directory}/ComfyUI</value>
+            <default>${user_home_directory}/ComfyUI</default>
+            <allowEmptyValue>0</allowEmptyValue>
+            <cliOptionName>comfyui-directory</cliOptionName>
+            <mustExist>1</mustExist>
             <ask>1</ask>
-            <parameterList>
-                <directoryParameter>
-                    <name>comfyui_directory</name>
-                    <description>ComfyUI source or launcher folder</description>
-                    <value>${user_home_directory}/ComfyUI</value>
-                    <default>${user_home_directory}/ComfyUI</default>
-                    <allowEmptyValue>0</allowEmptyValue>
-                    <cliOptionName>comfyui-directory</cliOptionName>
-                    <mustExist>1</mustExist>
-                    <ask>1</ask>
-                </directoryParameter>
-                <directoryParameter>
-                    <name>comfyui_base_directory</name>
-                    <description>Separate base folder (optional)</description>
-                    <value />
-                    <default />
-                    <explanation>Leave this blank when ComfyUI already identifies your custom nodes. Otherwise, select the existing base folder containing custom_nodes.</explanation>
-                    <allowEmptyValue>1</allowEmptyValue>
-                    <cliOptionName>comfyui-base-directory</cliOptionName>
-                    <mustExist>1</mustExist>
-                    <ask>1</ask>
-                </directoryParameter>
-            </parameterList>
-            <validationActionList>
-                <throwError text="Folder paths must not contain double quotes, dollar signs, backticks, percent signs, or line breaks. Select ordinary folder paths before continuing.">
-                    <ruleEvaluationLogic>or</ruleEvaluationLogic>
-                    <ruleList>
-                        <regExMatch text="${installdir}" pattern="[&quot;$`%\r\n]" />
-                        <regExMatch text="${comfyui_directory}" pattern="[&quot;$`%\r\n]" />
-                        <regExMatch text="${comfyui_base_directory}" pattern="[&quot;$`%\r\n]" />
-                        <regExMatch text="${custom_nodes_directory}" pattern="[&quot;$`%\r\n]" />
-                        <regExMatch text="${deadline_custom_nodes_override}" pattern="[&quot;$`%\r\n]" />
-                        <regExMatch text="${deadline_comfyui_source}" pattern="[&quot;$`%\r\n]" />
-                        <regExMatch text="${system_temp_directory}" pattern="[&quot;$`%\r\n]" />
-                        <regExMatch text="${runtime_python_relative}" pattern="[&quot;$`%\r\n]" />
-                        <regExMatch text="${runtime_cli_relative}" pattern="[&quot;$`%\r\n]" />
-                    </ruleList>
-                </throwError>
-                <throwError text="Select your existing ComfyUI source or launcher folder.">
-                    <ruleList>
-                        <compareText text="${comfyui_directory}" value="" logic="equals" />
-                    </ruleList>
-                </throwError>
-                <setInstallerVariable name="deadline_resolve_arguments" value="-I &quot;${deadline_validation_directory}/bootstrap/install.py&quot; resolve --comfyui &quot;${comfyui_directory}&quot; --output-dir &quot;${deadline_validation_directory}/resolved&quot; --prefix &quot;${installdir}&quot;" />
-                <setInstallerVariable name="deadline_resolve_arguments" value="${deadline_resolve_arguments} --base-directory &quot;${comfyui_base_directory}&quot;">
-                    <ruleList>
-                        <compareText text="${comfyui_base_directory}" value="" logic="does_not_equal" />
-                    </ruleList>
-                </setInstallerVariable>
-                <setInstallerVariable name="deadline_resolve_arguments" value="${deadline_resolve_arguments} --custom-nodes &quot;${deadline_custom_nodes_override}&quot;">
-                    <ruleList>
-                        <compareText text="${deadline_custom_nodes_override}" value="" logic="does_not_equal" />
-                    </ruleList>
-                </setInstallerVariable>
-                <runProgram>
-                    <progressText>Checking your ComfyUI installation</progressText>
-                    <abortOnError>1</abortOnError>
-                    <program>${deadline_validation_directory}/bootstrap/runtime/${runtime_python_relative}</program>
-                    <programArguments>${deadline_resolve_arguments}</programArguments>
-                </runProgram>
-                <readFile path="${deadline_validation_directory}/resolved/source.txt" name="deadline_comfyui_source" encoding="utf-8" />
-                <readFile path="${deadline_validation_directory}/resolved/custom_nodes.txt" name="custom_nodes_directory" encoding="utf-8" />
-                <throwError text="Folder paths must not contain double quotes, dollar signs, backticks, percent signs, or line breaks. Select ordinary folder paths before continuing.">
-                    <ruleEvaluationLogic>or</ruleEvaluationLogic>
-                    <ruleList>
-                        <regExMatch text="${installdir}" pattern="[&quot;$`%\r\n]" />
-                        <regExMatch text="${comfyui_directory}" pattern="[&quot;$`%\r\n]" />
-                        <regExMatch text="${comfyui_base_directory}" pattern="[&quot;$`%\r\n]" />
-                        <regExMatch text="${custom_nodes_directory}" pattern="[&quot;$`%\r\n]" />
-                        <regExMatch text="${deadline_custom_nodes_override}" pattern="[&quot;$`%\r\n]" />
-                        <regExMatch text="${deadline_comfyui_source}" pattern="[&quot;$`%\r\n]" />
-                        <regExMatch text="${system_temp_directory}" pattern="[&quot;$`%\r\n]" />
-                        <regExMatch text="${runtime_python_relative}" pattern="[&quot;$`%\r\n]" />
-                        <regExMatch text="${runtime_cli_relative}" pattern="[&quot;$`%\r\n]" />
-                    </ruleList>
-                </throwError>
-            </validationActionList>
-        </parameterGroup>
-        <infoParameter>
-            <name>selected_comfyui</name>
-            <title>Ready to install Deadline Cloud</title>
-            <description>Selected ComfyUI installation</description>
-            <value>ComfyUI: ${deadline_comfyui_source}
-
-Custom nodes: ${custom_nodes_directory}
-
-Restart ComfyUI after installation.</value>
-            <ask>1</ask>
-        </infoParameter>
+        </directoryParameter>
     </parameterList>
-    <preInstallationActionList>
-        <throwError text="Folder paths must not contain double quotes, dollar signs, backticks, percent signs, or line breaks. Select ordinary folder paths before continuing.">
+    <readyToInstallActionList>
+        <throwError text="Folder paths must not contain double quotes, dollar signs, backticks, percent signs, or line breaks.">
             <ruleEvaluationLogic>or</ruleEvaluationLogic>
             <ruleList>
                 <regExMatch text="${installdir}" pattern="[&quot;$`%\r\n]" />
                 <regExMatch text="${comfyui_directory}" pattern="[&quot;$`%\r\n]" />
-                <regExMatch text="${comfyui_base_directory}" pattern="[&quot;$`%\r\n]" />
-                <regExMatch text="${custom_nodes_directory}" pattern="[&quot;$`%\r\n]" />
-                <regExMatch text="${deadline_custom_nodes_override}" pattern="[&quot;$`%\r\n]" />
-                <regExMatch text="${deadline_comfyui_source}" pattern="[&quot;$`%\r\n]" />
                 <regExMatch text="${system_temp_directory}" pattern="[&quot;$`%\r\n]" />
                 <regExMatch text="${runtime_python_relative}" pattern="[&quot;$`%\r\n]" />
-                <regExMatch text="${runtime_cli_relative}" pattern="[&quot;$`%\r\n]" />
             </ruleList>
         </throwError>
-        <setInstallerVariable name="deadline_custom_nodes_override" value="${custom_nodes_directory}" />
         <if>
             <conditionRuleList>
                 <platformTest type="windows" />
@@ -198,29 +90,16 @@ Restart ComfyUI after installation.</value>
             </elseActionList>
         </if>
         <stringModify text="${deadline_validation_directory}" variable="deadline_validation_directory" logic="trim" />
-        <unpackDirectory component="deadline_cloud_for_comfyui" folder="validation_tools" origin="bootstrap" destination="${deadline_validation_directory}" addToUninstaller="0" />
-    </preInstallationActionList>
-    <readyToInstallActionList>
-        <!-- Resolve the raw folder selection again before any payload is copied. -->
-        <setInstallerVariable name="deadline_resolve_arguments" value="-I &quot;${deadline_validation_directory}/bootstrap/install.py&quot; resolve --comfyui &quot;${comfyui_directory}&quot; --output-dir &quot;${deadline_validation_directory}/resolved&quot; --prefix &quot;${installdir}&quot;" />
-        <setInstallerVariable name="deadline_resolve_arguments" value="${deadline_resolve_arguments} --base-directory &quot;${comfyui_base_directory}&quot;">
-            <ruleList>
-                <compareText text="${comfyui_base_directory}" value="" logic="does_not_equal" />
-            </ruleList>
-        </setInstallerVariable>
-        <setInstallerVariable name="deadline_resolve_arguments" value="${deadline_resolve_arguments} --custom-nodes &quot;${deadline_custom_nodes_override}&quot;">
-            <ruleList>
-                <compareText text="${deadline_custom_nodes_override}" value="" logic="does_not_equal" />
-            </ruleList>
-        </setInstallerVariable>
+        <!-- Use the packed runtime for preflight before writing to either destination. -->
+        <unpackDirectory component="deadline_cloud_for_comfyui" folder="deadline_runtime" origin="runtime" destination="${deadline_validation_directory}" />
+        <unpackFile component="deadline_cloud_for_comfyui" folder="installation_helper" origin="install.py" destination="${deadline_validation_directory}" />
         <runProgram>
             <progressText>Checking your ComfyUI installation</progressText>
             <abortOnError>1</abortOnError>
-            <program>${deadline_validation_directory}/bootstrap/runtime/${runtime_python_relative}</program>
-            <programArguments>${deadline_resolve_arguments}</programArguments>
+            <workingDirectory>${deadline_validation_directory}</workingDirectory>
+            <program>${deadline_validation_directory}/runtime/${runtime_python_relative}</program>
+            <programArguments>-I install.py validate --comfyui "${comfyui_directory}" --prefix "${installdir}"</programArguments>
         </runProgram>
-        <readFile path="${deadline_validation_directory}/resolved/source.txt" name="deadline_comfyui_source" encoding="utf-8" />
-        <readFile path="${deadline_validation_directory}/resolved/custom_nodes.txt" name="custom_nodes_directory" encoding="utf-8" />
         <deleteFile path="${deadline_validation_directory}" abortOnError="0">
             <ruleList>
                 <regExMatch text="${deadline_validation_directory}" pattern="[/\\]deadline-comfyui-installer\.[A-Za-z0-9]+$" />
@@ -237,16 +116,10 @@ Restart ComfyUI after installation.</value>
             <addToUninstaller>1</addToUninstaller>
         </unzip>
         <runProgram>
-            <progressText>Checking your ComfyUI installation</progressText>
-            <abortOnError>1</abortOnError>
-            <program>${installdir}/runtime/${runtime_python_relative}</program>
-            <programArguments>-I "${installdir}/install.py" validate --comfyui "${deadline_comfyui_source}" --custom-nodes "${custom_nodes_directory}"</programArguments>
-        </runProgram>
-        <runProgram>
             <progressText>Installing Deadline Cloud into ComfyUI</progressText>
             <abortOnError>1</abortOnError>
             <program>${installdir}/runtime/${runtime_python_relative}</program>
-            <programArguments>-I "${installdir}/install.py" install --payload "${installdir}/payload" --runtime "${installdir}/runtime" --comfyui "${deadline_comfyui_source}" --state "${installdir}/installation.json" --version "${project.version}" --custom-nodes "${custom_nodes_directory}"</programArguments>
+            <programArguments>-I "${installdir}/install.py" install --payload "${installdir}/payload" --runtime "${installdir}/runtime" --comfyui "${comfyui_directory}" --state "${installdir}/installation.json" --version "${project.version}"</programArguments>
         </runProgram>
         <setInstallerVariable name="deadline_install_succeeded" value="1" />
         <!-- Only the private staging directory is removed; customer files are handled by install.py. -->

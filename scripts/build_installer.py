@@ -153,68 +153,6 @@ def validate_bare_runtime(runtime: Path, info: dict[str, Any]) -> None:
             raise ValueError(f"The packed runtime must not contain SDK dependencies: {path}")
 
 
-def stage_bootstrap(runtime: Path, output: Path) -> None:
-    """Bundle only portable Python and its standard library for selected-folder validation."""
-    if output.exists():
-        raise ValueError(f"Bootstrap output already exists: {output}")
-    copied = output / "runtime"
-    if os.name == "nt":
-        copy_runtime(runtime, copied)
-        info = runtime_metadata(runtime_python(copied))
-        strip_runtime_dependencies(copied, info)
-        for name in ("ensurepip", "idlelib", "test", "tests"):
-            directory = copied / "Lib" / name
-            if directory.is_dir():
-                shutil.rmtree(directory)
-    else:
-        copied.mkdir(parents=True)
-        (copied / "bin").mkdir()
-        for path in (runtime / "bin").glob("python3*"):
-            if not path.name.endswith("-config"):
-                shutil.copy2(path, copied / "bin" / path.name, follow_symlinks=False)
-        (copied / "lib").mkdir()
-        for path in (runtime / "lib").glob("*.dylib"):
-            shutil.copy2(path, copied / "lib" / path.name, follow_symlinks=False)
-        for library in (runtime / "lib").glob("python3.*"):
-            if library.is_dir():
-                shutil.copytree(
-                    library,
-                    copied / "lib" / library.name,
-                    symlinks=True,
-                    ignore=shutil.ignore_patterns(
-                        "site-packages",
-                        "__pycache__",
-                        "*.pyc",
-                        "test",
-                        "tests",
-                        "idlelib",
-                        "ensurepip",
-                    ),
-                )
-        for path in runtime.iterdir():
-            if path.is_file() and any(
-                word in path.name.lower() for word in ("license", "notice", "copying")
-            ):
-                shutil.copy2(path, copied / path.name)
-        for path in copied.rglob("*"):
-            if path.is_symlink():
-                original = runtime / path.relative_to(copied)
-                target = original.resolve()
-                if not target.is_relative_to(runtime.resolve()):
-                    raise ValueError(f"Bootstrap runtime link leaves its directory: {original}")
-                relative = target.relative_to(runtime.resolve())
-                path.unlink()
-                path.symlink_to(os.path.relpath(copied / relative, path.parent))
-                if not path.exists():
-                    raise ValueError(f"Bootstrap runtime is missing a link target: {relative}")
-    shutil.copy2(ROOT / "installer/install.py", output / "install.py")
-    info = runtime_metadata(runtime_python(copied))
-    if Path(info["prefix"]).resolve() != copied.resolve():
-        raise ValueError("The bootstrap Python is not relocatable.")
-    validate_bare_runtime(copied, info)
-    run([str(runtime_python(copied)), "-I", str(output / "install.py"), "--help"])
-
-
 def build_frontend(extension: Path) -> None:
     node, npm = shutil.which("node"), shutil.which("npm")
     if not node or not npm:
@@ -338,7 +276,6 @@ def stage_payload(python_runtime: Path, output: Path, target: str, wheelhouse: P
         )
         build_frontend(extension)
         shutil.copy2(ROOT / "installer/install.py", temporary / "install.py")
-        stage_bootstrap(runtime, temporary / "bootstrap")
         with tempfile.TemporaryDirectory(prefix=".sdk-", dir=temporary) as directory:
             dependencies = Path(directory) / "site-packages"
             install_dependencies(python, wheelhouse, dependencies)
@@ -394,19 +331,6 @@ def verify_payload(payload: Path, target: str) -> None:
         )
         hooks.prepare_runtime(verification)
     hooks.payload_files(payload / "extension")
-    bootstrap = payload / "bootstrap"
-    if not bootstrap.is_dir():
-        raise ValueError("The staged payload has no validation bootstrap; stage it again.")
-    if (bootstrap / "install.py").read_bytes() != (payload / "install.py").read_bytes():
-        raise ValueError("The validation and installation helpers do not match.")
-    bootstrap_info = runtime_metadata(runtime_python(bootstrap / "runtime"))
-    if any(
-        bootstrap_info[key] != info[key]
-        for key in ("version", "system", "machine", "site_packages_relative")
-    ):
-        raise ValueError("The validation runtime does not match the installer runtime.")
-    validate_bare_runtime(bootstrap / "runtime", bootstrap_info)
-    validate_bare_runtime(runtime, info)
 
 
 def build(
@@ -429,10 +353,10 @@ def build(
     info = json.loads((payload / "build.json").read_text(encoding="utf-8"))
     validate_architecture(info, target)
     if target == "Windows":
-        python_relative, cli_relative = "python.exe", "Scripts/deadline.exe"
+        python_relative = "python.exe"
         architecture, filename = "x64", "DeadlineCloudForComfyUISubmitter-windows-x64-installer.exe"
     else:
-        python_relative, cli_relative = "bin/python3", "bin/deadline"
+        python_relative = "bin/python3"
         architecture = "arm64" if info["machine"].lower() in ("arm64", "aarch64") else "x86_64"
         filename = f"DeadlineCloudForComfyUISubmitter-osx-{architecture}-installer.app"
     text = run(
@@ -447,7 +371,6 @@ def build(
             f"project.installerFilename={filename}",
             f"project.parameter(payload_directory).value={payload.resolve()}",
             f"project.parameter(runtime_python_relative).value={python_relative}",
-            f"project.parameter(runtime_cli_relative).value={cli_relative}",
             f"project.parameter(runtime_site_packages_relative).value={info['site_packages_relative']}",
             f"project.parameter(runtime_architecture).value={architecture}",
         ]

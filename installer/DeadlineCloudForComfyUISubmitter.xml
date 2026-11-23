@@ -42,7 +42,6 @@
         <!-- These paths are populated by the build script, never requested from customers. -->
         <stringParameter name="payload_directory" value="payload" ask="0" cliOptionShow="0" />
         <stringParameter name="runtime_python_relative" value="bin/python3" ask="0" cliOptionShow="0" />
-        <stringParameter name="runtime_cli_relative" value="bin/deadline" ask="0" cliOptionShow="0" />
         <stringParameter name="runtime_architecture" value="arm64" ask="0" cliOptionShow="0" />
         <stringParameter name="runtime_site_packages_relative" value="lib/python3.13/site-packages" ask="0" cliOptionShow="0" />
         <directoryParameter>
@@ -121,15 +120,6 @@
         <language code="en" file="custom-en.lng" />
     </customLanguageFileList>
     <width>600</width>
-    <installationAbortedActionList>
-        <deleteFile path="${deadline_validation_directory}" abortOnError="0">
-            <ruleList>
-                <regExMatch text="${deadline_validation_directory}" pattern="[/\\]deadline-comfyui-installer\.[A-Za-z0-9]+$" />
-                <fileTest path="${deadline_validation_directory}" condition="is_directory" />
-                <fileTest path="${deadline_validation_directory}" condition="is_symlink" negate="1" />
-            </ruleList>
-        </deleteFile>
-    </installationAbortedActionList>
     <onExitActionList>
         <deleteFile path="${deadline_validation_directory}" abortOnError="0">
             <ruleList>

@@ -85,25 +85,15 @@ The library runs in the Deadline Cloud CLI's own Python environment, not ComfyUI
 When your studio supplies an installer built from this repository, quit ComfyUI and open
 `DeadlineCloudForComfyUISubmitter-windows-x64-installer.exe` on 64-bit Windows, or the
 `osx-arm64` installer on an Apple silicon Mac with macOS 13 or later.
-Select the ComfyUI submitter on the component page, then choose your existing ComfyUI
-folder. The folder picker suggests `ComfyUI` in your home folder. Choose the source folder
-containing `main.py`, a portable installation's parent containing `ComfyUI/main.py`, or a
-launcher folder containing `comfyui-source.txt` and a supported `launch.sh`.
-The installer validates only the selected folder and its referenced source/base folders.
-For installations using `--base-directory`, select that base folder when it cannot be
-identified from the selected launcher metadata; Deadline belongs in its active
-`custom_nodes`, which can be separate from the source. The custom-node folder must already
-exist and be writable, without symbolic links or Windows directory junctions. Paths with
-spaces and normal Windows directory separators are supported. Double quotes, dollar signs,
-backticks, percent signs, and line breaks are rejected; literal backslashes in macOS folder
-names are also rejected. Intel Mac and Linux installers remain deferred.
+Select the ComfyUI submitter, then choose the folder containing both `main.py` and
+`custom_nodes`. The folder picker suggests `ComfyUI` in your home folder. The installer
+supports standard ComfyUI layouts and requires a writable `custom_nodes` directory.
 
-The installer includes the compiled panel, a private Python runtime, and the bundled
-Deadline Cloud dependencies. You need no Python, Node.js, setup script, or package downloads
-to install it. The runtime lives in `DeadlineCloudForComfyUISubmitter` in your home folder;
-keep that folder while you use the extension. Restart ComfyUI after installation to load the
-extension; the finish page provides instructions. Deadline Cloud monitor credentials and
-AWS profiles still need to be set up for your account.
+The installer includes the compiled panel, Deadline Cloud SDK and CLI, and the Python
+runtime used by the submitter. Restart ComfyUI after installation to load the extension.
+Keep the `DeadlineCloudForComfyUISubmitter` folder in your home directory while the
+extension is installed. Set up Deadline Cloud monitor credentials or an AWS profile
+for your account.
 
 Run the newer installer with the same ComfyUI folder to upgrade. It preserves existing
 submitter settings and unrelated custom nodes. To remove an installer installation, quit

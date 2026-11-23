@@ -114,7 +114,9 @@ jobs:
   Test:
     name: Python
     needs: Readiness
-    if: needs.Readiness.outputs.ready == 'true'
+    if: >-
+      needs.Readiness.outputs.ready == 'true' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.draft != true)
     permissions:
       contents: read
     strategy:
@@ -131,7 +133,9 @@ jobs:
   Frontend:
     name: Frontend CI
     needs: Readiness
-    if: needs.Readiness.outputs.ready == 'true'
+    if: >-
+      needs.Readiness.outputs.ready == 'true' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.draft != true)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

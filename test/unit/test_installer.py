@@ -320,7 +320,7 @@ def test_install_rejects_linked_custom_nodes_before_changing_files(setup):
     target.mkdir()
     (target / "customer.txt").write_text("keep")
     custom_nodes.symlink_to(target, target_is_directory=True)
-    with pytest.raises(hooks.InstallError, match="custom_nodes folder is a symbolic link"):
+    with pytest.raises(hooks.InstallError, match="custom_nodes folder is linked"):
         hooks.install(payload, runtime, comfy, state, "1.0")
     assert (target / "customer.txt").read_text() == "keep"
     assert not state.exists()
@@ -466,190 +466,6 @@ def test_uninstall_receipt_write_failure_retains_retry_ownership(setup, monkeypa
     assert (destination / "customer.txt").read_text() == "keep"
 
 
-def make_launcher(home: Path, source: Path, name: str = "ComfyUI Preview") -> tuple[Path, Path]:
-    folder = home / name
-    nodes = folder / "runtime/custom_nodes"
-    nodes.mkdir(parents=True)
-    (folder / "comfyui-source.txt").write_text(str(source), encoding="utf-8")
-    (folder / "launch.sh").write_text(
-        'ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"\n'
-        'COMFYUI_SOURCE="$(cat "$ROOT/comfyui-source.txt")"\n'
-        'exec "$ROOT/venv/bin/python" "$COMFYUI_SOURCE/main.py" '
-        '--base-directory "$ROOT/runtime" "$@"\n',
-        encoding="utf-8",
-    )
-    return folder, nodes
-
-
-def test_selected_launcher_validation_is_read_only_with_split_paths(setup, tmp_path, monkeypatch):
-    comfy, _, _, _ = setup
-    launcher, nodes = make_launcher(tmp_path / "Customer home", comfy)
-
-    def forbid_access(*args, **kwargs):
-        raise AssertionError(
-            "Selected-folder validation must not scan folders or probe by writing."
-        )
-
-    monkeypatch.setattr(hooks.tempfile, "NamedTemporaryFile", forbid_access)
-    monkeypatch.setattr(hooks.os, "scandir", forbid_access)
-    assert hooks.resolve_layout(launcher) == (comfy, nodes)
-    assert not (nodes / hooks.EXTENSION_NAME).exists()
-
-
-@pytest.mark.parametrize("base", ['"$(touch sentinel)/runtime"', '"$OTHER/runtime"'])
-def test_selected_launcher_dynamic_paths_are_rejected_without_execution(setup, tmp_path, base):
-    comfy, _, _, _ = setup
-    folder, _ = make_launcher(tmp_path / "Home", comfy)
-    (folder / "launch.sh").write_text(
-        'exec python "' + str(comfy / "main.py") + '" --base-directory ' + base
-    )
-    with pytest.raises(hooks.InstallError, match="dynamic paths"):
-        hooks.resolve_layout(folder)
-    assert not (folder / "sentinel").exists()
-
-
-def test_split_layout_install_upgrade_uninstall_reinstall_preserves_customer_files(setup, tmp_path):
-    comfy, payload, runtime, state = setup
-    source_nodes = comfy / "custom_nodes"
-    (source_nodes / "unrelated.txt").write_text("source stays untouched")
-    launcher, nodes = make_launcher(tmp_path / "Home", comfy)
-    destination = hooks.install(payload, runtime, launcher, state, "1.0")
-    assert destination == nodes / hooks.EXTENSION_NAME
-    manifest = json.loads(state.read_text())
-    assert manifest["comfyui_source"] == str(comfy)
-    assert manifest["custom_nodes"] == str(nodes)
-    config = destination / hooks.CONFIG_NAME
-    config.write_text(json.dumps({"conda_channels": "studio"}))
-    (destination / "customer.txt").write_text("keep")
-    hooks.install(payload, runtime, comfy, state, "2.0", custom_nodes=nodes)
-    hooks.uninstall(state)
-    assert hooks.uninstalled_receipt(destination)
-    hooks.install(payload, runtime, launcher, state, "3.0")
-    assert json.loads(config.read_text())["conda_channels"] == "studio"
-    assert not (destination / hooks.RECEIPT_NAME).exists()
-    hooks.uninstall(state)
-    assert (destination / "customer.txt").read_text() == "keep"
-    assert (source_nodes / "unrelated.txt").read_text() == "source stays untouched"
-    assert not (source_nodes / hooks.EXTENSION_NAME).exists()
-
-
-def test_split_source_without_local_nodes_uses_explicit_base(setup, tmp_path):
-    comfy, _, _, _ = setup
-    (comfy / "custom_nodes").rmdir()
-    base = tmp_path / "Active base"
-    (base / "custom_nodes").mkdir(parents=True)
-    assert hooks.resolve_layout(comfy, base_directory=base) == (comfy, base / "custom_nodes")
-    with pytest.raises(hooks.InstallError, match="active custom_nodes"):
-        hooks.resolve_layout(comfy)
-
-
-def test_runtime_overlap_with_separate_active_nodes_rejected_before_install(setup):
-    comfy, payload, runtime, state = setup
-    nodes = runtime.parent / "custom_nodes"
-    nodes.mkdir()
-    with pytest.raises(hooks.InstallError, match="separate"):
-        hooks.install(payload, runtime, comfy, state, "1.0", custom_nodes=nodes)
-    assert not state.exists()
-    assert not (nodes / hooks.EXTENSION_NAME).exists()
-
-
-@pytest.mark.skipif(os.name == "nt", reason="macOS path alias guard")
-def test_split_nodes_symlink_ancestor_rejected(setup, tmp_path):
-    comfy, payload, runtime, state = setup
-    target = tmp_path / "Customer nodes"
-    (target / "custom_nodes").mkdir(parents=True)
-    link = tmp_path / "Alias"
-    link.symlink_to(target, target_is_directory=True)
-    with pytest.raises(hooks.InstallError, match="symbolic links"):
-        hooks.install(payload, runtime, comfy, state, "1.0", custom_nodes=link / "custom_nodes")
-    assert not state.exists()
-    assert not (target / "custom_nodes" / hooks.EXTENSION_NAME).exists()
-
-
-def test_layout_output_matches_selected_pair(setup, tmp_path, capsys):
-    comfy, _, _, _ = setup
-    launcher, nodes = make_launcher(tmp_path / "Home", comfy)
-    output = tmp_path / "Private validation output"
-    assert hooks.main(["resolve", "--comfyui", str(launcher), "--output-dir", str(output)]) == 0
-    result = {"schema": 1, "source": str(comfy), "custom_nodes": str(nodes)}
-    assert json.loads(capsys.readouterr().out) == result
-    assert json.loads((output / "layout.json").read_text()) == result
-    assert (output / "source.txt").read_text() == str(comfy)
-    assert (output / "custom_nodes.txt").read_text() == str(nodes)
-    assert {item.name for item in output.iterdir()} == {
-        "layout.json",
-        "source.txt",
-        "custom_nodes.txt",
-    }
-
-
-def test_launcher_ignores_incidental_base_flags_and_honors_explicit_override(setup, tmp_path):
-    comfy, _, _, _ = setup
-    launcher, nodes = make_launcher(tmp_path / "Home", comfy)
-    with (launcher / "launch.sh").open("a") as stream:
-        stream.write('echo --base-directory "/unrelated/base"\n')
-    assert hooks.resolve_layout(launcher) == (comfy, nodes)
-    (launcher / "launch.sh").write_text(
-        'exec python "$(unknown)/main.py" --base-directory "$UNKNOWN"'
-    )
-    assert hooks.resolve_layout(launcher, custom_nodes=nodes) == (comfy, nodes)
-    assert hooks.resolve_layout(launcher, base_directory=nodes.parent) == (comfy, nodes)
-
-
-@pytest.mark.parametrize(
-    "args,expected",
-    [
-        (["python3", "-I", "/ComfyUI/main.py", "--base-directory", "/base"], 2),
-        (["python3", "other.py", "--file", "/ComfyUI/main.py"], 1),
-        (["python3", "-c", "print('main.py')"], None),
-        (["python3", "-m", "other", "/ComfyUI/main.py"], None),
-    ],
-)
-def test_launcher_parser_identifies_actual_python_script_operand(args, expected):
-    assert hooks.python_script_operand(args) == expected
-
-
-def test_launcher_refuses_mismatched_source_and_missing_exec(setup, tmp_path):
-    comfy, _, _, _ = setup
-    launcher, _ = make_launcher(tmp_path / "Home", comfy)
-    other_main = (tmp_path / "Other source" / "main.py").as_posix()
-    (launcher / "launch.sh").write_text(
-        f'exec python "{other_main}" --base-directory "$ROOT/runtime"'
-    )
-    with pytest.raises(hooks.InstallError, match="does not match"):
-        hooks.resolve_layout(launcher)
-    (launcher / "launch.sh").write_text('echo --base-directory "runtime"\n')
-    with pytest.raises(hooks.InstallError, match="no single Python exec"):
-        hooks.resolve_layout(launcher)
-
-
-@pytest.mark.parametrize(
-    "script",
-    [
-        "exec python main.py --base-directory runtime",
-        'if false; then\nexec python "{source}/main.py" --base-directory "{base}"\nfi',
-        'ROOT="$(cat "$ROOT/comfyui-source.txt")"\nexec "$ROOT/python" "$ROOT/main.py"',
-    ],
-)
-def test_selected_untrusted_launcher_requires_explicit_base(setup, tmp_path, script):
-    comfy, _, _, _ = setup
-    launcher, nodes = make_launcher(tmp_path / "Home", comfy)
-    (launcher / "launch.sh").write_text(script.format(source=comfy, base=nodes.parent))
-    with pytest.raises(hooks.InstallError, match="Choose the source and base folders manually"):
-        hooks.resolve_layout(launcher)
-    assert hooks.resolve_layout(launcher, custom_nodes=nodes) == (comfy, nodes)
-    assert hooks.resolve_layout(launcher, base_directory=nodes.parent) == (comfy, nodes)
-
-
-def test_launcher_variable_expansion_does_not_replace_other_variable_prefix(setup, tmp_path):
-    comfy, _, _, _ = setup
-    launcher, _ = make_launcher(tmp_path / "Home", comfy)
-    text = (launcher / "launch.sh").read_text().replace("COMFYUI_SOURCE", "ROOT_SOURCE")
-    assert hooks.launcher_value("$ROOT/$ROOT_SOURCE", launcher, comfy, text) == str(
-        launcher
-    ) + "/" + str(comfy)
-
-
 @pytest.mark.parametrize(
     "name",
     [
@@ -663,13 +479,13 @@ def test_launcher_variable_expansion_does_not_replace_other_variable_prefix(setu
 )
 def test_selected_folder_rejects_native_shell_expansion_paths(tmp_path, name):
     with pytest.raises(hooks.InstallError, match="Folder paths must not contain"):
-        hooks.resolve_layout(tmp_path / name)
+        hooks.validate_comfyui(tmp_path / name)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Backslash is a Windows directory separator")
 def test_macos_selected_folder_rejects_literal_backslash_paths(tmp_path):
     with pytest.raises(hooks.InstallError, match="Folder paths must not contain"):
-        hooks.resolve_layout(tmp_path / "ComfyUI\\literal")
+        hooks.validate_comfyui(tmp_path / "ComfyUI\\literal")
 
 
 @pytest.mark.parametrize(
@@ -843,48 +659,35 @@ def test_macos_builder_rejects_literal_backslash_paths(tmp_path):
         builder.validate_native_path(tmp_path / "build\\literal")
 
 
-def test_portable_parent_resolves_only_nested_source_and_active_nodes(tmp_path):
-    portable = tmp_path / "ComfyUI portable with spaces"
-    source = portable / "ComfyUI"
+def test_selected_folder_must_contain_main_and_custom_nodes(tmp_path):
+    parent = tmp_path / "ComfyUI parent"
+    source = parent / "ComfyUI"
     (source / "custom_nodes").mkdir(parents=True)
     (source / "main.py").write_text("# customer source\n")
-    (portable / "custom_nodes").mkdir()
-    sentinel = portable / "custom_nodes/customer.txt"
-    sentinel.write_text("keep")
-    assert hooks.resolve_layout(portable) == (source.resolve(), source / "custom_nodes")
-    assert sentinel.read_text() == "keep"
+    with pytest.raises(hooks.InstallError, match="containing main.py and custom_nodes"):
+        hooks.validate_comfyui(parent)
+    assert hooks.validate_comfyui(source) == source.resolve()
 
 
-def test_direct_source_takes_precedence_over_a_nested_source(setup):
-    source, _, _, _ = setup
-    (source / "ComfyUI/custom_nodes").mkdir(parents=True)
-    (source / "ComfyUI/main.py").write_text("# nested customer source\n")
-    assert hooks.resolve_layout(source) == (source.resolve(), source / "custom_nodes")
-
-
-def test_resolve_rejects_unowned_prefix_before_writing_layout(setup, tmp_path, capsys):
+def test_validate_rejects_unowned_prefix(setup, tmp_path, capsys):
     source, _, _, _ = setup
     prefix = tmp_path / "Customer unrelated data"
     prefix.mkdir()
     sentinel = prefix / "customer.txt"
     sentinel.write_text("keep")
-    output = tmp_path / "resolved"
     assert (
         hooks.main(
             [
-                "resolve",
+                "validate",
                 "--comfyui",
                 str(source),
                 "--prefix",
                 str(prefix),
-                "--output-dir",
-                str(output),
             ]
         )
         == 1
     )
     assert "contains other files" in capsys.readouterr().err
-    assert not output.exists()
     assert sentinel.read_text() == "keep"
 
 
@@ -894,7 +697,7 @@ def test_prefix_overlap_is_rejected_before_payload_copy(setup, target):
     nodes = source / "custom_nodes"
     prefix = {"source": source, "nodes": nodes / "Deadline", "ancestor": source.parent}[target]
     with pytest.raises(hooks.InstallError, match="must be separate"):
-        hooks.validate_prefix(prefix, source, nodes)
+        hooks.validate_prefix(prefix, source)
 
 
 def test_existing_managed_prefix_can_only_target_its_original_host(setup, tmp_path):
@@ -905,17 +708,17 @@ def test_existing_managed_prefix_can_only_target_its_original_host(setup, tmp_pa
     )
     (prefix / "installer_version.txt").write_text("1.0")
     state.write_text(json.dumps({"extension": str(source / "custom_nodes" / hooks.EXTENSION_NAME)}))
-    hooks.validate_prefix(prefix, source, source / "custom_nodes")
+    hooks.validate_prefix(prefix, source)
     other = tmp_path / "Other ComfyUI"
     (other / "custom_nodes").mkdir(parents=True)
     with pytest.raises(hooks.InstallError, match="another ComfyUI installation"):
-        hooks.validate_prefix(prefix, other, other / "custom_nodes")
+        hooks.validate_prefix(prefix, other)
 
 
 def test_prefix_rejects_relative_paths(setup):
     source, _, _, _ = setup
     with pytest.raises(hooks.InstallError, match="absolute"):
-        hooks.validate_prefix(Path("Deadline Runtime"), source, source / "custom_nodes")
+        hooks.validate_prefix(Path("Deadline Runtime"), source)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Directory junctions require Windows")
@@ -933,8 +736,8 @@ def test_windows_junction_aliases_cannot_bypass_prefix_or_host_guards(setup, tmp
     assert result.returncode == 0, result.stderr
     try:
         with pytest.raises(hooks.InstallError, match="symbolic links"):
-            hooks.resolve_layout(alias)
+            hooks.validate_comfyui(alias)
         with pytest.raises(hooks.InstallError, match="symbolic links"):
-            hooks.validate_prefix(alias / "Deadline Runtime", source, source / "custom_nodes")
+            hooks.validate_prefix(alias / "Deadline Runtime", source)
     finally:
         alias.rmdir()

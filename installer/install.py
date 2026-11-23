@@ -9,7 +9,6 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -88,194 +87,14 @@ def direct_path(path: Path) -> Path:
     return expanded.resolve()
 
 
-def metadata_text(path: Path, limit: int = 65536) -> str:
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > limit:
-        raise InstallError(f"Invalid ComfyUI metadata: {path}")
-    return path.read_text(encoding="utf-8")
-
-
-def launcher_source(folder: Path) -> Path:
-    source_text = metadata_text(folder / "comfyui-source.txt", 4096).strip()
-    if not source_text or "\n" in source_text:
-        raise InstallError("comfyui-source.txt must contain one existing source folder.")
-    source = Path(source_text).expanduser()
-    return source if source.is_absolute() else folder / source
-
-
-def python_script_operand(args: list[str]) -> int | None:
-    """Find Python's actual script operand, excluding -c/-m and script arguments."""
-    if not args or not Path(args[0]).name.startswith("python"):
-        return None
-    index = 1
-    while index < len(args):
-        arg = args[index]
-        if arg == "--":
-            return index + 1 if index + 1 < len(args) else None
-        if not arg.startswith("-"):
-            return index
-        if arg in ("-c", "-m") or arg.startswith(("-c", "-m")):
-            return None
-        if arg in ("-X", "-W"):
-            index += 2
-        elif arg.startswith(("-X", "-W")) or arg in (
-            "-I",
-            "-B",
-            "-E",
-            "-s",
-            "-S",
-            "-u",
-            "-O",
-            "-OO",
-            "-q",
-            "-v",
-            "-vv",
-        ):
-            index += 1
-        else:
-            return None
-    return None
-
-
-def base_argument(args: list[str]) -> str | None:
-    bases = []
-    for index, arg in enumerate(args):
-        if arg == "--base-directory":
-            if index + 1 >= len(args) or args[index + 1].startswith("--"):
-                raise InstallError("ComfyUI has no base-directory value.")
-            bases.append(args[index + 1])
-        elif arg.startswith("--base-directory="):
-            bases.append(arg.partition("=")[2])
-    if len(set(bases)) > 1 or bases and not bases[0]:
-        raise InstallError("ComfyUI names ambiguous base directories.")
-    return bases[0] if bases else None
-
-
-def launcher_value(value: str, folder: Path, source: Path, text: str) -> str:
-    anchored_expressions = (
-        '"$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"',
-        '"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
-        '"$(cd -- "$(dirname -- "$0")" && pwd)"',
-        '"$(cd "$(dirname "$0")" && pwd)"',
-    )
-    variables = re.findall(r"\$(?:\{([A-Za-z_][A-Za-z_0-9]*)\}|([A-Za-z_][A-Za-z_0-9]*))", value)
-    for variable in variables:
-        name = variable[0] or variable[1]
-        assignments = re.findall(rf"(?m)^{re.escape(name)}=([^\n]+)$", text)
-        replacement = None
-        if len(assignments) == 1:
-            expression = assignments[0].strip()
-            if expression in anchored_expressions:
-                replacement = str(folder)
-            else:
-                # A source variable may only read this launcher's source pointer.
-                match = re.fullmatch(
-                    r'"\$\(cat "(\$[A-Za-z_][A-Za-z_0-9]*|\$\{[A-Za-z_][A-Za-z_0-9]*\})/comfyui-source\.txt"\)"',
-                    expression,
-                )
-                if match:
-                    anchor_name = match[1].removeprefix("$").strip("{}")
-                    anchor_assignments = re.findall(
-                        rf"(?m)^{re.escape(anchor_name)}=([^\n]+)$", text
-                    )
-                    if (
-                        len(anchor_assignments) == 1
-                        and anchor_assignments[0].strip() in anchored_expressions
-                    ):
-                        replacement = str(source)
-        if replacement is None:
-            raise InstallError(
-                "Choose the source and base folders manually; the launcher uses dynamic paths."
-            )
-        value = re.sub(
-            r"\$(?:\{" + re.escape(name) + r"\}|" + re.escape(name) + r"(?![A-Za-z_0-9]))",
-            lambda _match, replacement=replacement: replacement,
-            value,
-        )
-    unsupported = ("$", "`", "\n") + (("\\",) if os.name != "nt" else ())
-    if any(character in value for character in unsupported):
-        raise InstallError(
-            "Choose the source and base folders manually; the launcher uses dynamic paths."
-        )
-    return value
-
-
-def launcher_layout(folder: Path) -> tuple[Path, Path]:
-    """Read one literal Python main.py exec, never evaluating or running shell code."""
-    source = direct_path(launcher_source(folder))
-    text = metadata_text(folder / "launch.sh").replace("\\\n", " ")
-    if re.search(
-        r"(?m)^\s*(if|then|else|elif|fi|case|esac|for|while|until|function|exit|return)\b|^\s*[A-Za-z_][A-Za-z_0-9]*\s*\(\)",
-        text,
-    ):
-        raise InstallError(
-            "Choose the source and base folders manually; the launcher uses shell control flow."
-        )
-    commands = re.findall(r"(?m)^\s*exec\s+([^\n]+)$", text)
-    if len(commands) != 1:
-        raise InstallError(
-            "Choose the source and base folders manually; the launcher has no single Python exec."
-        )
-    try:
-        args = shlex.split(commands[0], comments=True)
-    except ValueError as error:
-        raise InstallError("The launcher metadata cannot be read safely.") from error
-    if not args or any(token in (";", "&&", "||", "|", "&", ">", "<") for token in args):
-        raise InstallError("The launcher has no single safe Python command.")
-    args[0] = launcher_value(args[0], folder, source, text)
-    index = python_script_operand(args)
-    if index is None or Path(args[index]).name != "main.py":
-        raise InstallError(
-            "Choose the source and base folders manually; the launcher is not a Python main.py exec."
-        )
-    script = Path(launcher_value(args[index], folder, source, text)).expanduser()
-    if not script.is_absolute():
-        raise InstallError(
-            "Choose the source and base folders manually; the launcher uses a relative main.py path."
-        )
-    if direct_path(script.parent) != source:
-        raise InstallError("The launcher's main.py does not match comfyui-source.txt.")
-    base = base_argument(args[index + 1 :])
-    nodes = source / "custom_nodes"
-    if base is not None:
-        base_path = Path(launcher_value(base, folder, source, text)).expanduser()
-        if not base_path.is_absolute():
-            raise InstallError(
-                "Choose the source and base folders manually; the launcher uses a relative base path."
-            )
-        nodes = base_path / "custom_nodes"
-    return source, nodes
-
-
-def resolve_layout(
-    path: Path, custom_nodes: Path | None = None, base_directory: Path | None = None
-) -> tuple[Path, Path]:
-    if custom_nodes is not None and base_directory is not None:
-        raise InstallError("Choose a custom_nodes folder or a base directory, not both.")
+def validate_comfyui(path: Path) -> Path:
     root = direct_path(path)
-    if (root / "comfyui-source.txt").exists():
-        if custom_nodes is not None or base_directory is not None:
-            root = launcher_source(root)
-            inferred_nodes = root / "custom_nodes"
-        else:
-            root, inferred_nodes = launcher_layout(root)
-    else:
-        # Windows portable distributions place the source below the selected parent.
-        # Inspect only this literal child, never execute a launcher or search the drive.
-        if not (root / "main.py").is_file() and (root / "ComfyUI/main.py").is_file():
-            root = root / "ComfyUI"
-        inferred_nodes = root / "custom_nodes"
-    root = direct_path(root)
-    selected_nodes = custom_nodes or (
-        base_directory / "custom_nodes" if base_directory else inferred_nodes
-    )
-    if linked_path(selected_nodes):
-        raise InstallError("The custom_nodes folder is a symbolic link. Choose its actual folder.")
-    nodes = direct_path(selected_nodes)
-    if not (root / "main.py").is_file() or not nodes.is_dir() or nodes.name != "custom_nodes":
+    nodes = root / "custom_nodes"
+    if not (root / "main.py").is_file() or not nodes.is_dir():
+        raise InstallError("Choose the ComfyUI folder containing main.py and custom_nodes.")
+    if linked_path(nodes):
         raise InstallError(
-            "Choose your existing ComfyUI source folder containing main.py, or its launcher "
-            "folder containing comfyui-source.txt. If ComfyUI uses --base-directory, choose "
-            "that base folder so Deadline is added to its active custom_nodes."
+            "The custom_nodes folder is linked. Choose a normal ComfyUI installation."
         )
     if not os.access(nodes, os.W_OK | os.X_OK):
         raise InstallError(f"The custom_nodes folder is not writable: {nodes}")
@@ -294,20 +113,18 @@ def resolve_layout(
         )
     ):
         raise InstallError(f"{destination} exists and is not the Deadline extension.")
-    return root, nodes
+    return root
 
 
-def validate_prefix(prefix: Path, source: Path, nodes: Path) -> None:
+def validate_prefix(prefix: Path, source: Path) -> None:
     """Reject unsafe destinations before InstallBuilder copies any product files."""
     if not prefix.expanduser().is_absolute():
         raise InstallError("Use an absolute Deadline Cloud installation directory.")
     prefix = direct_path(prefix)
-    for host in (source, nodes):
-        if prefix.is_relative_to(host) or host.is_relative_to(prefix):
-            raise InstallError(
-                "The Deadline Cloud installation directory must be separate from "
-                "the ComfyUI source and custom_nodes folders."
-            )
+    if prefix.is_relative_to(source) or source.is_relative_to(prefix):
+        raise InstallError(
+            "The Deadline Cloud installation directory must be separate from the ComfyUI folder."
+        )
     if not prefix.exists():
         return
     if not prefix.is_dir():
@@ -338,31 +155,13 @@ def validate_prefix(prefix: Path, source: Path, nodes: Path) -> None:
         if linked_path(prefix / name):
             raise InstallError("The existing Deadline installation contains linked managed files.")
     state = prefix / "installation.json"
-    if state.exists() and read_json(state).get("extension") != str(nodes / EXTENSION_NAME):
+    if state.exists() and read_json(state).get("extension") != str(
+        source / "custom_nodes" / EXTENSION_NAME
+    ):
         raise InstallError(
             "This installer already manages another ComfyUI installation. "
             "Uninstall it before selecting another folder."
         )
-
-
-def validate_comfyui(path: Path, custom_nodes: Path | None = None) -> Path:
-    root, nodes = resolve_layout(path, custom_nodes)
-    try:
-        with tempfile.NamedTemporaryFile(prefix=".deadline-write-check-", dir=nodes):
-            pass
-    except OSError as error:
-        raise InstallError(f"Cannot write to {nodes}: {error}") from error
-    return root
-
-
-def layout_output(directory: Path, source: Path, nodes: Path) -> None:
-    """Write only the selected source/active-node pair for the native wizard."""
-    directory.mkdir(parents=True, exist_ok=True)
-    write_json(
-        directory / "layout.json", {"schema": 1, "source": str(source), "custom_nodes": str(nodes)}
-    )
-    for name, value in (("source", source), ("custom_nodes", nodes)):
-        (directory / (name + ".txt")).write_text(str(value), encoding="utf-8")
 
 
 def runtime_paths(runtime: Path) -> tuple[Path, Path]:
@@ -475,16 +274,12 @@ def install(
     comfyui: Path,
     state: Path,
     version: str,
-    custom_nodes: Path | None = None,
 ) -> Path:
-    root, nodes = resolve_layout(comfyui, custom_nodes)
-    validate_comfyui(root, nodes)
+    root = validate_comfyui(comfyui)
+    nodes = root / "custom_nodes"
     runtime_root = direct_path(runtime)
-    for host in (root, nodes):
-        if runtime_root.parent.is_relative_to(host) or host.is_relative_to(runtime_root.parent):
-            raise InstallError(
-                "The Deadline runtime must be separate from ComfyUI source and custom_nodes."
-            )
+    if runtime_root.parent.is_relative_to(root) or root.is_relative_to(runtime_root.parent):
+        raise InstallError("The Deadline runtime must be separate from the ComfyUI folder.")
     files = payload_files(payload)
     python, cli = prepare_runtime(runtime.resolve())
     destination = nodes / EXTENSION_NAME
@@ -704,34 +499,17 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     validate = commands.add_parser("validate")
     validate.add_argument("--comfyui", required=True, type=Path)
-    validate.add_argument("--custom-nodes", type=Path)
-    resolve = commands.add_parser("resolve")
-    resolve.add_argument("--comfyui", required=True, type=Path)
-    resolve.add_argument("--custom-nodes", type=Path)
-    resolve.add_argument("--base-directory", type=Path)
-    resolve.add_argument("--prefix", type=Path)
-    resolve.add_argument("--output-dir", type=Path)
+    validate.add_argument("--prefix", required=True, type=Path)
     setup = commands.add_parser("install")
     for name in ("payload", "runtime", "comfyui", "state"):
         setup.add_argument(f"--{name}", required=True, type=Path)
     setup.add_argument("--version", default="development")
-    setup.add_argument("--custom-nodes", type=Path)
     remove = commands.add_parser("uninstall")
     remove.add_argument("--state", required=True, type=Path)
-    configure = commands.add_parser("configure")
-    configure.add_argument("--runtime", required=True, type=Path)
     args = parser.parse_args(argv)
     try:
         if args.command == "validate":
-            validate_comfyui(args.comfyui, args.custom_nodes)
-        elif args.command == "resolve":
-            source, nodes = resolve_layout(args.comfyui, args.custom_nodes, args.base_directory)
-            if args.prefix is not None:
-                validate_prefix(args.prefix, source, nodes)
-            result = {"schema": 1, "source": str(source), "custom_nodes": str(nodes)}
-            if args.output_dir:
-                layout_output(args.output_dir, source, nodes)
-            print(json.dumps(result, indent=2))
+            validate_prefix(args.prefix, validate_comfyui(args.comfyui))
         elif args.command == "install":
             extension = install(
                 args.payload,
@@ -739,18 +517,14 @@ def main(argv: list[str] | None = None) -> int:
                 args.comfyui,
                 args.state,
                 args.version,
-                args.custom_nodes,
             )
             print(
                 f"Installed Deadline Cloud in {extension}. Restart ComfyUI to use the Deadline panel."
             )
-        elif args.command == "uninstall":
+        else:
             preserved = uninstall(args.state)
             if preserved:
                 print("Preserved modified integration files: " + ", ".join(preserved))
-        else:
-            _, cli = runtime_paths(args.runtime)
-            subprocess.run([str(cli), "config", "gui"], check=True)
         return 0
     except (InstallError, OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"Deadline Cloud setup: {error}", file=sys.stderr)
