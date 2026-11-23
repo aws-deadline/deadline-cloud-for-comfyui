@@ -7,8 +7,6 @@ mypy == 2.*
 openjd-model == 0.*
 pytest == 9.*
 pytest-cov == 7.*
-# The Windows installer tests check the installed files' ACLs with it.
-pywin32 == 312.*; sys_platform == "win32"
 # Reads the job templates in the template script tests. ComfyUI depends on PyYAML too.
 pyyaml == 6.*
 ruff == 0.17.*

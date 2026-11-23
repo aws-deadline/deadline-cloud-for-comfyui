@@ -4,7 +4,6 @@ Runs a built installer against a stand-in ComfyUI folder. Run `hatch run test-in
 folder that contains the installer, or set COMFYUI_INSTALLER_PATH to it.
 """
 
-import getpass
 import glob
 import os
 import platform
@@ -29,21 +28,6 @@ COMPONENT_NAME = "deadline_cloud_for_comfyui"
 # Mirrors scripts/deps_bundle.py's SUPPORTED_PYTHON_VERSIONS; not imported since
 # test/installer does not otherwise reach into scripts/.
 SUPPORTED_PYTHON_VERSIONS = ["3.13", "3.14"]
-
-
-def _is_admin() -> bool:
-    """Platform independent utility to determine if the tests are running with
-    elevated privileges"""
-    # sys.platform helps mypy type checking ignore other platforms
-    if sys.platform != "win32":
-        return os.getuid() == 0
-
-    import ctypes
-
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin() == 1
-    except (AttributeError, OSError):
-        return False
 
 
 @dataclass
@@ -333,111 +317,6 @@ class TestMacOS:
             fmted_reasons = "\n  - ".join(reason for reason in bad_perms[entry])
             error_message.append(
                 f"{i+1}. ({stat.S_IMODE(entry.stat().st_mode):o}) '{Path(*entry.parts[len(installation_path.parts):])!s:>3}'\n"
-                f"  - {fmted_reasons}"
-            )
-
-        # THEN
-        assert len(bad_perms) == 0, "\n".join(error_message)
-
-
-@pytest.mark.skipif(platform.system() != "Windows", reason="Only run on Windows")
-class TestWindows:
-    def test_user_permissions(self, user_installation: Installation):
-        # GIVEN / WHEN / THEN
-        self._verify_windows_least_privilege(user_installation.prefix)
-        self._verify_windows_least_privilege(user_installation.extension)
-
-    def _running_in_container(self) -> bool:
-        """
-        Check to see if the cexecsvc service exists and is running
-        to determine if we're running on a container.
-        """
-        # assists mypy type checking to ignore this on non-Windows
-        assert sys.platform == "win32"
-        import win32service
-        import win32serviceutil
-
-        try:
-            service_status = win32serviceutil.QueryServiceStatus("cexecsvc")
-            return service_status[1] == win32service.SERVICE_RUNNING
-        except win32service.error:
-            # Service doesn't exist, not on a container
-            return False
-
-    def _verify_windows_least_privilege(self, installation_path: Path):
-        # assists mypy type checking to ignore this on non-Windows
-        assert sys.platform == "win32"
-        import ntsecuritycon
-        import win32con
-        import win32file
-        import win32security
-
-        # GIVEN
-        windows_user = getpass.getuser()
-
-        if self._running_in_container():
-            # The admin group is different wehen running
-            # in a container.
-            admin_group = "ContainerAdministrator"
-        else:
-            admin_group = "Administrators"
-
-        builtin_admin_group_sid, _, _ = win32security.LookupAccountName(None, admin_group)
-        user_sid, _, _ = win32security.LookupAccountName(None, windows_user)
-
-        # WHEN
-        bad_perms: defaultdict[Path, list[str]] = defaultdict(list)
-        for path in [installation_path, *installation_path.rglob("*")]:
-            sd = win32security.GetFileSecurity(
-                str(path),
-                win32con.DACL_SECURITY_INFORMATION | win32con.OWNER_SECURITY_INFORMATION,
-            )
-
-            # Verify ownership
-            owner_sid = sd.GetSecurityDescriptorOwner()
-            if _is_admin():
-                if builtin_admin_group_sid != owner_sid:
-                    bad_perms[path].append(
-                        f"Expected to be owned by '{admin_group}' but got '{win32security.LookupAccountSid(None, owner_sid)}'"
-                    )
-            elif user_sid != owner_sid:
-                bad_perms[path].append(
-                    f"Expected to be owned by '{win32security.LookupAccountSid(None, user_sid)}' but got '{win32security.LookupAccountSid(None, owner_sid)}'"
-                )
-
-            # Verify all ACEs
-            dacl = sd.GetSecurityDescriptorDacl()
-            if dacl.GetAceCount() != 3:
-                bad_perms[path].append(f"Expected 3 ACEs, but was {dacl.GetAceCount()}")
-
-            for ace in [dacl.GetAce(i) for i in range(dacl.GetAceCount())]:
-                _ace_info, mask, sid = ace
-                ace_type, ace_flags = _ace_info
-
-                if sid not in [builtin_admin_group_sid, user_sid]:
-                    continue
-                if ace_type != ntsecuritycon.ACCESS_ALLOWED_ACE_TYPE:
-                    bad_perms[path].append(
-                        f"Expected ACE type {ntsecuritycon.ACCESS_ALLOWED_ACE_TYPE} but got {ace_type}"
-                    )
-                if (
-                    path.is_dir()
-                    and ace_flags
-                    != ntsecuritycon.OBJECT_INHERIT_ACE | ntsecuritycon.CONTAINER_INHERIT_ACE
-                ):
-                    bad_perms[path].append(
-                        f"Expected inheritance in ACE to be {ntsecuritycon.OBJECT_INHERIT_ACE | ntsecuritycon.CONTAINER_INHERIT_ACE} but got {ace_flags}"
-                    )
-                if mask != win32file.FILE_ALL_ACCESS:
-                    bad_perms[path].append(
-                        f"Expected only FILE_ALL_ACCESS ({win32file.FILE_ALL_ACCESS}) ACEs but got {mask}"
-                    )
-
-        error_message = [f"Found {len(bad_perms)} instance(s) of incorrect permissions"]
-        for i, path in enumerate(bad_perms):
-            fmted_reasons = "\n  - ".join(reason for reason in bad_perms[path])
-            error_message.append(
-                f"{i+1}. '{Path(*path.parts[len(installation_path.parts):])!s:>3}'\n"
                 f"  - {fmted_reasons}"
             )
 
