@@ -1,8 +1,8 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 """
-Calls the Deadline Cloud client library for ComfyUI's submitter panel. ComfyUI runs this script with
-the Deadline Cloud CLI's own Python, `python -I bridge.py <command>`, so ComfyUI's environment
-doesn't need the library or boto3. It reads the request as a JSON object on the first line of
+Calls the Deadline Cloud client library for ComfyUI's submitter panel. The native installer uses
+ComfyUI's Python and a separate SDK directory. Source installations can use the CLI's Python.
+The script reads the request as a JSON object on the first line of
 stdin, and writes one JSON object per line to stdout: progress events while it works, then a
 "result" or an "error" event. While submitting, it reads each confirmation's answer as a further
 line of stdin.
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import site
 import sys
 import time
 from collections.abc import Callable
@@ -290,14 +291,30 @@ COMMANDS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
 def main(argv: list[str]) -> int:
     global _protocol
     _protocol = sys.stdout
-    if len(argv) != 2 or argv[1] not in COMMANDS:
-        emit("error", message=f"Usage: bridge.py {{{','.join(COMMANDS)}}}")
+    args = argv[1:]
+    sdk = None
+    if len(args) == 3 and args[0] == "--sdk":
+        sdk = Path(args[1])
+        args = args[2:]
+    if len(args) != 1 or args[0] not in COMMANDS:
+        emit("error", message=f"Usage: bridge.py [--sdk DIRECTORY] {{{','.join(COMMANDS)}}}")
         return 2
     try:
+        if sdk is not None:
+            packages = sdk / f"{sys.version_info.major}.{sys.version_info.minor}"
+            if not packages.is_dir():
+                raise RuntimeError(
+                    f"The Deadline Cloud SDK is missing for Python {sys.version_info.major}."
+                    f"{sys.version_info.minor}. Use ComfyUI with Python 3.13 or 3.14 and "
+                    "check the submitter installation."
+                )
+            # Apply only the bundled .pth files, including pywin32's DLL setup on Windows.
+            site.addsitedir(str(packages))
+            site.addsitedir(str(sdk / "common"))
         request = json.loads(sys.stdin.readline() or "{}")
         if not isinstance(request, dict):
             raise TypeError("The request isn't a JSON object.")
-        emit("result", data=COMMANDS[argv[1]](request))
+        emit("result", data=COMMANDS[args[0]](request))
     except Exception as e:  # noqa: BLE001 - every failure goes back to ComfyUI as an event.
         emit("error", message=str(e) or type(e).__name__, type=type(e).__name__)
         return 1

@@ -57,14 +57,10 @@ def test_host_picker_and_unattended_options_belong_to_the_component() -> None:
     )
 
 
-def test_component_packages_a_private_runtime_and_uses_the_selected_folder() -> None:
+def test_component_uses_the_selected_folder_and_existing_python() -> None:
     component = ET.parse(ROOT / "install_builder/deadline-cloud-for-comfyui.xml").getroot()
     folders = {folder.findtext("name"): folder for folder in component.findall("folderList/folder")}
-    assert folders["deadline_runtime"].findtext("destination") == "${installdir}"
-    assert (
-        folders["deadline_runtime"].findtext("distributionFileList/distributionDirectory/origin")
-        == "${payload_directory}/runtime"
-    )
+    assert set(folders) == {"comfyui_payload", "deadline_dependencies", "installation_helper"}
     assert folders["comfyui_payload"].findtext("destination") == "${installdir}/payload"
     assert folders["installation_helper"].findtext("destination") == "${installdir}"
     hooks = component.findall("postInstallationActionList/runProgram")
@@ -73,29 +69,28 @@ def test_component_packages_a_private_runtime_and_uses_the_selected_folder() -> 
     )
     arguments = install_hook.findtext("programArguments") or ""
     assert '--comfyui "${comfyui_directory}"' in arguments
-    assert '--runtime "${installdir}/runtime"' in arguments
+    assert '--sdk "${installdir}/sdk"' in arguments
     assert '--state "${installdir}/installation.json"' in arguments
     assert install_hook.findtext("abortOnError") == "1"
+    assert install_hook.findtext("program") == "${comfyui_python}"
     uninstaller = component.find("preUninstallationActionList/runProgram")
     assert uninstaller is not None
     assert 'uninstall --state "${installdir}/installation.json"' in (
         uninstaller.findtext("programArguments") or ""
     )
     assert uninstaller.findtext("abortOnError") == "1"
+    assert uninstaller.findtext("program") == "${comfyui_python}"
 
 
-def test_dependency_bundle_is_unpacked_before_runtime_validation() -> None:
+def test_dependency_bundle_is_unpacked_before_sdk_validation() -> None:
     component = ET.parse(ROOT / "install_builder/deadline-cloud-for-comfyui.xml").getroot()
     post_installation = component.find("postInstallationActionList")
     assert post_installation is not None
     actions = list(post_installation)
     unzip = next(action for action in actions if action.tag == "unzip")
-    runtime_hook = next(action for action in actions if action.tag == "runProgram")
-    assert actions.index(unzip) < actions.index(runtime_hook)
-    assert (
-        unzip.findtext("destinationDirectory")
-        == "${installdir}/runtime/${runtime_site_packages_relative}"
-    )
+    sdk_hook = next(action for action in actions if action.tag == "runProgram")
+    assert actions.index(unzip) < actions.index(sdk_hook)
+    assert unzip.findtext("destinationDirectory") == "${installdir}/sdk"
     assert unzip.findtext("addToUninstaller") == "1"
     assert (unzip.findtext("zipFile") or "").endswith(
         "deadline_cloud_for_comfyui_submitter-deps.zip"
@@ -106,8 +101,9 @@ def test_selected_target_and_prefix_are_validated_before_payload_copy() -> None:
     component = ET.parse(ROOT / "install_builder/deadline-cloud-for-comfyui.xml").getroot()
     ready = component.find("readyToInstallActionList")
     assert ready is not None
-    unpack = ready.find("unpackDirectory")
-    assert unpack is not None and unpack.get("folder") == "deadline_runtime"
+    unpack = ready.find("unpackFile")
+    assert unpack is not None and unpack.get("folder") == "installation_helper"
+    assert ready.findtext("runProgram/program") == "${comfyui_python}"
     assert ready.findtext("runProgram/programArguments") == (
-        '-I install.py validate --comfyui "${comfyui_directory}" --prefix "${installdir}"'
+        '-IBS install.py validate --comfyui "${comfyui_directory}" --prefix "${installdir}"'
     )

@@ -98,22 +98,20 @@ def test_installer_lock_pins_and_hashes_every_requirement(
 
 
 @pytest.mark.parametrize("offline", [False, True])
-@pytest.mark.parametrize("staged", [False, True], ids=["runtime", "sdk-target"])
 def test_hash_verification_is_required_for_index_and_wheelhouse(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offline: bool, staged: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offline: bool
 ) -> None:
     commands = []
     monkeypatch.setattr(builder, "run", lambda command: commands.append(command))
     wheelhouse = tmp_path / "Wheels with spaces" if offline else None
-    target = tmp_path / "SDK staging with spaces" if staged else None
-    builder.install_dependencies(Path("portable-python"), wheelhouse, target)
+    target = tmp_path / "SDK staging with spaces"
+    builder.install_dependencies(Path("python"), wheelhouse, target, version="3.14")
     assert len(commands) == 1
     command = commands[0]
     assert {"--require-hashes", "--force-reinstall", "--only-binary=:all:"} <= set(command)
     assert ("--no-index" in command) == offline
-    assert ("--target" in command) == staged
-    if target is not None:
-        assert command[command.index("--target") + 1] == str(target.resolve())
+    assert command[command.index("--target") + 1] == str(target.resolve())
+    assert command[command.index("--python-version") + 1] == "3.14"
     if wheelhouse is not None:
         assert command[command.index("--find-links") + 1] == str(wheelhouse.resolve())
 
@@ -181,24 +179,6 @@ def lock(tmp_path: Path, artifact: Path) -> None:
     )
 
 
-def test_locked_local_wheel_is_installed_without_an_index(
-    tmp_path: Path, isolated_runtime: Path
-) -> None:
-    wheels = tmp_path / "Wheelhouse"
-    wheels.mkdir()
-    artifact = wheel(wheels, "locked-parent")
-    lock(tmp_path, artifact)
-    builder.install_dependencies(isolated_runtime, wheels)
-    result = subprocess.run(
-        [str(isolated_runtime), "-I", "-c", "import locked_parent; print(locked_parent.VALUE)"],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.stdout.strip() == "trusted"
-
-
 def test_sdk_target_staging_does_not_install_dependencies_into_runtime(
     tmp_path: Path, isolated_runtime: Path
 ) -> None:
@@ -207,7 +187,7 @@ def test_sdk_target_staging_does_not_install_dependencies_into_runtime(
     artifact = wheel(wheels, "locked-parent")
     lock(tmp_path, artifact)
     target = tmp_path / "SDK staging with spaces"
-    builder.install_dependencies(isolated_runtime, wheels, target)
+    builder.install_dependencies(isolated_runtime, wheels, target, version="3.13")
     assert (target / "locked_parent/__init__.py").is_file()
     result = subprocess.run(
         [
@@ -245,15 +225,24 @@ def test_modified_local_wheel_is_rejected_even_when_version_is_installed(
     wheels.mkdir()
     artifact = wheel(wheels, "locked-parent")
     lock(tmp_path, artifact)
-    builder.install_dependencies(isolated_runtime, wheels)
+    target = tmp_path / "SDK staging"
+    builder.install_dependencies(isolated_runtime, wheels, target, version="3.13")
     with zipfile.ZipFile(artifact, "a") as archive:
         archive.writestr("locked_parent/unverified.py", "VALUE = 'modified'\n")
     with pytest.raises(subprocess.CalledProcessError) as failure:
-        builder.install_dependencies(isolated_runtime, wheels)
+        builder.install_dependencies(
+            isolated_runtime, wheels, tmp_path / "SDK staging", version="3.13"
+        )
     output = failure.value.stdout + failure.value.stderr
     assert "DO NOT MATCH THE HASHES" in output
     result = subprocess.run(
-        [str(isolated_runtime), "-I", "-c", "import locked_parent; print(locked_parent.VALUE)"],
+        [
+            str(isolated_runtime),
+            "-IBS",
+            "-c",
+            "import sys; sys.path.insert(0,sys.argv[1]); import locked_parent; print(locked_parent.VALUE)",
+            str(target),
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -272,7 +261,9 @@ def test_transitive_dependency_without_a_complete_hash_lock_is_rejected(
     wheel(wheels, "locked-child")
     lock(tmp_path, artifact)
     with pytest.raises(subprocess.CalledProcessError) as failure:
-        builder.install_dependencies(isolated_runtime, wheels)
+        builder.install_dependencies(
+            isolated_runtime, wheels, tmp_path / "SDK staging", version="3.13"
+        )
     output = failure.value.stdout + failure.value.stderr
     assert "--require-hashes" in output and "locked-child" in output
     result = subprocess.run(
@@ -360,42 +351,6 @@ def test_windows_target_wheel_closure_is_hash_verified_offline(
         assert result.returncode != 0
         assert "--require-hashes" in result.stdout + result.stderr
         assert "locked-child" in result.stdout + result.stderr
-
-
-@pytest.mark.parametrize("python_version", ["3.13", "3.14"])
-@pytest.mark.parametrize("system", ["Darwin", "Windows"])
-def test_sdk_bundle_is_separate_from_platform_runtime_site_packages(
-    tmp_path: Path, python_version: str, system: str
-) -> None:
-    runtime = tmp_path / "Portable runtime with spaces"
-    relative = (
-        "Lib/site-packages" if system == "Windows" else f"lib/python{python_version}/site-packages"
-    )
-    info = {
-        "system": system,
-        "version": [int(part) for part in python_version.split(".")],
-        "site_packages_relative": relative,
-    }
-    site_packages = builder.runtime_site_packages(runtime, info)
-    assert site_packages == runtime / relative
-    module = site_packages / "locked_sdk/__init__.py"
-    module.parent.mkdir(parents=True)
-    module.write_text("# Synthetic SDK fixture.\n", encoding="utf-8")
-    scripts = runtime / ("Scripts" if system == "Windows" else "bin")
-    scripts.mkdir()
-    python = scripts / ("python.exe" if system == "Windows" else "python3")
-    python.write_text("synthetic interpreter", encoding="utf-8")
-    cli = scripts / ("deadline.exe" if system == "Windows" else "deadline")
-    cli.write_text("synthetic SDK launcher", encoding="utf-8")
-    stdlib = site_packages.parent / "os.py"
-    stdlib.write_text("# Synthetic standard library.\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="must not contain SDK dependencies"):
-        builder.validate_bare_runtime(runtime, info)
-    builder.strip_runtime_dependencies(runtime, info)
-    builder.validate_bare_runtime(runtime, info)
-    assert not site_packages.exists() and not cli.exists()
-    assert python.read_text(encoding="utf-8") == "synthetic interpreter"
-    assert stdlib.read_text(encoding="utf-8") == "# Synthetic standard library.\n"
 
 
 def test_dependency_bundle_is_deterministic_and_contains_raw_site_packages(tmp_path: Path) -> None:

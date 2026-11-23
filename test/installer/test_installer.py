@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import time
+import venv
 import xml.etree.ElementTree as ET
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -51,15 +52,13 @@ class Layout:
 
     @property
     def python(self) -> Path:
-        return self.prefix / (
-            "runtime/python.exe" if sys.platform == "win32" else "runtime/bin/python3"
+        return self.source / (
+            ".venv/Scripts/python.exe" if sys.platform == "win32" else ".venv/bin/python"
         )
 
     @property
-    def cli(self) -> Path:
-        return self.prefix / (
-            "runtime/Scripts/deadline.exe" if sys.platform == "win32" else "runtime/bin/deadline"
-        )
+    def sdk(self) -> Path:
+        return self.prefix / "sdk"
 
     @property
     def uninstaller(self) -> Path:
@@ -79,6 +78,7 @@ def make_layout(root: Path) -> Layout:
     (source / "main.py").write_text(
         "# Synthetic host; no ComfyUI code or assets.\n", encoding="utf-8"
     )
+    venv.EnvBuilder(with_pip=False, symlinks=sys.platform != "win32").create(source / ".venv")
     (nodes / "studio-node/customer.txt").write_text("keep studio node", encoding="utf-8")
     configuration = root / "Isolated configuration"
     configuration.mkdir()
@@ -96,7 +96,7 @@ def make_layout(root: Path) -> Layout:
         "DEADLINE_CONFIG_FILE_PATH": str(configuration / "deadline-config"),
         "QT_QPA_PLATFORM": "offscreen",
     }
-    return Layout(root, source, root / "Deadline runtime with spaces", environment)
+    return Layout(root, source, root / "Deadline install with spaces", environment)
 
 
 def run_program(
@@ -171,13 +171,14 @@ def uninstall(layout: Layout) -> None:
         while remaining_prefix_entries(layout.prefix) and time.monotonic() < deadline:
             time.sleep(0.25)
     remaining = remaining_prefix_entries(layout.prefix)
-    assert not remaining, "The uninstaller left private runtime files behind:\n" + "\n".join(
+    assert not remaining, "The uninstaller left installed files behind:\n" + "\n".join(
         str(path) for path in remaining
     )
     assert (layout.source / "main.py").read_text(encoding="utf-8").startswith("# Synthetic host")
     assert (layout.nodes / "studio-node/customer.txt").read_text(
         encoding="utf-8"
     ) == "keep studio node"
+    assert layout.python.is_file()
 
 
 @pytest.fixture(scope="session")
@@ -264,10 +265,11 @@ def test_component_and_selected_folder_cli(installer_help: str | None) -> None:
             for item in component.iter()
             if item.tag.endswith("Parameter")
         }
-        assert options == {"comfyui-directory"}
+        assert options == {"comfyui-directory", "comfyui-python"}
         return
     assert "--enable-components" in installer_help and COMPONENT in installer_help
     assert "--comfyui-directory" in installer_help
+    assert "--comfyui-python" in installer_help
     for removed in (
         "--installscope",
         "--comfyui-base-directory",
@@ -281,7 +283,7 @@ def test_installed_files_and_dependencies(user_installation: Layout) -> None:
     assert (layout.prefix / "installer_version.txt").read_text(encoding="utf-8").strip()
     assert layout.uninstaller.is_file()
     assert (layout.prefix / ".deadline-cloud-for-comfyui-installer").is_file()
-    for staging in ("payload", "bootstrap", "dependency_bundle"):
+    for staging in ("payload", "bootstrap", "dependency_bundle", "runtime"):
         assert not (layout.prefix / staging).exists(), staging
     assert not (layout.prefix / "rollbackBackupDirectory").exists()
     for relative in (
@@ -298,40 +300,64 @@ def test_installed_files_and_dependencies(user_installation: Layout) -> None:
     )
     names = {re.sub(r"[-_.]+", "-", entry["name"]).lower() for entry in inventory}
     assert {"deadline", "boto3", "botocore", "pyside6-essentials", "awscrt"} <= names
-    python, cli = layout.python, layout.cli
+    configuration = json.loads((layout.extension / CONFIG).read_text(encoding="utf-8"))
+    assert configuration == {"deadline_sdk": str(layout.sdk)}
+    assert all((layout.sdk / version / "deadline/client").is_dir() for version in ("3.13", "3.14"))
     code = (
-        "import json,sys,ssl,importlib.util,deadline.client,boto3,botocore,awscrt; "
-        "import psutil,yaml,xxhash,qtpy,distlib; from yaml import _yaml; "
+        "import json,sys,ssl,site,importlib.util; "
+        "assert not any('site-packages' in path for path in sys.path); "
+        "site.addsitedir(sys.argv[1]); "
+        "site.addsitedir(sys.argv[2]); "
+        "import deadline.client,boto3,botocore,awscrt; "
+        "import psutil,yaml,xxhash,qtpy; from yaml import _yaml; "
         "from PySide6 import QtCore,QtWidgets; "
         "modules=('deadline.client','boto3','botocore','awscrt','PySide6.QtCore',"
-        "'shiboken6','psutil','yaml','xxhash','distlib','qtpy'); "
-        "print(json.dumps({'prefix':sys.prefix,'version':list(sys.version_info[:2]),"
+        "'shiboken6','psutil','yaml','xxhash','qtpy'); "
+        "assert xxhash.xxh128(b'Deadline').hexdigest(); "
+        "print(json.dumps({'version':list(sys.version_info[:2]),"
         "'tls':bool(ssl.create_default_context().get_ca_certs()),"
         "'modules':{name:importlib.util.find_spec(name).origin for name in modules}}))"
     )
-    result = run_program(python, ["-I", "-c", code], layout=layout)
+    site_packages = layout.sdk / f"{sys.version_info.major}.{sys.version_info.minor}"
+    common = layout.sdk / "common"
+    result = run_program(
+        layout.python, ["-IBS", "-c", code, str(site_packages), str(common)], layout=layout
+    )
     assert_success(result)
     details = json.loads(result.stdout)
-    assert Path(details["prefix"]).resolve() == layout.prefix / "runtime"
     assert details["version"] in ([3, 13], [3, 14]) and details["tls"]
-    version = ".".join(str(part) for part in details["version"])
-    site_packages = (
-        layout.prefix
-        / "runtime"
-        / ("Lib/site-packages" if sys.platform == "win32" else f"lib/python{version}/site-packages")
-    )
     assert all(
-        Path(path).resolve().is_relative_to(site_packages) for path in details["modules"].values()
+        Path(path).resolve().is_relative_to(site_packages)
+        or Path(path).resolve().is_relative_to(common)
+        for path in details["modules"].values()
     ), details
     if sys.platform == "win32":
         # Imports of these native modules verify Windows conditional dependencies too.
-        assert_success(run_program(python, ["-I", "-c", "import colorama,win32api"], layout=layout))
-    result = run_program(cli, ["--version"], layout=layout)
-    assert_success(result)
-    assert "deadline" in result.stdout.lower()
-    configuration = json.loads((layout.extension / CONFIG).read_text(encoding="utf-8"))
-    assert configuration["deadline_python"] == str(python)
-    assert configuration["deadline_cli"] == str(cli)
+        assert_success(
+            run_program(
+                layout.python,
+                [
+                    "-IBS",
+                    "-c",
+                    "import site,sys; site.addsitedir(sys.argv[1]); import colorama,win32api",
+                    str(site_packages),
+                ],
+                layout=layout,
+            )
+        )
+    bridge = layout.extension / "src/deadline/comfyui_submitter/bridge.py"
+    result = run_program(
+        layout.python,
+        ["-IBS", str(bridge), "--sdk", str(layout.sdk), "submit"],
+        layout=layout,
+        input_text="{}\n",
+    )
+    assert result.returncode == 1
+    assert json.loads(result.stdout) == {
+        "event": "error",
+        "message": "'bundleDir'",
+        "type": "KeyError",
+    }
 
 
 def test_user_ownership_and_permissions(user_installation: Layout) -> None:
@@ -406,7 +432,7 @@ def test_upgrade_uninstall_reinstall_preserves_customer_settings(
     assert not list(customer_module.parent.joinpath("__pycache__").glob("bridge.*.pyc"))
     preserved = json.loads(configuration.read_text(encoding="utf-8"))
     assert preserved["conda_channels"] == "studio-channel" and preserved["custom_setting"] == "keep"
-    assert "deadline_python" not in preserved and "deadline_cli" not in preserved
+    assert "deadline_sdk" not in preserved
     assert (layout.extension / ".deadline-installer-uninstalled.json").is_file()
     install(installer_path, layout)
     assert not (layout.extension / ".deadline-installer-uninstalled.json").exists()
@@ -492,11 +518,14 @@ def test_invalid_targets_are_rejected_before_installing(
             COMPONENT,
             "--comfyui-directory",
             str(source),
+            "--comfyui-python",
+            sys.executable,
         ],
         layout=layout,
     )
     assert result.returncode != 0, result.stdout + result.stderr
     assert not (prefix / "runtime").exists()
+    assert not (prefix / "sdk").exists()
     assert not (source / "custom_nodes" / EXTENSION).exists()
     assert not (layout.root / "shell-sentinel").exists()
     if case == "unrelated-prefix":

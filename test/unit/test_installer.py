@@ -44,25 +44,19 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path, 
         path = payload / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"packaged {name}\n")
-    runtime = tmp_path / "Deadline installation" / "runtime"
-    python, cli = hooks.runtime_paths(runtime)
-    python.parent.mkdir(parents=True, exist_ok=True)
-    cli.parent.mkdir(parents=True, exist_ok=True)
-    python.write_text("runtime")
-    cli.write_text("cli")
-    monkeypatch.setattr(hooks, "prepare_runtime", lambda path: hooks.runtime_paths(path))
-    return comfy, payload, runtime, runtime.parent / "installation.json"
+    sdk = tmp_path / "Deadline installation" / "sdk"
+    sdk.mkdir(parents=True)
+    monkeypatch.setattr(hooks, "verify_sdk", lambda path: None)
+    return comfy, payload, sdk, sdk.parent / "installation.json"
 
 
-def test_offline_install_preserves_comfyui_and_records_runtime(setup):
-    comfy, payload, runtime, state = setup
-    result = hooks.install(payload, runtime, comfy, state, "1.0")
+def test_offline_install_preserves_comfyui_and_records_sdk(setup):
+    comfy, payload, sdk, state = setup
+    result = hooks.install(payload, sdk, comfy, state, "1.0")
     assert result == comfy / "custom_nodes" / hooks.EXTENSION_NAME
     assert (comfy / "main.py").read_text() == "# customer supplied\n"
     config = json.loads((result / hooks.CONFIG_NAME).read_text())
-    python, cli = hooks.runtime_paths(runtime)
-    assert config["deadline_python"] == str(python)
-    assert config["deadline_cli"] == str(cli)
+    assert config == {"deadline_sdk": str(sdk)}
     assert json.loads(state.read_text())["files"]["__init__.py"] == hooks.digest(
         payload / "__init__.py"
     )
@@ -71,38 +65,38 @@ def test_offline_install_preserves_comfyui_and_records_runtime(setup):
 
 
 def test_upgrade_preserves_customer_config_and_extra_files(setup):
-    comfy, payload, runtime, state = setup
-    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    comfy, payload, sdk, state = setup
+    destination = hooks.install(payload, sdk, comfy, state, "1.0")
     config = destination / hooks.CONFIG_NAME
     config.write_text(json.dumps({"conda_channels": "studio-channel", "custom": True}))
     (destination / "customer.txt").write_text("keep")
     (payload / "__init__.py").write_text("new plugin")
-    hooks.install(payload, runtime, comfy, state, "2.0")
+    hooks.install(payload, sdk, comfy, state, "2.0")
     assert (destination / "__init__.py").read_text() == "new plugin"
     assert (destination / "customer.txt").read_text() == "keep"
     assert json.loads(config.read_text())["conda_channels"] == "studio-channel"
     assert json.loads(config.read_text())["custom"] is True
 
 
-def test_runtime_failure_leaves_existing_extension_untouched(setup, monkeypatch):
-    comfy, payload, runtime, state = setup
-    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+def test_sdk_failure_leaves_existing_extension_untouched(setup, monkeypatch):
+    comfy, payload, sdk, state = setup
+    destination = hooks.install(payload, sdk, comfy, state, "1.0")
     before = (destination / "__init__.py").read_text()
     (payload / "__init__.py").write_text("new")
 
-    def fail(_runtime):
-        raise hooks.InstallError("runtime broken")
+    def fail(_sdk):
+        raise hooks.InstallError("sdk broken")
 
-    monkeypatch.setattr(hooks, "prepare_runtime", fail)
-    with pytest.raises(hooks.InstallError, match="runtime broken"):
-        hooks.install(payload, runtime, comfy, state, "2.0")
+    monkeypatch.setattr(hooks, "verify_sdk", fail)
+    with pytest.raises(hooks.InstallError, match="sdk broken"):
+        hooks.install(payload, sdk, comfy, state, "2.0")
     assert (destination / "__init__.py").read_text() == before
     assert json.loads(state.read_text())["version"] == "1.0"
 
 
 def test_state_write_failure_rolls_back_extension(setup, monkeypatch):
-    comfy, payload, runtime, state = setup
-    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    comfy, payload, sdk, state = setup
+    destination = hooks.install(payload, sdk, comfy, state, "1.0")
     (payload / "__init__.py").write_text("new")
     original = hooks.write_json
 
@@ -113,14 +107,14 @@ def test_state_write_failure_rolls_back_extension(setup, monkeypatch):
 
     monkeypatch.setattr(hooks, "write_json", fail)
     with pytest.raises(OSError, match="disk full"):
-        hooks.install(payload, runtime, comfy, state, "2.0")
+        hooks.install(payload, sdk, comfy, state, "2.0")
     assert (destination / "__init__.py").read_text() == "packaged __init__.py\n"
     assert not list(destination.parent.glob(".deadline-cloud-install-*"))
 
 
 def test_uninstall_preserves_settings_modified_files_and_other_nodes(setup):
-    comfy, payload, runtime, state = setup
-    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    comfy, payload, sdk, state = setup
+    destination = hooks.install(payload, sdk, comfy, state, "1.0")
     (destination / "__init__.py").write_text("customer modification")
     (destination / "customer.txt").write_text("keep")
     other = comfy / "custom_nodes" / "other-node"
@@ -140,8 +134,8 @@ def test_uninstall_preserves_settings_modified_files_and_other_nodes(setup):
 def test_uninstall_does_not_enter_customer_directory_junction(setup, tmp_path):
     import subprocess
 
-    comfy, payload, runtime, state = setup
-    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    comfy, payload, sdk, state = setup
+    destination = hooks.install(payload, sdk, comfy, state, "1.0")
     outside = tmp_path / "Customer directory outside integration"
     empty = outside / "Customer empty folder" / "Nested empty folder"
     empty.mkdir(parents=True)
@@ -184,8 +178,8 @@ def test_uninstall_does_not_enter_customer_directory_junction(setup, tmp_path):
 
 
 def test_uninstall_rejects_traversal_before_deleting_anything(setup):
-    comfy, payload, runtime, state = setup
-    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    comfy, payload, sdk, state = setup
+    destination = hooks.install(payload, sdk, comfy, state, "1.0")
     manifest = json.loads(state.read_text())
     manifest["files"]["../outside"] = "bad"
     state.write_text(json.dumps(manifest))
@@ -196,75 +190,46 @@ def test_uninstall_rejects_traversal_before_deleting_anything(setup):
 
 
 def test_install_rejects_incomplete_payload(setup):
-    comfy, payload, runtime, state = setup
+    comfy, payload, sdk, state = setup
     (payload / "src/deadline/comfyui_submitter/web/deadline_submit.js").unlink()
     with pytest.raises(hooks.InstallError, match="incomplete"):
-        hooks.install(payload, runtime, comfy, state, "1.0")
+        hooks.install(payload, sdk, comfy, state, "1.0")
     assert not state.exists()
     assert not (comfy / "custom_nodes" / hooks.EXTENSION_NAME).exists()
 
 
 def test_install_rejects_unknown_destination(setup):
-    comfy, payload, runtime, state = setup
+    comfy, payload, sdk, state = setup
     destination = comfy / "custom_nodes" / hooks.EXTENSION_NAME
     destination.mkdir()
     (destination / "user.txt").write_text("keep")
     with pytest.raises(hooks.InstallError, match="not the Deadline extension"):
-        hooks.install(payload, runtime, comfy, state, "1.0")
+        hooks.install(payload, sdk, comfy, state, "1.0")
     assert (destination / "user.txt").read_text() == "keep"
 
 
 def test_second_comfyui_cannot_orphan_managed_install(setup):
-    comfy, payload, runtime, state = setup
-    hooks.install(payload, runtime, comfy, state, "1.0")
+    comfy, payload, sdk, state = setup
+    hooks.install(payload, sdk, comfy, state, "1.0")
     other = comfy.parent / "second"
     (other / "custom_nodes").mkdir(parents=True)
     (other / "main.py").write_text("existing")
     with pytest.raises(hooks.InstallError, match="another ComfyUI"):
-        hooks.install(payload, runtime, other, state, "2.0")
+        hooks.install(payload, sdk, other, state, "2.0")
     assert not (other / "custom_nodes" / hooks.EXTENSION_NAME).exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Symlink permissions differ on Windows")
 def test_upgrade_rejects_link_that_would_modify_outside_directory(setup, tmp_path):
-    comfy, payload, runtime, state = setup
-    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    comfy, payload, sdk, state = setup
+    destination = hooks.install(payload, sdk, comfy, state, "1.0")
     outside = tmp_path / "outside.py"
     outside.write_text("keep")
     (destination / "__init__.py").unlink()
     (destination / "__init__.py").symlink_to(outside)
     with pytest.raises(hooks.InstallError, match="symbolic link"):
-        hooks.install(payload, runtime, comfy, state, "2.0")
+        hooks.install(payload, sdk, comfy, state, "2.0")
     assert outside.read_text() == "keep"
-
-
-@pytest.mark.skipif(os.name == "nt", reason="Symlink permissions differ on Windows")
-def test_runtime_copy_rewrites_absolute_internal_links(tmp_path):
-    runtime = tmp_path / "original"
-    (runtime / "bin").mkdir(parents=True)
-    (runtime / "bin/python3.13").write_text("python")
-    (runtime / "bin/python3").symlink_to(runtime / "bin/python3.13")
-    copied = tmp_path / "relocated"
-    builder.copy_runtime(runtime, copied)
-    assert not Path(os.readlink(copied / "bin/python3")).is_absolute()
-    assert (copied / "bin/python3").resolve() == copied / "bin/python3.13"
-
-
-@pytest.mark.skipif(os.name == "nt", reason="Symlink permissions differ on Windows")
-def test_runtime_copy_rejects_external_links(tmp_path):
-    runtime = tmp_path / "original"
-    runtime.mkdir()
-    (runtime / "python3").symlink_to(tmp_path / "outside")
-    with pytest.raises(ValueError, match="outside"):
-        builder.copy_runtime(runtime, tmp_path / "output")
-
-
-def test_runtime_copy_rejects_nonportable_venv(tmp_path):
-    runtime = tmp_path / "venv"
-    runtime.mkdir()
-    (runtime / "pyvenv.cfg").write_text("home=/somewhere")
-    with pytest.raises(ValueError, match="virtual environment"):
-        builder.copy_runtime(runtime, tmp_path / "output")
 
 
 @pytest.mark.parametrize(
@@ -276,15 +241,15 @@ def test_manifest_rejects_windows_and_posix_escape_names(tmp_path, name):
 
 
 def test_clean_uninstall_removes_generated_config_and_directory(setup):
-    comfy, payload, runtime, state = setup
-    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    comfy, payload, sdk, state = setup
+    destination = hooks.install(payload, sdk, comfy, state, "1.0")
     assert hooks.uninstall(state) == []
     assert not destination.exists()
 
 
 def test_old_uninstaller_preserves_customer_replacement(setup):
-    comfy, payload, runtime, state = setup
-    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    comfy, payload, sdk, state = setup
+    destination = hooks.install(payload, sdk, comfy, state, "1.0")
     (destination / hooks.MARKER_NAME).unlink()
     assert hooks.uninstall(state) == ["extension now managed outside this installer"]
     assert (destination / "__init__.py").exists()
@@ -292,8 +257,8 @@ def test_old_uninstaller_preserves_customer_replacement(setup):
 
 
 def test_old_uninstaller_preserves_newer_ownership(setup):
-    comfy, payload, runtime, state = setup
-    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    comfy, payload, sdk, state = setup
+    destination = hooks.install(payload, sdk, comfy, state, "1.0")
     marker = destination / hooks.MARKER_NAME
     changed = json.loads(marker.read_text())
     changed["installation_id"] = "another installer"
@@ -306,22 +271,22 @@ def test_old_uninstaller_preserves_newer_ownership(setup):
     "target,system,machine",
     [("Linux", "Linux", "aarch64"), ("Windows", "Windows", "arm64"), ("MacOS", "Linux", "x86_64")],
 )
-def test_builder_rejects_mislabeled_runtime_architecture(target, system, machine):
+def test_builder_rejects_mislabeled_sdk_architecture(target, system, machine):
     with pytest.raises(ValueError):
         builder.validate_architecture({"system": system, "machine": machine}, target)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="macOS installer symlink validation")
 def test_install_rejects_linked_custom_nodes_before_changing_files(setup):
-    comfy, payload, runtime, state = setup
+    comfy, payload, sdk, state = setup
     custom_nodes = comfy / "custom_nodes"
     custom_nodes.rmdir()
-    target = runtime.parent / "payload"
+    target = sdk.parent / "payload"
     target.mkdir()
     (target / "customer.txt").write_text("keep")
     custom_nodes.symlink_to(target, target_is_directory=True)
     with pytest.raises(hooks.InstallError, match="custom_nodes folder is linked"):
-        hooks.install(payload, runtime, comfy, state, "1.0")
+        hooks.install(payload, sdk, comfy, state, "1.0")
     assert (target / "customer.txt").read_text() == "keep"
     assert not state.exists()
     assert not (target / hooks.EXTENSION_NAME).exists()
@@ -329,8 +294,8 @@ def test_install_rejects_linked_custom_nodes_before_changing_files(setup):
 
 @pytest.mark.skipif(os.name == "nt", reason="macOS installer symlink validation")
 def test_old_uninstaller_preserves_extension_behind_changed_custom_nodes_link(setup):
-    comfy, payload, runtime, state = setup
-    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    comfy, payload, sdk, state = setup
+    destination = hooks.install(payload, sdk, comfy, state, "1.0")
     custom_nodes = comfy / "custom_nodes"
     moved = comfy / "customer-managed-nodes"
     custom_nodes.rename(moved)
@@ -342,18 +307,18 @@ def test_old_uninstaller_preserves_extension_behind_changed_custom_nodes_link(se
 
 @pytest.mark.parametrize("origin", ["edited-native", "existing-source"])
 def test_uninstall_preserves_customer_config_after_upgrade(setup, origin):
-    comfy, payload, runtime, state = setup
+    comfy, payload, sdk, state = setup
     destination = comfy / "custom_nodes" / hooks.EXTENSION_NAME
     if origin == "edited-native":
-        hooks.install(payload, runtime, comfy, state, "1.0")
+        hooks.install(payload, sdk, comfy, state, "1.0")
     else:
         destination.mkdir()
         (destination / "__init__.py").write_text("source setup")
         (destination / "src/deadline/comfyui_submitter").mkdir(parents=True)
     configuration = destination / hooks.CONFIG_NAME
     configuration.write_text(json.dumps({"conda_channels": "studio", "custom": True}))
-    hooks.install(payload, runtime, comfy, state, "2.0")
-    hooks.install(payload, runtime, comfy, state, "3.0")
+    hooks.install(payload, sdk, comfy, state, "2.0")
+    hooks.install(payload, sdk, comfy, state, "3.0")
     assert json.loads(state.read_text())["preserve_configuration"] is True
     hooks.uninstall(state)
     assert json.loads(configuration.read_text()) == {"conda_channels": "studio", "custom": True}
@@ -361,21 +326,21 @@ def test_uninstall_preserves_customer_config_after_upgrade(setup, origin):
 
 
 def test_unchanged_generated_config_still_removed_after_upgrade(setup):
-    comfy, payload, runtime, state = setup
-    destination = hooks.install(payload, runtime, comfy, state, "1.0")
-    hooks.install(payload, runtime, comfy, state, "2.0")
+    comfy, payload, sdk, state = setup
+    destination = hooks.install(payload, sdk, comfy, state, "1.0")
+    hooks.install(payload, sdk, comfy, state, "2.0")
     assert json.loads(state.read_text())["preserve_configuration"] is False
     assert hooks.uninstall(state) == []
     assert not destination.exists()
 
 
 def test_reinstall_preserved_settings_and_files_after_edited_upgrade(setup, tmp_path):
-    comfy, payload, runtime, state = setup
-    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    comfy, payload, sdk, state = setup
+    destination = hooks.install(payload, sdk, comfy, state, "1.0")
     config = destination / hooks.CONFIG_NAME
     config.write_text(json.dumps({"conda_channels": "studio", "custom": True}))
     (destination / "customer.txt").write_text("keep")
-    hooks.install(payload, runtime, comfy, state, "2.0")
+    hooks.install(payload, sdk, comfy, state, "2.0")
     old_state = tmp_path / "old-installer-state.json"
     old_state.write_text(state.read_text())
     hooks.uninstall(state)
@@ -386,7 +351,7 @@ def test_reinstall_preserved_settings_and_files_after_edited_upgrade(setup, tmp_
         "status": "uninstalled",
         "extension": str(destination.resolve()),
     }
-    hooks.install(payload, runtime, comfy, state, "3.0")
+    hooks.install(payload, sdk, comfy, state, "3.0")
     assert not receipt.exists()
     assert json.loads(config.read_text())["conda_channels"] == "studio"
     assert json.loads(config.read_text())["custom"] is True
@@ -401,7 +366,7 @@ def test_reinstall_preserved_settings_and_files_after_edited_upgrade(setup, tmp_
     [("product", "other"), ("schema", 2), ("status", "installed"), ("extension", "/different")],
 )
 def test_reinstall_rejects_invalid_uninstall_receipt(setup, key, value):
-    comfy, payload, runtime, state = setup
+    comfy, payload, sdk, state = setup
     destination = comfy / "custom_nodes" / hooks.EXTENSION_NAME
     destination.mkdir()
     receipt = {
@@ -414,14 +379,14 @@ def test_reinstall_rejects_invalid_uninstall_receipt(setup, key, value):
     (destination / hooks.RECEIPT_NAME).write_text(json.dumps(receipt))
     (destination / "customer.txt").write_text("keep")
     with pytest.raises(hooks.InstallError, match="invalid uninstall receipt"):
-        hooks.install(payload, runtime, comfy, state, "1.0")
+        hooks.install(payload, sdk, comfy, state, "1.0")
     assert (destination / "customer.txt").read_text() == "keep"
     assert not state.exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="macOS installer symlink validation")
 def test_reinstall_rejects_linked_uninstall_receipt(setup, tmp_path):
-    comfy, payload, runtime, state = setup
+    comfy, payload, sdk, state = setup
     destination = comfy / "custom_nodes" / hooks.EXTENSION_NAME
     destination.mkdir()
     target = tmp_path / "receipt.json"
@@ -437,14 +402,14 @@ def test_reinstall_rejects_linked_uninstall_receipt(setup, tmp_path):
     )
     (destination / hooks.RECEIPT_NAME).symlink_to(target)
     with pytest.raises(hooks.InstallError, match="linked uninstall receipt"):
-        hooks.install(payload, runtime, comfy, state, "1.0")
+        hooks.install(payload, sdk, comfy, state, "1.0")
     assert target.exists()
     assert not state.exists()
 
 
 def test_uninstall_receipt_write_failure_retains_retry_ownership(setup, monkeypatch):
-    comfy, payload, runtime, state = setup
-    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    comfy, payload, sdk, state = setup
+    destination = hooks.install(payload, sdk, comfy, state, "1.0")
     (destination / "customer.txt").write_text("keep")
     original = hooks.write_json
 
@@ -515,9 +480,9 @@ def compile_module(module: Path, optimization: int = 0) -> Path:
 
 
 def test_clean_uninstall_removes_generated_packaged_module_bytecode(setup):
-    comfy, payload, runtime, state = setup
+    comfy, payload, sdk, state = setup
     valid_python_payload(payload)
-    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    destination = hooks.install(payload, sdk, comfy, state, "1.0")
     cached = [
         compile_module(module, optimization)
         for module in destination.rglob("*.py")
@@ -535,9 +500,9 @@ def test_clean_uninstall_removes_generated_packaged_module_bytecode(setup):
 
 
 def test_uninstall_preserves_edited_and_customer_module_bytecode(setup):
-    comfy, payload, runtime, state = setup
+    comfy, payload, sdk, state = setup
     valid_python_payload(payload)
-    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    destination = hooks.install(payload, sdk, comfy, state, "1.0")
     edited = destination / "__init__.py"
     edited.write_text("# Customer changes.\nVALUE = 2\n", encoding="utf-8")
     edited_cache = compile_module(edited)
@@ -563,9 +528,9 @@ def test_uninstall_preserves_edited_and_customer_module_bytecode(setup):
 @pytest.mark.skipif(os.name == "nt", reason="Symlink permissions differ on Windows")
 @pytest.mark.parametrize("link_directory", [False, True])
 def test_uninstall_does_not_follow_bytecode_symlinks(setup, tmp_path, link_directory):
-    comfy, payload, runtime, state = setup
+    comfy, payload, sdk, state = setup
     valid_python_payload(payload)
-    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    destination = hooks.install(payload, sdk, comfy, state, "1.0")
     module = destination / "src/deadline/comfyui_submitter/bridge.py"
     cached = compile_module(module)
     outside = tmp_path / "Customer bytecode outside integration"
@@ -586,9 +551,9 @@ def test_uninstall_does_not_follow_bytecode_symlinks(setup, tmp_path, link_direc
 
 
 def test_uninstall_cache_removal_failure_preserves_source_ownership_for_retry(setup, monkeypatch):
-    comfy, payload, runtime, state = setup
+    comfy, payload, sdk, state = setup
     valid_python_payload(payload)
-    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    destination = hooks.install(payload, sdk, comfy, state, "1.0")
     manifest = json.loads(state.read_text())
     owned_files = {
         destination / name: (destination / name).read_bytes() for name in manifest["files"]
@@ -629,8 +594,8 @@ def test_uninstall_cache_removal_failure_preserves_source_ownership_for_retry(se
 def test_uninstall_reports_unexpected_directory_cleanup_errors_and_allows_retry(
     setup, monkeypatch, root_folder
 ):
-    comfy, payload, runtime, state = setup
-    destination = hooks.install(payload, runtime, comfy, state, "1.0")
+    comfy, payload, sdk, state = setup
+    destination = hooks.install(payload, sdk, comfy, state, "1.0")
     target = destination if root_folder else destination / "src/deadline/comfyui_submitter"
     original = Path.rmdir
     failed = False
@@ -701,8 +666,8 @@ def test_prefix_overlap_is_rejected_before_payload_copy(setup, target):
 
 
 def test_existing_managed_prefix_can_only_target_its_original_host(setup, tmp_path):
-    source, _, runtime, state = setup
-    prefix = runtime.parent
+    source, _, sdk, state = setup
+    prefix = sdk.parent
     (prefix / ".deadline-cloud-for-comfyui-installer").write_text(
         "deadline-cloud-for-comfyui-installer-v1"
     )

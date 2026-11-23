@@ -101,23 +101,21 @@ echo '{}' | /path/to/deadline-cli-python -I src/deadline/comfyui_submitter/bridg
 ## Building the installers
 
 Build on the target operating system with Node.js 22 or later, npm, Hatch,
-InstallBuilder, and a trusted portable CPython 3.13 or 3.14 distribution. Use Apple
-silicon for macOS and x64 for Windows. Windows embeddable distributions need isolated
-imports and pip. Keep the distribution's license files.
+InstallBuilder, and CPython 3.13 for the Hatch build environment. Use Apple silicon
+for macOS and x64 for Windows.
 
 The build compiles the panel into the installer payload and bundles the locked SDK
 wheels in `dependency_bundle/deadline_cloud_for_comfyui_submitter-deps.zip`, like
-Cinema 4D. The installer uses its packed Python to check the selected ComfyUI folder
-and installation prefix before copying files. InstallBuilder then installs the runtime
-and extracts the SDK into it. The helper regenerates the Deadline CLI for the final
-path and checks SDK imports, TLS, and the CLI before replacing the extension.
+Cinema 4D. The installer uses ComfyUI's Python to validate the selected folder and
+installation prefix. InstallBuilder then extracts the SDK, and the helper checks
+the corresponding native wheels before replacing the extension. The panel loads the
+SDK in a subprocess of ComfyUI's Python and calls the installed CLI for downloads.
 
 For macOS:
 
 ```sh
 hatch run installer:build-installer \
   --platform MacOS \
-  --python-runtime /path/to/portable-python \
   --install-builder-path /path/to/installbuilder \
   --local-dev
 ```
@@ -128,14 +126,12 @@ For Windows PowerShell:
 $payload = Join-Path $env:TEMP ('comfyui-installer-payload-' + [guid]::NewGuid().ToString('N'))
 hatch run installer:build-installer `
   --platform Windows `
-  --python-runtime 'C:\Build Tools\Portable Python' `
   --install-builder-path 'C:\Build Tools\InstallBuilder' `
   --payload-dir $payload `
   --local-dev
 ```
 
-Artifacts go to `dist/installers/`. Set `COMFYUI_INSTALLER_PYTHON_RUNTIME` when a build
-runner provides Python. Build automation accepts the same InstallBuilder location,
+Artifacts go to `dist/installers/`. Build automation accepts the same InstallBuilder location,
 private S3 archive, license, development, and version-override options as Cinema 4D.
 Local builds can use a fresh `--payload-dir`, validate it with `--stage-only`, rebuild
 with `--reuse-payload`, or resolve SDK wheels from a local `--wheelhouse`.
@@ -144,12 +140,14 @@ with `--reuse-payload`, or resolve SDK wheels from a local `--wheelhouse`.
 
 Run `hatch run test-installer` on the target operating system. The suite picks the
 installer under `dist/installers/`. Set `COMFYUI_INSTALLER_PATH` to use another artifact.
-It runs the native installer and uninstaller against disposable folders that contain
-`main.py` and `custom_nodes`. It checks packaged dependencies, permissions, upgrade,
+It runs the native installer and uninstaller against disposable folders with a Python
+`.venv`, `main.py` and `custom_nodes`. It checks packaged dependencies, permissions, upgrade,
 uninstall, customer file preservation, and invalid destinations.
 
 For unattended installation, pass `--comfyui-directory` with the absolute path to
 the ComfyUI folder and `--prefix` with the separate Deadline installation directory.
+Use `--comfyui-python` with the absolute path to the Python executable if your ComfyUI
+environment lives outside its `.venv`.
 Use the same prefix and ComfyUI folder for upgrades. `hatch run test` runs unit tests
 without an installer.
 
@@ -182,6 +180,6 @@ installer and run its native tests before accepting a lock update.
 
 The repository calls the shared installer build, release, and XML-change workflows.
 Customer releases require the managed macOS and Windows build/signing projects, the
-shared release project, protected GitHub environments and role, licensed InstallBuilder,
-and a trusted Python runtime. Verify Windows Authenticode, macOS signing and notarization,
+shared release project, protected GitHub environments and role, and licensed InstallBuilder.
+Verify Windows Authenticode, macOS signing and notarization,
 and a real panel submission for the release. See [Installer validation](installer/VALIDATION.md).

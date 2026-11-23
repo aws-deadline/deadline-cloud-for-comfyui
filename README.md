@@ -50,8 +50,9 @@ When you submit, the extension:
 4. Shows the hashing and upload progress, asks you to confirm when Deadline Cloud would (for
    example, to upload files outside the storage profile), and then shows the job ID.
 
-The library runs in the Deadline Cloud CLI's own Python environment, not ComfyUI's, through
-`bridge.py`, so ComfyUI doesn't need boto3 or the deadline package.
+The panel calls the Deadline Cloud SDK through `bridge.py`. Native installer setups use
+ComfyUI's Python with the SDK supplied by the installer. Source setups can use the SDK
+from the Deadline Cloud CLI's Python environment.
 
 ## Requirements
 
@@ -89,18 +90,20 @@ Select the ComfyUI submitter, then choose the folder containing both `main.py` a
 `custom_nodes`. The folder picker suggests `ComfyUI` in your home folder. The installer
 supports standard ComfyUI layouts and requires a writable `custom_nodes` directory.
 
-The installer includes the compiled panel, Deadline Cloud SDK and CLI, and the Python
-runtime used by the submitter. Restart ComfyUI after installation to load the extension.
-Keep the `DeadlineCloudForComfyUISubmitter` folder in your home directory while the
-extension is installed. Set up Deadline Cloud monitor credentials or an AWS profile
-for your account.
+The installer includes the compiled panel and Deadline Cloud SDK for CPython 3.13
+and 3.14. It uses the Python in ComfyUI's `.venv` when available. Otherwise, select
+the Python executable you use to launch ComfyUI. Restart ComfyUI after installation
+and keep the `DeadlineCloudForComfyUISubmitter` folder while the extension is installed.
+Set up Deadline Cloud monitor credentials or an AWS profile for your account. To
+download job outputs, make the installed Deadline Cloud CLI available on ComfyUI's
+`PATH` or set `COMFYUI_DEADLINE_CLI`.
 
 Run the newer installer with the same ComfyUI folder to upgrade. It preserves existing
 submitter settings and unrelated custom nodes. To remove an installer installation, quit
 ComfyUI and run `uninstall.exe` on Windows or `uninstall.app` on macOS from the Deadline
-installation folder. Start ComfyUI again after uninstalling. The uninstaller removes
-unchanged integration files and its own runtime, and keeps customer additions and edited
-settings. ComfyUI, models, workflows, and Deadline Cloud credentials stay in place.
+installation folder while your ComfyUI Python is still available. Start ComfyUI again
+after uninstalling. The uninstaller removes unchanged integration files and the SDK
+and keeps customer additions and edited settings.
 
 The shared installer build workflow uses the AWS-managed build/signing projects, which
 must be provisioned for this integration before producing a customer release. Local and
@@ -160,7 +163,7 @@ the environment that starts ComfyUI.
 
 | Environment variable | Default | Description |
 |---|---|---|
-| `COMFYUI_DEADLINE_PYTHON` | `deadline_python` in the installer config, then the CLI's Python | The executable Python runtime used for Deadline Cloud. The installer configures its private runtime automatically. |
+| `COMFYUI_DEADLINE_PYTHON` | `deadline_python` in the config, then the CLI's Python | Overrides the Python used for source installations. Native installations use ComfyUI's Python. |
 | `COMFYUI_DEADLINE_CLI` | `deadline_cli` in the config, then `deadline` on the `PATH` | The Deadline Cloud CLI executable. |
 | `COMFYUI_DEADLINE_CONDA_CHANNELS` | `conda_channels` in the config | Optional **Conda Channels** to fill in. When neither is set, the queue's default, the Deadline Cloud channels, is used. |
 | `COMFYUI_DEADLINE_CONFIG` | `deadline_cloud_submitter.json` in the extension folder | Another config file to read. |

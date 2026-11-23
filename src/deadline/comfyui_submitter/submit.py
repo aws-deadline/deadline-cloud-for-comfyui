@@ -85,9 +85,9 @@ def resolve_deadline_cli(config: dict[str, Any] | None = None) -> str:
     found = shutil.which("deadline")
     if not found:
         raise SubmitError(
-            "The Deadline Cloud CLI wasn't found. Run install_submitter.py to set it up, or install "
-            f'it into its own Python environment with pip install "deadline[gui]>=0.60.8" and put '
-            f"it on the PATH or set {CLI_ENV_VAR} to its `deadline` executable."
+            "The Deadline Cloud CLI wasn't found. Put the installed CLI on PATH or set "
+            f"{CLI_ENV_VAR} to its executable. For source installations, run install_submitter.py "
+            'or install the CLI with pip install "deadline[gui]>=0.60.8".'
         )
     return found
 
@@ -211,7 +211,8 @@ def check_cli_version(cli: str, version_output: str) -> None:
         minimum = ".".join(map(str, MIN_CLI_VERSION))
         raise SubmitError(
             f"The Deadline Cloud CLI at {cli} is version {'.'.join(map(str, version))}, which can't "
-            f"open the submitter with the workflow filled in. Upgrade it to {minimum} or later with "
+            f"open the submitter with the workflow filled in. Upgrade it to {minimum} or later "
+            "with the Deadline Cloud installer or "
             f'pip install --upgrade "deadline[gui]>={minimum}".'
         )
 

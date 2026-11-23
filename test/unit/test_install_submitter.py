@@ -435,7 +435,13 @@ def test_setup_replaces_stale_packaged_python_config(tmp_path):
     extension.mkdir()
     config = extension / install.CONFIG_FILE_NAME
     config.write_text(
-        json.dumps({"deadline_python": "/removed/runtime/python", "conda_channels": "studio"})
+        json.dumps(
+            {
+                "deadline_python": "/removed/runtime/python",
+                "deadline_sdk": "/removed/sdk",
+                "conda_channels": "studio",
+            }
+        )
     )
     marker = extension / ".deadline-installer.json"
     marker.write_text("native owner")
@@ -445,6 +451,7 @@ def test_setup_replaces_stale_packaged_python_config(tmp_path):
     install.write_config(extension, cli, None)
     settings = json.loads(config.read_text())
     assert "deadline_python" not in settings
+    assert "deadline_sdk" not in settings
     assert settings["conda_channels"] == "studio"
     assert settings["deadline_cli"] == ".deadline-cli/bin/deadline"
     assert not marker.exists()

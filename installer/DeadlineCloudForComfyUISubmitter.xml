@@ -15,13 +15,13 @@
         <setInstallerVariable name="deadline_install_succeeded" value="0" />
         <throwError text="This installer requires an Apple Silicon Mac. Use an installer built for your Mac's processor.">
             <ruleList>
-                <compareText text="${runtime_architecture}" value="arm64" logic="equals" />
+                <compareText text="${installer_architecture}" value="arm64" logic="equals" />
                 <platformTest type="osx-arm64" negate="1" />
             </ruleList>
         </throwError>
         <throwError text="This installer requires 64-bit Windows.">
             <ruleList>
-                <compareText text="${runtime_architecture}" value="x64" logic="equals" />
+                <compareText text="${installer_architecture}" value="x64" logic="equals" />
                 <platformTest type="windows" />
                 <platformTest type="windows-x64" negate="1" />
             </ruleList>
@@ -41,9 +41,7 @@
     <parameterList>
         <!-- These paths are populated by the build script, never requested from customers. -->
         <stringParameter name="payload_directory" value="payload" ask="0" cliOptionShow="0" />
-        <stringParameter name="runtime_python_relative" value="bin/python3" ask="0" cliOptionShow="0" />
-        <stringParameter name="runtime_architecture" value="arm64" ask="0" cliOptionShow="0" />
-        <stringParameter name="runtime_site_packages_relative" value="lib/python3.13/site-packages" ask="0" cliOptionShow="0" />
+        <stringParameter name="installer_architecture" value="arm64" ask="0" cliOptionShow="0" />
         <directoryParameter>
             <name>installdir</name>
             <description>Deadline Cloud installation directory</description>
@@ -94,12 +92,12 @@
             <ruleEvaluationLogic>or</ruleEvaluationLogic>
             <ruleList>
                 <regExMatch text="${installdir}" pattern="[&quot;$`%\r\n]" />
-                <regExMatch text="${runtime_python_relative}" pattern="[&quot;$`%\r\n]" />
+                <regExMatch text="${comfyui_python}" pattern="[&quot;$`%\r\n]" />
             </ruleList>
         </throwError>
-        <throwError text="The Deadline Cloud runtime folder is a symbolic link. Remove the link before uninstalling; its target was left unchanged.">
+        <throwError text="The Deadline Cloud SDK folder is a symbolic link. Remove the link before uninstalling; its target was left unchanged.">
             <ruleList>
-                <fileTest path="${installdir}/runtime" condition="is_symlink" />
+                <fileTest path="${installdir}/sdk" condition="is_symlink" />
             </ruleList>
         </throwError>
         <throwError text="The installer backup path is a symbolic link. Remove the link before uninstalling; its target was left unchanged.">
@@ -109,10 +107,9 @@
         </throwError>
     </preUninstallationActionList>
     <postUninstallationActionList>
-        <!-- Python may generate caches after installation. This directory is installer-owned. -->
-        <deleteFile path="${installdir}/runtime">
+        <deleteFile path="${installdir}/sdk">
             <ruleList>
-                <fileTest path="${installdir}/runtime" condition="is_symlink" negate="1" />
+                <fileTest path="${installdir}/sdk" condition="is_symlink" negate="1" />
             </ruleList>
         </deleteFile>
     </postUninstallationActionList>

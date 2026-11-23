@@ -90,12 +90,6 @@ deadline-job-attachments==0.1.5 \
     # via
     #   -c requirements-installer.txt
     #   deadline
-distlib==0.4.4 \
-    --hash=sha256:ca4175b4ac7f71223cc30ed7248c45d2b38c2439d8ee6e498ab67ed63cf3508d \
-    --hash=sha256:cf09d55b1e85a89576b036aeb71550bfd68320f3f21761ca329eadadad918638
-    # via
-    #   -c requirements-installer.txt
-    #   -r requirements-installer.in
 jmespath==1.1.0 \
     --hash=sha256:472c87d80f36026ae83c6ddd0f1d05d4e510134ed462851fd5f754c8c3cbb88d \
     --hash=sha256:a5663118de4908c91729bea0acadca56526eb2698e83de10cd116ae0f4e97c64

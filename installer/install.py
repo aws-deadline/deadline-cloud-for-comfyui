@@ -1,5 +1,5 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-"""Offline installer hooks, run by the installer's bundled Python."""
+"""Offline installer hooks, run by the existing ComfyUI Python."""
 
 from __future__ import annotations
 
@@ -145,6 +145,7 @@ def validate_prefix(prefix: Path, source: Path) -> None:
     for name in (
         "payload",
         "runtime",
+        "sdk",
         "dependency_bundle",
         "install.py",
         "installation.json",
@@ -164,59 +165,50 @@ def validate_prefix(prefix: Path, source: Path) -> None:
         )
 
 
-def runtime_paths(runtime: Path) -> tuple[Path, Path]:
-    if os.name == "nt":
-        return runtime / "python.exe", runtime / "Scripts/deadline.exe"
-    return runtime / "bin/python3", runtime / "bin/deadline"
+def validate_python() -> None:
+    if sys.implementation.name != "cpython" or sys.version_info[:2] not in ((3, 13), (3, 14)):
+        raise InstallError("Select the CPython 3.13 or 3.14 executable used to run ComfyUI.")
 
 
-def run_python(python: Path, code: str) -> str:
+def verify_sdk(sdk: Path) -> None:
+    """Check the SDK selected by the host interpreter in a fresh Python process."""
+    validate_python()
+    packages = sdk / f"{sys.version_info.major}.{sys.version_info.minor}"
+    code = """
+import importlib.metadata as metadata
+import os
+import site
+import ssl
+import sys
+site.addsitedir(sys.argv[1])
+site.addsitedir(sys.argv[2])
+import awscrt
+import boto3
+import deadline.client.api
+import xxhash
+from PySide6 import QtWidgets
+from yaml import _yaml
+if os.name == "nt":
+    import win32security
+ssl.create_default_context()
+xxhash.xxh128(b"Deadline")
+print(metadata.version("deadline"), metadata.version("botocore"))
+"""
     result = subprocess.run(
-        [str(python), "-I", "-c", code], capture_output=True, text=True, check=False
+        [sys.executable, "-IBS", "-c", code, str(packages), str(sdk / "common")],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if result.returncode:
-        raise InstallError(
-            f"The bundled Deadline runtime could not start:\n{result.stderr.strip()}"
-        )
-    return result.stdout.strip()
-
-
-def prepare_runtime(runtime: Path) -> tuple[Path, Path]:
-    """Rebuild binary launchers at their final path, including Windows .exe launchers."""
-    python, cli = runtime_paths(runtime)
-    if not python.is_file():
-        raise InstallError(f"The installer is missing its Python runtime: {python}")
-    details = json.loads(
-        run_python(
-            python,
-            "import json, sys, importlib.metadata as m; "
-            "import ssl, boto3, botocore, deadline.client.api, PySide6.QtWidgets; "
-            "ssl.create_default_context(); "
-            "print(json.dumps({'prefix':sys.prefix,'python':list(sys.version_info[:2]),"
-            "'deadline':m.version('deadline'),'botocore':m.version('botocore')}))",
-        )
-    )
-    if Path(details["prefix"]).resolve() != runtime.resolve():
-        raise InstallError(
-            "The bundled Python is not relocatable. Rebuild with a portable runtime."
-        )
-    if tuple(details["python"]) not in ((3, 13), (3, 14)):
-        raise InstallError("The bundled runtime must use Python 3.13 or 3.14.")
-    for name, minimum in (("deadline", MIN_DEADLINE), ("botocore", MIN_BOTOCORE)):
-        if tuple(int(part) for part in details[name].split(".")) < minimum:
+        raise InstallError(f"The Deadline Cloud SDK failed to load:\n{result.stderr.strip()}")
+    deadline, botocore = result.stdout.strip().splitlines()[-1].split()
+    for name, version, minimum in (
+        ("deadline", deadline, MIN_DEADLINE),
+        ("botocore", botocore, MIN_BOTOCORE),
+    ):
+        if tuple(int(part) for part in version.split(".")) < minimum:
             raise InstallError(f"The installer contains an incompatible {name} version.")
-    code = (
-        "from distlib.scripts import ScriptMaker; import sys; "
-        f"maker=ScriptMaker(None, {str(cli.parent)!r}); "
-        "maker.variants={''}; maker.clobber=True; "
-        "maker.make('deadline = deadline.client.cli:main', "
-        "{'interpreter_args':['-I']})"
-    )
-    run_python(python, code)
-    result = subprocess.run([str(cli), "--version"], capture_output=True, text=True, check=False)
-    if result.returncode:
-        raise InstallError(f"The bundled Deadline CLI could not start:\n{result.stderr.strip()}")
-    return python, cli
 
 
 def digest(path: Path) -> str:
@@ -270,26 +262,25 @@ def payload_files(payload: Path) -> dict[str, str]:
 
 def install(
     payload: Path,
-    runtime: Path,
+    sdk: Path,
     comfyui: Path,
     state: Path,
     version: str,
 ) -> Path:
     root = validate_comfyui(comfyui)
     nodes = root / "custom_nodes"
-    runtime_root = direct_path(runtime)
-    if runtime_root.parent.is_relative_to(root) or root.is_relative_to(runtime_root.parent):
-        raise InstallError("The Deadline runtime must be separate from the ComfyUI folder.")
+    sdk = direct_path(sdk)
+    if sdk.parent.is_relative_to(root) or root.is_relative_to(sdk.parent):
+        raise InstallError("The Deadline installation directory must be separate from ComfyUI.")
     files = payload_files(payload)
-    python, cli = prepare_runtime(runtime.resolve())
+    verify_sdk(sdk)
     destination = nodes / EXTENSION_NAME
-    if state.exists():
-        previous_state = read_json(state)
-        if previous_state.get("extension") != str(destination):
-            raise InstallError(
-                "This installer already manages another ComfyUI installation. "
-                "Uninstall it first, or choose a different installer prefix."
-            )
+    previous_state = read_json(state) if state.exists() else None
+    if previous_state is not None and previous_state.get("extension") != str(destination):
+        raise InstallError(
+            "This installer already manages another ComfyUI installation. "
+            "Uninstall it first, or choose a different installer prefix."
+        )
     configuration_path = destination / CONFIG_NAME
     marker_path = destination / MARKER_NAME
     previous_installation = read_json(marker_path) if marker_path.exists() else {}
@@ -298,7 +289,19 @@ def install(
         bool(previous_installation.get("preserve_configuration"))
         or digest(configuration_path) != previous_installation.get("config_hash")
     )
-    configuration.update(deadline_cli=str(cli), deadline_python=str(python))
+    old_runtime = state.parent / "runtime"
+    legacy_runtime = (
+        previous_state is not None
+        and previous_installation == previous_state
+        and previous_state.get("runtime") == str(old_runtime)
+    )
+    if legacy_runtime:
+        old_cli = "Scripts/deadline.exe" if os.name == "nt" else "bin/deadline"
+        old_python = "python.exe" if os.name == "nt" else "bin/python3"
+        for key, path in (("deadline_cli", old_cli), ("deadline_python", old_python)):
+            if configuration.get(key) == str(old_runtime / path):
+                configuration.pop(key)
+    configuration["deadline_sdk"] = str(sdk)
     stage = Path(tempfile.mkdtemp(prefix=".deadline-cloud-install-", dir=destination.parent))
     backup = stage.with_name(stage.name + ".backup")
     moved = False
@@ -325,7 +328,7 @@ def install(
             "extension": str(destination),
             "comfyui_source": str(root),
             "custom_nodes": str(nodes),
-            "runtime": str(runtime.resolve()),
+            "sdk": str(sdk),
             "files": files,
             "version": version,
         }
@@ -344,6 +347,14 @@ def install(
             raise
         if moved:
             shutil.rmtree(backup)
+        if legacy_runtime and old_runtime.is_dir() and not linked_path(old_runtime):
+            try:
+                shutil.rmtree(old_runtime)
+            except OSError as error:
+                print(
+                    f"Couldn't remove the old installer runtime at {old_runtime}: {error}",
+                    file=sys.stderr,
+                )
         return destination
     except Exception:
         if moved and backup.exists() and not destination.exists():
@@ -432,13 +443,11 @@ def uninstall(state: Path) -> list[str]:
         ):
             configuration.unlink()
         else:
-            # Preserve studio settings but remove references to the runtime being uninstalled.
+            # Preserve studio settings and drop the installer-owned SDK path.
             try:
                 config = read_json(configuration)
-                python, cli = runtime_paths(Path(manifest["runtime"]))
-                for key, managed in (("deadline_python", python), ("deadline_cli", cli)):
-                    if config.get(key) == str(managed):
-                        config.pop(key)
+                if config.get("deadline_sdk") == manifest.get("sdk"):
+                    config.pop("deadline_sdk", None)
                 write_json(configuration, config)
             except InstallError:
                 preserved.append(CONFIG_NAME)
@@ -501,7 +510,7 @@ def main(argv: list[str] | None = None) -> int:
     validate.add_argument("--comfyui", required=True, type=Path)
     validate.add_argument("--prefix", required=True, type=Path)
     setup = commands.add_parser("install")
-    for name in ("payload", "runtime", "comfyui", "state"):
+    for name in ("payload", "sdk", "comfyui", "state"):
         setup.add_argument(f"--{name}", required=True, type=Path)
     setup.add_argument("--version", default="development")
     remove = commands.add_parser("uninstall")
@@ -509,11 +518,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "validate":
+            validate_python()
             validate_prefix(args.prefix, validate_comfyui(args.comfyui))
         elif args.command == "install":
             extension = install(
                 args.payload,
-                args.runtime,
+                args.sdk,
                 args.comfyui,
                 args.state,
                 args.version,

@@ -25,38 +25,34 @@ from scripts.find_installbuilder import extract_builder_archive, find_builder
 
 
 @pytest.mark.parametrize(
-    "target,system,machine,site,artifact,python",
+    "target,system,machine,artifact,arch",
     [
         (
             "Windows",
             "Windows",
             "AMD64",
-            "Lib/site-packages",
             "DeadlineCloudForComfyUISubmitter-windows-x64-installer.exe",
-            "python.exe",
+            "x64",
         ),
         (
             "MacOS",
             "Darwin",
             "arm64",
-            "lib/python3.13/site-packages",
             "DeadlineCloudForComfyUISubmitter-osx-arm64-installer.app",
-            "bin/python3",
+            "arm64",
         ),
     ],
 )
-def test_platform_build_passes_runtime_layout_and_produces_expected_artifact(
-    tmp_path, monkeypatch, target, system, machine, site, artifact, python
+def test_platform_build_produces_expected_artifact(
+    tmp_path, monkeypatch, target, system, machine, artifact, arch
 ):
     payload = tmp_path / "Payload with spaces"
     payload.mkdir()
     (payload / "build.json").write_text(
         json.dumps(
             {
-                "version": [3, 13],
                 "system": system,
                 "machine": machine,
-                "site_packages_relative": site,
             }
         )
     )
@@ -78,8 +74,7 @@ def test_platform_build_passes_runtime_layout_and_produces_expected_artifact(
     result = builder.build(payload, executable, output, target, "0.1.0", True)
     assert result == output / artifact
     assert commands[0][3] == {"Windows": "windows-x64", "MacOS": "osx"}[target]
-    assert f"project.parameter(runtime_python_relative).value={python}" in commands[0]
-    assert f"project.parameter(runtime_site_packages_relative).value={site}" in commands[0]
+    assert f"project.parameter(installer_architecture).value={arch}" in commands[0]
     assert "project.version=0.1.0" in commands[0]
 
 
@@ -89,10 +84,8 @@ def test_release_builder_rejects_an_evaluation_artifact(tmp_path, monkeypatch):
     (payload / "build.json").write_text(
         json.dumps(
             {
-                "version": [3, 13],
                 "system": "Windows",
                 "machine": "AMD64",
-                "site_packages_relative": "Lib/site-packages",
             }
         )
     )
@@ -113,7 +106,7 @@ def test_release_builder_rejects_an_evaluation_artifact(tmp_path, monkeypatch):
         ("MacOS", "Windows", "AMD64"),
     ],
 )
-def test_build_rejects_a_runtime_for_the_wrong_native_target(target, system, machine):
+def test_build_rejects_an_sdk_for_the_wrong_native_target(target, system, machine):
     with pytest.raises(ValueError):
         builder.validate_architecture({"system": system, "machine": machine}, target)
 

@@ -657,20 +657,40 @@ async def submit_and_confirm(comfy, body, accept=True):
         return status, result
 
 
-def test_jobs_submits_with_the_library(comfy, monkeypatch):
-    fake_cli(monkeypatch, comfy.tmp_path, "")
+@pytest.mark.parametrize("native", [False, True], ids=["source", "native"])
+def test_jobs_submits_with_the_library(comfy, monkeypatch, native):
+    if native:
+        config = submit.config_path()
+        settings = json.loads(config.read_text())
+        settings["deadline_sdk"] = "SDK with spaces"
+        config.write_text(json.dumps(settings))
+        monkeypatch.setenv(submit.CLI_ENV_VAR, str(comfy.tmp_path / "unavailable-deadline"))
+    else:
+        fake_cli(monkeypatch, comfy.tmp_path, "")
     progress = {"event": "progress", "stage": "uploading", "progress": 50.0, "message": "1 of 2"}
     submitted = {"jobId": "job-1", "farmId": "farm-1", "queueId": "queue-1"}
     requests = fake_bridge(
         monkeypatch, comfy.tmp_path, {"submit": [progress, "confirm", result(submitted)]}
     )
+    if native:
+        launcher = types.SimpleNamespace(executable=os.environ[submit.PYTHON_ENV_VAR])
+        monkeypatch.setattr(comfy.routes, "sys", launcher)
     status, body = run(submit_and_confirm(comfy, JOB))
     assert status == 202
     bundle_dir = Path(body["job_bundle"])
     assert (bundle_dir / "asset_references.yaml").exists()
 
     [request] = bridge_requests(requests)
-    assert request["argv"][-1] == "submit"
+    if native:
+        assert request["argv"] == [
+            "-IBS",
+            str(comfy.routes.BRIDGE),
+            "--sdk",
+            str(comfy.tmp_path / "SDK with spaces"),
+            "submit",
+        ]
+    else:
+        assert request["argv"] == ["-I", str(comfy.routes.BRIDGE), "submit"]
     sent = request["request"]
     assert sent["bundleDir"] == str(bundle_dir)
     assert (sent["farmId"], sent["queueId"], sent["storageProfileId"]) == (

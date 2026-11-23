@@ -2,8 +2,8 @@
 """
 The Deadline Cloud routes on the ComfyUI server. ComfyUI's submitter panel plans a submission with
 /deadline/plan, calls the Deadline Cloud client library through /deadline/cloud/<command>, and
-submits with /deadline/jobs. The library runs in the Deadline Cloud CLI's own Python, through
-bridge.py. Background tasks report progress and results over the websocket.
+submits with /deadline/jobs. The library runs through bridge.py. Background tasks report progress
+and results over the websocket.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -42,6 +43,7 @@ from .submit import (
     PICKER_KINDS,
     SubmitError,
     check_cli_version,
+    config_path,
     create_job_bundle,
     host_requirements,
     input_folders,
@@ -567,25 +569,24 @@ async def plan_submission(request: web.Request) -> web.Response:
 
 
 async def _bridge_process(command: str, cli: str | None = None) -> asyncio.subprocess.Process:
-    """
-    Starts bridge.py with the Python of the Deadline Cloud CLI, or of the configured one when cli
-    isn't given. Raises SubmitError.
-    """
+    """Use ComfyUI's Python with the installed SDK, or the source install's CLI environment."""
     config = load_config()
-    python = resolve_cli_python(cli or resolve_deadline_cli(config), config)
+    if sdk := config.get("deadline_sdk"):
+        python = sys.executable
+        arguments = ["-IBS", str(BRIDGE), "--sdk", str(config_path().parent / str(sdk)), command]
+    else:
+        python = resolve_cli_python(cli or resolve_deadline_cli(config), config)
+        arguments = ["-I", str(BRIDGE), command]
     try:
         return await asyncio.create_subprocess_exec(
-            # -I keeps this extension's modules and PYTHONPATH out of the CLI's environment.
             python,
-            "-I",
-            str(BRIDGE),
-            command,
+            *arguments,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
     except OSError as e:
-        raise SubmitError(f"Couldn't run the Deadline Cloud CLI's Python {python}: {e}")
+        raise SubmitError(f"Couldn't run the Deadline Cloud bridge with {python}: {e}")
 
 
 def _parse_event(line: bytes) -> dict[str, Any] | None:
@@ -793,9 +794,12 @@ async def submit_job(request: web.Request) -> web.Response:
         settings = _string_map(body.get("settings"), "settings")
     except SubmitError as e:
         return _error(400, str(e))
-    cli = await _checked_cli(config)
-    if isinstance(cli, web.Response):
-        return cli
+    cli = None
+    if not config.get("deadline_sdk"):
+        checked_cli = await _checked_cli(config)
+        if isinstance(checked_cli, web.Response):
+            return checked_cli
+        cli = checked_cli
     try:
         bundle = await _build_bundle(body, workflow, template, config)
     except SubmitError as e:

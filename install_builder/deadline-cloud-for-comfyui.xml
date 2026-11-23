@@ -2,7 +2,7 @@
 <component>
     <name>deadline_cloud_for_comfyui</name>
     <description>Deadline Cloud for ComfyUI</description>
-    <detailedDescription>Adds Deadline Cloud to an existing ComfyUI installation. Includes the panel and a separate Python runtime with Deadline Cloud dependencies.</detailedDescription>
+    <detailedDescription>Adds the Deadline Cloud panel and SDK to an existing ComfyUI installation.</detailedDescription>
     <selected>0</selected>
     <canBeEdited>1</canBeEdited>
     <show>1</show>
@@ -15,17 +15,6 @@
             <distributionFileList>
                 <distributionDirectory allowWildcards="1">
                     <origin>${payload_directory}/extension/*</origin>
-                </distributionDirectory>
-            </distributionFileList>
-        </folder>
-        <folder>
-            <name>deadline_runtime</name>
-            <description>Deadline Cloud runtime</description>
-            <destination>${installdir}</destination>
-            <platforms>all</platforms>
-            <distributionFileList>
-                <distributionDirectory>
-                    <origin>${payload_directory}/runtime</origin>
                 </distributionDirectory>
             </distributionFileList>
         </folder>
@@ -55,6 +44,16 @@
     <initializationActionList>
         <setInstallerVariable name="all_components" value="${all_components} deadline_cloud_for_comfyui" />
         <setInstallerVariable name="deadline_validation_directory" value="" />
+        <setInstallerVariable name="comfyui_python_relative" value="bin/python">
+            <ruleList>
+                <platformTest type="osx" />
+            </ruleList>
+        </setInstallerVariable>
+        <setInstallerVariable name="comfyui_python_relative" value="Scripts/python.exe">
+            <ruleList>
+                <platformTest type="windows" />
+            </ruleList>
+        </setInstallerVariable>
     </initializationActionList>
     <parameterList>
         <directoryParameter>
@@ -67,6 +66,18 @@
             <mustExist>1</mustExist>
             <ask>1</ask>
         </directoryParameter>
+        <fileParameter>
+            <name>comfyui_python</name>
+            <description>Python executable used to start ComfyUI</description>
+            <default>${comfyui_directory}/.venv/${comfyui_python_relative}</default>
+            <allowEmptyValue>0</allowEmptyValue>
+            <cliOptionName>comfyui-python</cliOptionName>
+            <mustExist>1</mustExist>
+            <ask>1</ask>
+            <ruleList>
+                <fileTest path="${comfyui_directory}/.venv/${comfyui_python_relative}" condition="not_exists" />
+            </ruleList>
+        </fileParameter>
     </parameterList>
     <readyToInstallActionList>
         <throwError text="Folder paths must not contain double quotes, dollar signs, backticks, percent signs, or line breaks.">
@@ -75,7 +86,7 @@
                 <regExMatch text="${installdir}" pattern="[&quot;$`%\r\n]" />
                 <regExMatch text="${comfyui_directory}" pattern="[&quot;$`%\r\n]" />
                 <regExMatch text="${system_temp_directory}" pattern="[&quot;$`%\r\n]" />
-                <regExMatch text="${runtime_python_relative}" pattern="[&quot;$`%\r\n]" />
+                <regExMatch text="${comfyui_python}" pattern="[&quot;$`%\r\n]" />
             </ruleList>
         </throwError>
         <if>
@@ -90,15 +101,13 @@
             </elseActionList>
         </if>
         <stringModify text="${deadline_validation_directory}" variable="deadline_validation_directory" logic="trim" />
-        <!-- Use the packed runtime for preflight before writing to either destination. -->
-        <unpackDirectory component="deadline_cloud_for_comfyui" folder="deadline_runtime" origin="runtime" destination="${deadline_validation_directory}" />
         <unpackFile component="deadline_cloud_for_comfyui" folder="installation_helper" origin="install.py" destination="${deadline_validation_directory}" />
         <runProgram>
             <progressText>Checking your ComfyUI installation</progressText>
             <abortOnError>1</abortOnError>
             <workingDirectory>${deadline_validation_directory}</workingDirectory>
-            <program>${deadline_validation_directory}/runtime/${runtime_python_relative}</program>
-            <programArguments>-I install.py validate --comfyui "${comfyui_directory}" --prefix "${installdir}"</programArguments>
+            <program>${comfyui_python}</program>
+            <programArguments>-IBS install.py validate --comfyui "${comfyui_directory}" --prefix "${installdir}"</programArguments>
         </runProgram>
         <deleteFile path="${deadline_validation_directory}" abortOnError="0">
             <ruleList>
@@ -109,17 +118,17 @@
         </deleteFile>
     </readyToInstallActionList>
     <postInstallationActionList>
-        <createDirectory path="${installdir}/runtime/${runtime_site_packages_relative}" />
+        <createDirectory path="${installdir}/sdk" />
         <unzip>
             <zipFile>${installdir}/dependency_bundle/deadline_cloud_for_comfyui_submitter-deps.zip</zipFile>
-            <destinationDirectory>${installdir}/runtime/${runtime_site_packages_relative}</destinationDirectory>
+            <destinationDirectory>${installdir}/sdk</destinationDirectory>
             <addToUninstaller>1</addToUninstaller>
         </unzip>
         <runProgram>
             <progressText>Installing Deadline Cloud into ComfyUI</progressText>
             <abortOnError>1</abortOnError>
-            <program>${installdir}/runtime/${runtime_python_relative}</program>
-            <programArguments>-I "${installdir}/install.py" install --payload "${installdir}/payload" --runtime "${installdir}/runtime" --comfyui "${comfyui_directory}" --state "${installdir}/installation.json" --version "${project.version}"</programArguments>
+            <program>${comfyui_python}</program>
+            <programArguments>-IBS "${installdir}/install.py" install --payload "${installdir}/payload" --sdk "${installdir}/sdk" --comfyui "${comfyui_directory}" --state "${installdir}/installation.json" --version "${project.version}"</programArguments>
         </runProgram>
         <setInstallerVariable name="deadline_install_succeeded" value="1" />
         <!-- Only the private staging directory is removed; customer files are handled by install.py. -->
@@ -130,8 +139,8 @@
         <runProgram>
             <progressText>Removing the Deadline Cloud integration</progressText>
             <abortOnError>1</abortOnError>
-            <program>${installdir}/runtime/${runtime_python_relative}</program>
-            <programArguments>-I "${installdir}/install.py" uninstall --state "${installdir}/installation.json"</programArguments>
+            <program>${comfyui_python}</program>
+            <programArguments>-IBS "${installdir}/install.py" uninstall --state "${installdir}/installation.json"</programArguments>
             <ruleList>
                 <fileExists path="${installdir}/installation.json" />
             </ruleList>
