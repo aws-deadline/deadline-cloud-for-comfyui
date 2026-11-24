@@ -222,11 +222,14 @@ def _progress(stage: str) -> Callable[[Any], bool]:
 
 
 def _confirm(message: str, default: bool) -> bool:
-    """Asks the panel, which answers with a line of stdin. No answer counts as no."""
+    """
+    Asks the panel, which answers with a line of stdin. Only {"accept": true} is a yes: no answer,
+    or anything else, such as "yes" or 1, counts as no.
+    """
     emit("confirm", message=message, default=default)
     line = sys.stdin.readline()
     try:
-        return bool(json.loads(line).get("accept"))
+        return json.loads(line).get("accept") is True
     except (ValueError, AttributeError):
         return False
 

@@ -36,12 +36,21 @@ function jobs() {
       clientId: body.clientId,
     }));
 }
-function emitConfirmation(message = "Upload?", defaultAnswer = true) {
+// Submits again, as a new submission, and returns its request.
+async function submitAgain() {
+  state.submission = null;
+  const before = api.calls.length;
+  await ui.submit();
+  await settle();
+  return api.calls.slice(before).find(({ path }) => path === "/deadline/jobs")?.body ?? null;
+}
+function emitConfirmation(message = "Upload?", defaultAnswer = true, promptId = "prompt-1") {
   try {
     api.emit("deadline.confirm", {
       submissionId: state.submission.id,
       message,
       default: defaultAnswer,
+      promptId,
     });
   } catch {
     // Without a document, opening the dialog fails after the prompt has been recorded.
@@ -49,6 +58,60 @@ function emitConfirmation(message = "Upload?", defaultAnswer = true) {
 }
 function confirmationAnswers() {
   return api.calls.filter(({ path }) => path === "/deadline/jobs/confirm").map(({ body }) => body);
+}
+// Opens another workflow tab, or goes back to one, as ComfyUI does, and reads it.
+async function openWorkflow(filename) {
+  app.extensionManager.workflow.activeWorkflow = { filename, path: `workflows/${filename}` };
+  ui.workflowLoaded();
+  await ui.loadPlan(true);
+}
+// A stand-in for the DOM, enough to render the panel's sections and click their controls.
+class NodeStub {
+  constructor(tag) {
+    this.tag = tag;
+    this.children = [];
+    this.attributes = {};
+    this.listeners = {};
+    this.scrollTop = 0;
+    this.open = false;
+  }
+  append(child) {
+    this.children.push(child);
+  }
+  setAttribute(name, value) {
+    this.attributes[name] = value;
+  }
+  getAttribute(name) {
+    return this.attributes[name] ?? null;
+  }
+  replaceChildren(...children) {
+    this.children = children;
+  }
+  querySelectorAll(selector) {
+    return descendants(this).slice(1).filter((node) => {
+      if (selector === "details") return node.tag === "details";
+      if (selector === "[data-dl-scroll]") return node.getAttribute("data-dl-scroll") !== null;
+      throw new Error(`Unsupported selector: ${selector}`);
+    });
+  }
+  addEventListener(name, handler) {
+    this.listeners[name] = handler;
+  }
+}
+const descendants = (node) => [
+  node,
+  ...node.children.filter((child) => child instanceof NodeStub).flatMap(descendants),
+];
+const text = (node) =>
+  node.children.map((child) => (child instanceof NodeStub ? text(child) : String(child))).join("");
+function installDom() {
+  globalThis.Node = NodeStub;
+  globalThis.document = { createElement: (tag) => new NodeStub(tag) };
+}
+// What a view shows with the data-role, or null.
+function shownText(container, role) {
+  const node = descendants(container).find((child) => child.getAttribute?.("data-role") === role);
+  return node ? text(node) : null;
 }
 
 api.handlers["/deadline/cloud/status"] = async () => ({
@@ -62,6 +125,7 @@ api.handlers["/deadline/cloud/queues"] = async () => ({
   queues: [{ queueId: "queue-1", displayName: "Queue" }],
 });
 api.handlers["/deadline/cloud/queue"] = async () => ({ parameters: [], storageProfiles: [] });
+api.handlers["/deadline/cloud/set-defaults"] = async () => ({});
 api.handlers["/deadline/plan"] = async (body) => planFor(body);
 api.handlers["/deadline/jobs"] = async (body) => ({ submissionId: body.submissionId });
 await ui.loadAccount(true);
@@ -85,7 +149,7 @@ if (scenario === "answer-confirmation") {
   const firstResponse = deferred();
   api.handlers["/deadline/jobs/confirm"] = async (body) => {
     if (body.accept) {
-      emitConfirmation("Run hooks?", false);
+      emitConfirmation("Run hooks?", false, "prompt-2");
       await firstResponse.promise;
     }
     return {};
@@ -190,7 +254,12 @@ if (scenario === "answer-confirmation") {
   const detail = { submissionId, name: "ComfyUI - fox" };
   try {
     if (scenario === "early-confirm") {
-      api.emit("deadline.confirm", { ...detail, message: "Upload 5 GB?", default: true });
+      api.emit("deadline.confirm", {
+        ...detail,
+        message: "Upload 5 GB?",
+        default: true,
+        promptId: "prompt-1",
+      });
     } else {
       api.emit("deadline.submitted", { ...detail, status: "SUBMITTED", jobId: "job-1" });
     }
@@ -204,44 +273,7 @@ if (scenario === "answer-confirmation") {
   result.toasts = app.toasts.map(({ severity }) => severity);
 } else if (scenario === "all-attachments") {
   // Render the real section and click its controls, including rows beyond the first 100.
-  class NodeStub {
-    constructor(tag) {
-      this.tag = tag;
-      this.children = [];
-      this.attributes = {};
-      this.listeners = {};
-      this.scrollTop = 0;
-      this.open = false;
-    }
-    append(child) {
-      this.children.push(child);
-    }
-    setAttribute(name, value) {
-      this.attributes[name] = value;
-    }
-    getAttribute(name) {
-      return this.attributes[name] ?? null;
-    }
-    replaceChildren(...children) {
-      this.children = children;
-    }
-    querySelectorAll(selector) {
-      return descendants(this).slice(1).filter((node) => {
-        if (selector === "details") return node.tag === "details";
-        if (selector === "[data-dl-scroll]") return node.getAttribute("data-dl-scroll") !== null;
-        throw new Error(`Unsupported selector: ${selector}`);
-      });
-    }
-    addEventListener(name, handler) {
-      this.listeners[name] = handler;
-    }
-  }
-  globalThis.Node = NodeStub;
-  globalThis.document = { createElement: (tag) => new NodeStub(tag) };
-  const descendants = (node) => [
-    node,
-    ...node.children.filter((child) => child instanceof NodeStub).flatMap(descendants),
-  ];
+  installDom();
   const container = new NodeStub("div");
   const rows = () => descendants(container).filter((node) => node.tag === "li");
   const list = (key) => container.querySelectorAll("[data-dl-scroll]")
@@ -253,7 +285,7 @@ if (scenario === "answer-confirmation") {
   const manualFolder = "/manual/frames";
   const planned = Array.from({ length: 105 }, (_, index) => `/input/image-${index}.png`);
   state.plan.attachments = { filenames: [...planned, external], directories: ["/outside/frames"] };
-  state.addedAttachments = { filenames: [manualFile], directories: [manualFolder] };
+  ui.__attachmentEdits().added = { filenames: [manualFile], directories: [manualFolder] };
   const view = ui.__createView(container, ["attachments"]);
   container.querySelectorAll("details")[0].open = true;
   list("inputs").scrollTop = 640;
@@ -290,8 +322,6 @@ if (scenario === "answer-confirmation") {
   result.inputScrollAfterModelsDisappear = list("inputs").scrollTop;
   result.attachmentsStillOpen = container.querySelectorAll("details")[0].open;
   // A custom node pack is removed and added back like a model, and the status warns about it.
-  const text = (node) =>
-    node.children.map((child) => (child instanceof NodeStub ? text(child) : String(child))).join("");
   const pack = "/custom_nodes/studio-nodes";
   const localNodes = [{ name: "studio-nodes", path: pack, size: 3_200_000_000, files: 12_500, counted: true }];
   api.handlers["/deadline/plan"] = async (body) => ({ ...planFor(body), localNodes });
@@ -319,7 +349,7 @@ if (scenario === "answer-confirmation") {
     path: `/models/${directory}/shared.safetensors`,
   });
   state.plan.localModels = [model("checkpoints"), model("loras")];
-  state.removedAttachments.add("/models/loras/shared.safetensors");
+  ui.__attachmentEdits().removed.add("/models/loras/shared.safetensors");
   await ui.submit();
   await settle();
   result.excludedModels = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body.excludedModels;
@@ -489,6 +519,212 @@ if (scenario === "answer-confirmation") {
 }
 if (scenario === "dialog-sections") {
   result.sections = ui.__dialogSections;
+}
+if (scenario === "panel-sections") {
+  result.sections = ui.__panelSections;
+}
+if (scenario === "switch-queue") {
+  // Queue 1's details are loaded and its parameters edited. Then the artist chooses queue 2, whose
+  // details are still loading.
+  const queue2 = deferred();
+  const parameters = (...names) => names.map((name) => ({ name, type: "STRING", default: "" }));
+  api.handlers["/deadline/cloud/queues"] = async () => ({
+    queues: [
+      { queueId: "queue-1", displayName: "Queue 1" },
+      { queueId: "queue-2", displayName: "Queue 2" },
+    ],
+  });
+  api.handlers["/deadline/cloud/queue"] = (body) =>
+    body.queueId === "queue-1"
+      ? Promise.resolve({
+          parameters: parameters("Queue1Parameter", "Shared"),
+          storageProfiles: [{ storageProfileId: "sp-1", displayName: "Profile 1" }],
+        })
+      : queue2.promise;
+  await ui.loadAccount(true);
+  ui.chooseStorageProfile("sp-1");
+  ui.editQueueParameter("Queue1Parameter", "for queue 1");
+  ui.editQueueParameter("Shared", "edited for queue 1");
+  const queue1 = await submitAgain();
+  result.queue1Sent = { parameters: queue1.parameters, storageProfileId: queue1.storageProfileId };
+  // That submission finished, so only the queue's details can keep Submit off.
+  state.submission = null;
+  result.canSubmitBeforeSwitching = Boolean(ui.canSubmit());
+  const switching = ui.selectQueue("queue-2");
+  await settle();
+  result.queueWhileLoading = state.queue;
+  result.queueParametersWhileLoading = ui.__renderers.queueParameters() ?? null;
+  result.canSubmitWhileLoading = Boolean(ui.canSubmit());
+  result.blockerWhileLoading = ui.submitBlocker();
+  result.sentWhileLoading = await submitAgain();
+  queue2.resolve({ parameters: parameters("Queue2Parameter", "Shared"), storageProfiles: [] });
+  await switching;
+  result.canSubmitLoaded = Boolean(ui.canSubmit());
+  ui.editQueueParameter("Queue2Parameter", "for queue 2");
+  const queue2Sent = await submitAgain();
+  result.queue2Sent = {
+    queueId: queue2Sent.queueId,
+    parameters: queue2Sent.parameters,
+    storageProfileId: queue2Sent.storageProfileId,
+  };
+}
+if (scenario === "pending-queue-details") {
+  // Submit waits for the chosen queue's details, and uses the latest request's answer.
+  const answers = [deferred(), deferred()];
+  let calls = 0;
+  api.handlers["/deadline/cloud/queue"] = () => answers[calls++].promise;
+  const first = ui.__loadQueue();
+  await settle();
+  result.canSubmitWhilePending = Boolean(ui.canSubmit());
+  result.blockerWhilePending = ui.submitBlocker();
+  result.sentWhilePending = await submitAgain();
+  // The same queue's details again, such as after logging in, before the first answer comes.
+  const second = ui.__loadQueue();
+  answers[1].resolve({
+    parameters: [{ name: "Newer" }],
+    storageProfiles: [{ storageProfileId: "sp-new", displayName: "New" }],
+  });
+  await second;
+  answers[0].resolve({ parameters: [{ name: "Older" }], storageProfiles: [] });
+  await first;
+  result.parameters = state.queue.parameters.map(({ name }) => name);
+  result.profiles = state.queue.storageProfiles.map(({ storageProfileId }) => storageProfileId);
+  result.canSubmitLoaded = Boolean(ui.canSubmit());
+  result.blockerLoaded = ui.submitBlocker();
+  // A failed load leaves Submit off, and says why.
+  api.handlers["/deadline/cloud/queue"] = async () => {
+    throw new Error("ThrottlingException");
+  };
+  await ui.__loadQueue();
+  result.queueFailed = state.queue;
+  result.canSubmitFailed = Boolean(ui.canSubmit());
+  result.blockerFailed = ui.submitBlocker();
+}
+if (scenario.startsWith("storage-profile-")) {
+  const status = (storageProfileId) => async () => ({
+    authenticationStatus: "AUTHENTICATED",
+    farmId: "farm-1",
+    queueId: "queue-1",
+    storageProfileId,
+  });
+  const profiles = [{ storageProfileId: "sp-1", displayName: "Profile 1" }];
+  if (scenario === "storage-profile-none") {
+    // The account's default profile is listed. The artist chooses None, which a reload keeps.
+    api.handlers["/deadline/cloud/status"] = status("sp-1");
+    const pending = deferred();
+    api.handlers["/deadline/cloud/queue"] = () => pending.promise;
+    const loading = ui.loadAccount(true);
+    await settle();
+    // While the queue's details load, the default stays chosen, and nothing can be submitted.
+    result.whileLoading = {
+      storageProfileId: state.storageProfileId,
+      canSubmit: Boolean(ui.canSubmit()),
+    };
+    pending.resolve({ parameters: [], storageProfiles: profiles });
+    await loading;
+    result.defaultSent = (await submitAgain()).storageProfileId;
+    ui.chooseStorageProfile("");
+    api.handlers["/deadline/cloud/queue"] = async () => ({ parameters: [], storageProfiles: profiles });
+    await ui.loadAccount(true);
+    result.afterReload = state.storageProfileId;
+    result.noneSent = (await submitAgain()).storageProfileId;
+    result.savedDefaults = api.calls
+      .filter(({ path }) => path === "/deadline/cloud/set-defaults")
+      .map(({ body }) => body.storageProfileId);
+  } else {
+    // The account's default profile isn't one of the queue's, such as one that was deleted.
+    api.handlers["/deadline/cloud/status"] = status("sp-gone");
+    api.handlers["/deadline/cloud/queue"] = async () => ({ parameters: [], storageProfiles: profiles });
+    await ui.loadAccount(true);
+    result.storageProfileId = state.storageProfileId;
+    result.canSubmit = Boolean(ui.canSubmit());
+    result.blocker = ui.submitBlocker();
+    result.sentBeforeChoosing = await submitAgain();
+    // None from the select, which then has a placeholder too.
+    ui.chooseStorageProfile("none");
+    result.canSubmitAfterNone = Boolean(ui.canSubmit());
+    result.blockerAfterNone = ui.submitBlocker();
+    result.noneSent = (await submitAgain()).storageProfileId;
+  }
+}
+if (scenario === "workflow-attachments") {
+  // Files added to or removed from one workflow's attachments stay with that workflow's tab.
+  const model = {
+    id: "checkpoints/sd.safetensors",
+    name: "sd.safetensors",
+    directory: "checkpoints",
+    path: "/models/sd.safetensors",
+  };
+  api.handlers["/deadline/plan"] = async (body) => ({ ...planFor(body), localModels: [model] });
+  await openWorkflow("fox.json");
+  api.handlers["/deadline/choose"] = async () => ({ paths: ["/manual/clip.mov"] });
+  await ui.chooseAttachments("files", "filenames");
+  ui.__attachmentEdits().removed.add("/input/old.png");
+  ui.__attachmentEdits().removed.add(model.path);
+  const sent = (body) => ({ attachments: body.attachments, excludedModels: body.excludedModels });
+  result.fromA = sent(await submitAgain());
+  await openWorkflow("hare.json");
+  result.fromB = sent(await submitAgain());
+  await openWorkflow("fox.json");
+  result.backInA = sent(await submitAgain());
+}
+if (scenario === "late-file-dialog") {
+  // The file dialog was opened for one workflow, and closes after the artist opened another.
+  await openWorkflow("fox.json");
+  const chosen = deferred();
+  api.handlers["/deadline/choose"] = () => chosen.promise;
+  const choosing = ui.chooseAttachments("files", "filenames");
+  await settle();
+  await openWorkflow("hare.json");
+  chosen.resolve({ paths: ["/manual/late.png"] });
+  await choosing;
+  result.fromB = (await submitAgain()).attachments.filenames;
+  await openWorkflow("fox.json");
+  result.fromA = (await submitAgain()).attachments.filenames;
+  result.toasts = app.toasts.map(({ severity }) => severity);
+}
+if (scenario === "attachment-summary") {
+  // The sidebar and the dialog both show, next to Submit, what the job attaches.
+  installDom();
+  const sidebar = new NodeStub("div");
+  const dialog = new NodeStub("div");
+  const views = [ui.__createView(sidebar, ui.__panelSections), ui.__createView(dialog, ui.__dialogSections)];
+  const model = (name) => ({
+    id: `checkpoints/${name}`,
+    name,
+    directory: "checkpoints",
+    path: `/models/${name}`,
+  });
+  const pack = { name: "studio-nodes", path: "/custom_nodes/studio-nodes", size: 10, files: 1, counted: true };
+  api.handlers["/deadline/plan"] = async (body) => ({
+    ...planFor(body),
+    attachments: { filenames: ["/input/old.png", "/input/mask.png"], directories: [] },
+    localModels: [model("a.safetensors"), model("b.safetensors")],
+    localNodes: [pack],
+  });
+  await ui.loadPlan(true);
+  result.planned = ui.attachmentSummary();
+  for (const [kind, key, path] of [
+    ["files", "filenames", "/outside/clip.mov"],
+    ["folder", "directories", "/outside/frames"],
+  ]) {
+    api.handlers["/deadline/choose"] = async () => ({ paths: [path] });
+    await ui.chooseAttachments(kind, key);
+  }
+  ui.__attachmentEdits().removed.add("/input/mask.png");
+  ui.__attachmentEdits().removed.add("/models/b.safetensors");
+  for (const view of views) {
+    view.render(["submit"]);
+  }
+  result.summary = ui.attachmentSummary();
+  result.sidebar = shownText(sidebar, "attachment-summary");
+  result.dialog = shownText(dialog, "attachment-summary");
+  const sent = await submitAgain();
+  result.sent = {
+    attachments: sent.attachments,
+    excludedModels: sent.excludedModels,
+    excludedNodes: sent.excludedNodes,
+  };
 }
 if (scenario === "late-queue-details") {
   // Each queue's details come from their own request. Queue 2's answer comes before queue 1's.

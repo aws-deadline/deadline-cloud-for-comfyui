@@ -22,7 +22,7 @@ declare module "*/scripts/app.js" {
   export interface ExtensionManager {
     registerSidebarTab(tab: SidebarTab): void;
     toast: { add(message: ToastMessage): void };
-    workflow?: { activeWorkflow?: { filename?: string } | null };
+    workflow?: { activeWorkflow?: { filename?: string; path?: string } | null };
     sidebarTab?: { activeSidebarTabId?: string | null };
     command: { execute(id: string): void };
   }

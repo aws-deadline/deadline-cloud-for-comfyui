@@ -454,9 +454,11 @@ def test_jobs_rejects_a_body_that_isnt_an_object(comfy, monkeypatch):
 
 
 def test_jobs_attaches_the_folders_the_workflow_loads(comfy, monkeypatch):
+    """A folder loader's folder is attached as the images in it, not as the whole folder."""
     cats = comfy.tmp_path / "input" / "cats"
     cats.mkdir(parents=True)
-    (cats / "a.png").write_text("png")
+    for name in ("a.png", "b.png"):
+        (cats / name).write_text("png")
     workflow = {
         **WORKFLOW,
         "2": {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": "cats"}},
@@ -464,7 +466,9 @@ def test_jobs_attaches_the_folders_the_workflow_loads(comfy, monkeypatch):
     fake_tools(monkeypatch, comfy.tmp_path)
     _, body = run(post(comfy, {"workflow": workflow}))
     references = yaml.safe_load((Path(body["job_bundle"]) / "asset_references.yaml").read_text())
-    assert references["assetReferences"]["inputs"]["directories"] == [str(cats)]
+    inputs = references["assetReferences"]["inputs"]
+    assert {str(cats / "a.png"), str(cats / "b.png")} <= set(inputs["filenames"])
+    assert inputs["directories"] == []
 
 
 def fake_bridge(monkeypatch, tmp_path: Path, responses: dict) -> Path:
@@ -532,6 +536,23 @@ def result(data):
     return {"event": "result", "data": data}
 
 
+async def wait_for_prompt(comfy, number=1):
+    """Waits for the submission's confirmation prompt `number`, and returns what was sent for it."""
+    for _ in range(200):
+        prompts = [data for event, data in comfy.server.events if event == "deadline.confirm"]
+        if len(prompts) >= number:
+            return prompts[number - 1]
+        await asyncio.sleep(0.05)
+    pytest.fail(f"Prompt {number} never arrived.")
+
+
+def running_submission(comfy, monkeypatch, process, **fields):
+    """Adds a running submission from the tab tab-1, as /deadline/jobs does."""
+    submission = comfy.routes._Submission("fox", process, client_id="tab-1", **fields)
+    monkeypatch.setitem(comfy.routes._submissions, "a" * 32, submission)
+    return submission
+
+
 def test_plan_lists_parameters_task_lists_and_attachments(comfy, monkeypatch):
     input_dir = comfy.tmp_path / "input"
     input_dir.mkdir()
@@ -572,6 +593,32 @@ def test_plan_lists_parameters_task_lists_and_attachments(comfy, monkeypatch):
     assert body["attachments"] == {"filenames": [str(input_dir / "fox.png")], "directories": []}
     # Planning doesn't create a job bundle.
     assert not (comfy.tmp_path / "user" / "deadline_submissions").exists()
+
+
+def test_plan_and_jobs_warn_about_inputs_that_arent_attached(comfy, monkeypatch):
+    """An absolute path in a file input isn't attached, and the panel and the job say so."""
+    elsewhere = comfy.tmp_path / "elsewhere.png"
+    elsewhere.write_text("png")
+    workflow = {**WORKFLOW, "5": {"class_type": "LoadImage", "inputs": {"image": str(elsewhere)}}}
+    status, plan = run(call(comfy, "/deadline/plan", {"workflow": workflow}))
+    assert status == 200
+    assert plan["attachments"] == {"filenames": [], "directories": []}
+    # A long path is shortened to its end in the message.
+    [warning] = [warning for warning in plan["warnings"] if "elsewhere.png" in warning]
+    assert "isn't attached" in warning
+
+    fake_tools(monkeypatch, comfy.tmp_path)
+    # A request without the panel's list finds the workflow's inputs itself, and warns too.
+    status, body = run(call(comfy, "/deadline/jobs", {**JOB, "workflow": workflow}))
+    assert status == 202
+    assert warning in body["warnings"]
+    # The panel sends the list it showed, with the warning, so the job doesn't repeat it.
+    attachments: dict[str, list[str]] = {"filenames": [], "directories": []}
+    status, body = run(
+        call(comfy, "/deadline/jobs", {**JOB, "workflow": workflow, "attachments": attachments})
+    )
+    assert status == 202
+    assert warning not in body["warnings"]
 
 
 def test_plan_reports_workflows_it_cant_submit(comfy):
@@ -748,25 +795,20 @@ JOB = {
 
 
 async def submit_and_confirm(comfy, body, accept=True):
-    """Submits through /deadline/jobs and answers the confirmation when it comes."""
+    """Submits through /deadline/jobs and answers the confirmation, by its ID, when it comes."""
     app = web.Application()
     app.add_routes(comfy.server.routes)
     async with TestClient(TestServer(app)) as client:
         response = await client.post("/deadline/jobs", json=body)
         status, result = response.status, await response.json()
         if status == 202:
-            for _ in range(200):
-                prompts = [
-                    data for event, data in comfy.server.events if event == "deadline.confirm"
-                ]
-                if prompts:
-                    break
-                await asyncio.sleep(0.05)
+            prompt = await wait_for_prompt(comfy)
             answer = await client.post(
                 "/deadline/jobs/confirm",
                 json={
                     "submissionId": result["submissionId"],
                     "clientId": body.get("clientId"),
+                    "promptId": prompt["promptId"],
                     "accept": accept,
                 },
             )
@@ -823,9 +865,12 @@ def test_jobs_submits_with_the_library(comfy, monkeypatch):
             "kind": "progress",
         },
     )
+    # Each prompt has its own random ID, which the answer has to name.
+    prompt_id = events[1][1]["promptId"]
+    assert re.fullmatch(r"[0-9a-f]{32}", prompt_id)
     assert events[1] == (
         "deadline.confirm",
-        {**submission, "message": "Upload?", "default": True},
+        {**submission, "message": "Upload?", "default": True, "promptId": prompt_id},
     )
     # The panel shows each job's output directory, where Download puts its outputs.
     assert events[2] == (
@@ -1335,29 +1380,29 @@ def test_jobs_accept_answers_to_successive_prompts(comfy, monkeypatch):
             response = await client.post("/deadline/jobs", json=JOB)
             assert response.status == 202
             submission_id = (await response.json())["submissionId"]
-            for number in (1, 2):
-                for _ in range(200):
-                    prompts = [
-                        data for event, data in comfy.server.events if event == "deadline.confirm"
-                    ]
-                    if len(prompts) == number:
-                        break
-                    await asyncio.sleep(0.05)
-                else:
-                    pytest.fail(f"Prompt {number} never arrived.")
-                answer = {
+
+            async def answer(prompt, accept=True):
+                body = {
                     "submissionId": submission_id,
                     "clientId": JOB["clientId"],
-                    "accept": True,
+                    "promptId": prompt["promptId"],
+                    "accept": accept,
                 }
-                accepted = await client.post("/deadline/jobs/confirm", json=answer)
-                assert accepted.status == 200
-            await asyncio.gather(*comfy.routes._watchers)
+                return (await client.post("/deadline/jobs/confirm", json=body)).status
 
-    run(confirm_both_prompts())
+            first = await wait_for_prompt(comfy, 1)
+            # A repeated answer to the first prompt is refused.
+            statuses = [await answer(first), await answer(first)]
+            second = await wait_for_prompt(comfy, 2)
+            # So is a delayed one while the second is pending, which it doesn't answer.
+            statuses += [await answer(first, accept=False), await answer(second)]
+            await asyncio.gather(*comfy.routes._watchers)
+            return statuses
+
+    assert run(confirm_both_prompts()) == [200, 409, 409, 200]
     prompts = [data for event, data in comfy.server.events if event == "deadline.confirm"]
     assert len(prompts) == 2
-    assert all(sid == JOB["clientId"] for sid in comfy.server.sids)
+    assert prompts[0]["promptId"] != prompts[1]["promptId"]
     assert comfy.server.events[-1][1]["status"] == "SUBMITTED"
 
 
@@ -1379,53 +1424,95 @@ class _RecordingProcess:
         self.killed = True
 
 
+def confirmation(prompt_id="p" * 32, accept=True, **change):
+    """An answer to the prompt of running_submission's submission, from its tab."""
+    return {
+        "submissionId": "a" * 32,
+        "clientId": "tab-1",
+        "promptId": prompt_id,
+        "accept": accept,
+        **change,
+    }
+
+
 @pytest.mark.parametrize("canceled", [False, True])
 def test_confirmation_timeouts_only_decline_the_current_pending_prompt(
     comfy, monkeypatch, canceled
 ):
     process = _RecordingProcess()
-    submission = comfy.routes._Submission(
-        "fox", process, client_id="tab-1", confirms=2, canceled=canceled
+    submission = running_submission(
+        comfy, monkeypatch, process, prompt_id="second", canceled=canceled
     )
-    monkeypatch.setitem(comfy.routes._submissions, "a" * 32, submission)
     monkeypatch.setattr(comfy.routes, "CONFIRM_TIMEOUT", 0)
     # A timer for an earlier prompt must not send an answer to the current one.
-    run(comfy.routes._decline_unanswered("a" * 32, submission, 1))
+    run(comfy.routes._decline_unanswered("a" * 32, submission, "first"))
     assert process.answers == []
-    assert submission.answered == 0
-    run(comfy.routes._decline_unanswered("a" * 32, submission, 2))
+    assert submission.prompt_id == "second"
+    run(comfy.routes._decline_unanswered("a" * 32, submission, "second"))
     assert process.answers == ([] if canceled else [{"accept": False}])
-    assert submission.answered == (0 if canceled else 2)
+    assert submission.prompt_id == ("second" if canceled else None)
 
 
-@pytest.mark.parametrize(("confirms", "answered"), [(0, 0), (1, 1), (2, 2), (1, 2)])
-def test_confirm_rejects_answers_without_a_pending_prompt(comfy, monkeypatch, confirms, answered):
+def test_a_late_answer_to_a_declined_prompt_is_refused(comfy, monkeypatch):
     process = _RecordingProcess()
-    submission = comfy.routes._Submission(
-        "fox", process, client_id="tab-1", confirms=confirms, answered=answered
-    )
-    monkeypatch.setitem(comfy.routes._submissions, "a" * 32, submission)
-    status, response = run(
-        call(
-            comfy,
-            "/deadline/jobs/confirm",
-            {
-                "submissionId": "a" * 32,
-                "clientId": "tab-1",
-                "accept": True,
-            },
-        )
-    )
+    submission = running_submission(comfy, monkeypatch, process, prompt_id="p" * 32)
+    monkeypatch.setattr(comfy.routes, "CONFIRM_TIMEOUT", 0)
+    run(comfy.routes._decline_unanswered("a" * 32, submission, "p" * 32))
+    status, response = run(call(comfy, "/deadline/jobs/confirm", confirmation()))
+    assert status == 409
+    assert "no pending confirmation" in response["error"]
+    assert process.answers == [{"accept": False}]
+
+
+@pytest.mark.parametrize(
+    ("pending", "answered"),
+    [
+        # No prompt is waiting, or an earlier prompt's ID, or none, answers another.
+        (None, "p" * 32),
+        ("q" * 32, "p" * 32),
+        ("q" * 32, None),
+        ("q" * 32, ""),
+        ("q" * 32, 5),
+        ("q" * 32, ["q" * 32]),
+        ("q" * 32, "q" * 31),
+    ],
+)
+def test_confirm_rejects_answers_without_their_pending_prompt(
+    comfy, monkeypatch, pending, answered
+):
+    process = _RecordingProcess()
+    submission = running_submission(comfy, monkeypatch, process, prompt_id=pending)
+    status, response = run(call(comfy, "/deadline/jobs/confirm", confirmation(prompt_id=answered)))
     assert status == 409
     assert "no pending confirmation" in response["error"]
     assert process.answers == []
-    assert submission.answered == answered
+    assert submission.prompt_id == pending
+
+
+@pytest.mark.parametrize("accept", ["yes", 1, 0, "true", None, [], {}])
+def test_confirm_only_takes_true_or_false(comfy, monkeypatch, accept):
+    """A truthy value isn't a yes, and a falsy one isn't a no. The prompt stays pending."""
+    process = _RecordingProcess()
+    submission = running_submission(comfy, monkeypatch, process, prompt_id="p" * 32)
+    status, response = run(call(comfy, "/deadline/jobs/confirm", confirmation(accept=accept)))
+    assert (status, response) == (400, {"error": "accept must be true or false."})
+    assert process.answers == []
+    assert submission.prompt_id == "p" * 32
+
+
+def test_confirm_needs_accept(comfy, monkeypatch):
+    process = _RecordingProcess()
+    running_submission(comfy, monkeypatch, process, prompt_id="p" * 32)
+    body = confirmation()
+    del body["accept"]
+    status, _ = run(call(comfy, "/deadline/jobs/confirm", body))
+    assert status == 400
+    assert process.answers == []
 
 
 @pytest.mark.parametrize(
     "client",
     [
-        {},
         {"clientId": "tab-2"},
         {"clientId": None},
         {"clientId": ""},
@@ -1441,71 +1528,59 @@ def test_confirm_rejects_answers_without_a_pending_prompt(comfy, monkeypatch, co
 @pytest.mark.parametrize("path", ["/deadline/jobs/confirm", "/deadline/jobs/cancel"])
 def test_submission_controls_reject_other_or_invalid_clients(comfy, monkeypatch, client, path):
     process = _RecordingProcess()
-    submission = comfy.routes._Submission("fox", process, client_id="tab-1", confirms=1)
-    monkeypatch.setitem(comfy.routes._submissions, "a" * 32, submission)
-    status, _ = run(
-        call(
-            comfy,
-            path,
-            {"submissionId": "a" * 32, "accept": True, **client},
-        )
-    )
+    submission = running_submission(comfy, monkeypatch, process, prompt_id="p" * 32)
+    status, _ = run(call(comfy, path, confirmation(**client)))
     assert status == 403
     assert process.answers == []
-    assert submission.answered == 0
+    assert submission.prompt_id == "p" * 32
     assert submission.canceled is False
+    assert process.killed is False
+
+
+@pytest.mark.parametrize("path", ["/deadline/jobs/confirm", "/deadline/jobs/cancel"])
+def test_submission_controls_reject_a_missing_client(comfy, monkeypatch, path):
+    process = _RecordingProcess()
+    submission = running_submission(comfy, monkeypatch, process, prompt_id="p" * 32)
+    body = confirmation()
+    del body["clientId"]
+    status, _ = run(call(comfy, path, body))
+    assert status == 403
+    assert process.answers == []
+    assert submission.prompt_id == "p" * 32
     assert process.killed is False
 
 
 def test_confirm_only_answers_each_pending_prompt_once(comfy, monkeypatch):
     process = _RecordingProcess()
-    submission = comfy.routes._Submission("fox", process, client_id="tab-1")
-    monkeypatch.setitem(comfy.routes._submissions, "a" * 32, submission)
+    submission = running_submission(comfy, monkeypatch, process)
 
-    async def answer(accept=True):
-        return await call(
-            comfy,
-            "/deadline/jobs/confirm",
-            {
-                "submissionId": "a" * 32,
-                "clientId": "tab-1",
-                "accept": accept,
-            },
-        )
+    async def answer(prompt_id, accept=True):
+        return await call(comfy, "/deadline/jobs/confirm", confirmation(prompt_id, accept))
 
     async def confirm_prompts():
         # An early answer is not saved for the first prompt.
-        assert (await answer())[0] == 409
-        submission.confirms = 1
-        responses = await asyncio.gather(answer(), answer())
+        assert (await answer("first"))[0] == 409
+        submission.prompt_id = "first"
+        responses = await asyncio.gather(answer("first"), answer("first"))
         assert sorted(status for status, _ in responses) == [200, 409]
-        assert (await answer())[0] == 409
-        submission.confirms = 2
-        assert (await answer(accept=False))[0] == 200
-        assert (await answer())[0] == 409
+        # A repeated answer to an answered prompt.
+        assert (await answer("first"))[0] == 409
+        submission.prompt_id = "second"
+        # A delayed answer to the first prompt doesn't answer the second.
+        assert (await answer("first"))[0] == 409
+        assert submission.prompt_id == "second"
+        assert (await answer("second", accept=False))[0] == 200
+        assert (await answer("second"))[0] == 409
 
     run(confirm_prompts())
     assert process.answers == [{"accept": True}, {"accept": False}]
-    assert submission.answered == 2
+    assert submission.prompt_id is None
 
 
 def test_confirm_rejects_a_canceled_submission(comfy, monkeypatch):
     process = _RecordingProcess()
-    submission = comfy.routes._Submission(
-        "fox", process, client_id="tab-1", canceled=True, confirms=1
-    )
-    monkeypatch.setitem(comfy.routes._submissions, "a" * 32, submission)
-    status, _ = run(
-        call(
-            comfy,
-            "/deadline/jobs/confirm",
-            {
-                "submissionId": "a" * 32,
-                "clientId": "tab-1",
-                "accept": True,
-            },
-        )
-    )
+    running_submission(comfy, monkeypatch, process, prompt_id="p" * 32, canceled=True)
+    status, _ = run(call(comfy, "/deadline/jobs/confirm", confirmation()))
     assert status == 409
     assert process.answers == []
 
@@ -1527,24 +1602,11 @@ class _ExitedProcess:
 
 
 @pytest.mark.parametrize(
-    ("path", "body", "status"),
-    [
-        ("/deadline/jobs/confirm", {"accept": True}, 404),
-        ("/deadline/jobs/cancel", {}, 200),
-    ],
+    ("path", "status"), [("/deadline/jobs/confirm", 404), ("/deadline/jobs/cancel", 200)]
 )
-def test_confirm_and_cancel_handle_a_bridge_that_already_exited(
-    comfy, monkeypatch, path, body, status
-):
-    submission_id = "b" * 32
-    monkeypatch.setitem(
-        comfy.routes._submissions,
-        submission_id,
-        comfy.routes._Submission("fox", _ExitedProcess(), client_id="tab-1", confirms=1),
-    )
-    got, response = run(
-        call(comfy, path, {**body, "submissionId": submission_id, "clientId": "tab-1"})
-    )
+def test_confirm_and_cancel_handle_a_bridge_that_already_exited(comfy, monkeypatch, path, status):
+    running_submission(comfy, monkeypatch, _ExitedProcess(), prompt_id="p" * 32)
+    got, response = run(call(comfy, path, confirmation()))
     assert got == status
     if status == 404:
         assert "isn't running" in response["error"]

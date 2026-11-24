@@ -13,6 +13,7 @@ import ipaddress
 import json
 import logging
 import re
+import secrets
 import shutil
 import threading
 import time
@@ -36,6 +37,7 @@ from .get_local_assets import (
     node_pack_size,
     stage_local_models,
     stage_local_node_packs,
+    workflow_file_inputs,
     write_asset_references,
 )
 from .submit import (
@@ -50,7 +52,6 @@ from .submit import (
     check_task_count,
     create_job_bundle,
     host_requirements,
-    input_folders,
     job_description,
     load_config,
     local_node_packs,
@@ -128,8 +129,9 @@ class _Submission:
     # The browser tab that submitted it, which alone gets its events.
     client_id: str
     canceled: bool = False
-    confirms: int = 0
-    answered: int = 0
+    # The ID of the confirmation prompt waiting for an answer, if one is. Each prompt gets a new
+    # one, so a late or repeated answer to an earlier prompt can't answer a later one.
+    prompt_id: str | None = None
     # Timers that decline unanswered confirmations, canceled when the submission ends.
     timers: list[asyncio.Task] = field(default_factory=list)
     # The job bundle, deleted once the job is created or the submission is canceled.
@@ -684,17 +686,28 @@ def _local_model_paths(
         return {}, {}
 
 
+def _file_inputs(workflow: dict[str, Any]) -> dict[str, frozenset[str]] | None:
+    """The file inputs of the workflow's node types, as ComfyUI's node definitions mark them."""
+    try:
+        import nodes
+    except ImportError:
+        # get_local_assets then reads only ComfyUI's own loaders.
+        return None
+    return workflow_file_inputs(workflow, nodes.NODE_CLASS_MAPPINGS)
+
+
 def _local_assets(workflow: dict[str, Any]) -> LocalAssets:
-    """The input files the workflow loads, with the folders its folder loaders read."""
-    input_dir = folder_paths.get_input_directory()
-    assets = get_local_assets(
+    """
+    The input files the workflow's file inputs and folder loaders load, inside ComfyUI's input,
+    output and temp folders. A folder loader's folder is attached as the files in it.
+    """
+    return get_local_assets(
         workflow,
-        input_dir=input_dir,
+        input_dir=folder_paths.get_input_directory(),
         output_dir=folder_paths.get_output_directory(),
         temp_dir=folder_paths.get_temp_directory(),
+        file_inputs=_file_inputs(workflow),
     )
-    assets.directories = sorted({*assets.directories, *input_folders(workflow, Path(input_dir))})
-    return assets
 
 
 def _save_asset_references(
@@ -815,7 +828,8 @@ def _plan(body: dict[str, Any], workflow: dict[str, Any], template: Path) -> dic
         "hostRequirements": template_host_requirements(job_template),
         # Attached when submitting, unless the artist turns off Attach Custom Nodes.
         "localNodes": [_local_node(name, path) for name, path in prepared.local_nodes.items()],
-        "warnings": prepared.warnings,
+        # With the inputs the workflow names that aren't attached, such as an absolute path.
+        "warnings": [*prepared.warnings, *assets.warnings],
         # About splitting the lists into tasks, so only for Multiple tasks.
         "taskWarnings": prepared.items.warnings if prepared.items else [],
         "nodeWarnings": prepared.node_warnings,
@@ -1150,6 +1164,16 @@ async def _build_bundle(
     attach_nodes = _attaches_nodes(definitions, parameters)
     # Copying models and custom nodes can take a while when the bundle is on another volume.
     staged = await asyncio.to_thread(_stage_prepared, prepared, workflow, bundle_dir, attach_nodes)
+    if assets is None:
+        # A request without the panel's list attaches what the workflow's file inputs name, and
+        # warns about what they name that isn't attached.
+        try:
+            assets = await asyncio.to_thread(_local_assets, workflow)
+        except Exception:
+            # _save_asset_references tries again, and saves the bundle without them if it can't.
+            logger.exception("Couldn't find the workflow's input files")
+        else:
+            prepared.warnings.extend(assets.warnings)
     await asyncio.to_thread(
         _save_asset_references, workflow, bundle_dir, assets, staged.filenames, staged.directories
     )
@@ -1310,11 +1334,14 @@ async def _watch_submission(submission_id: str) -> None:
                 if kind in ("progress", "message"):
                     _send(PROGRESS_EVENT, {**base, **data, "kind": kind}, submission.client_id)
                 elif kind == "confirm":
-                    submission.confirms += 1
-                    _send(CONFIRM_EVENT, {**base, **data}, submission.client_id)
+                    # The answer has to name this prompt, so an earlier prompt's can't answer it.
+                    prompt_id = secrets.token_hex(16)
+                    submission.prompt_id = prompt_id
+                    confirm = {**base, **data, "promptId": prompt_id}
+                    _send(CONFIRM_EVENT, confirm, submission.client_id)
                     submission.timers.append(
                         asyncio.create_task(
-                            _decline_unanswered(submission_id, submission, submission.confirms)
+                            _decline_unanswered(submission_id, submission, prompt_id)
                         )
                     )
                 elif kind == "creating":
@@ -1344,6 +1371,7 @@ async def _watch_submission(submission_id: str) -> None:
         stderr_task.cancel()
         for timer in submission.timers:
             timer.cancel()
+        submission.prompt_id = None
         _submissions.pop(submission_id, None)
 
     # A job the bridge created is reported even when Cancel came too late to stop it.
@@ -1416,14 +1444,13 @@ async def _write_line(process: asyncio.subprocess.Process, data: dict[str, Any])
     return True
 
 
-async def _decline_unanswered(submission_id: str, submission: _Submission, number: int) -> None:
-    """Declines the bridge's confirmation `number` if it's still unanswered after the timeout."""
+async def _decline_unanswered(submission_id: str, submission: _Submission, prompt_id: str) -> None:
+    """Declines the bridge's confirmation prompt_id if it's still unanswered after the timeout."""
     await asyncio.sleep(CONFIRM_TIMEOUT)
     if (
         _submissions.get(submission_id) is not submission
         or submission.canceled
-        or submission.confirms != number
-        or submission.answered >= number
+        or submission.prompt_id != prompt_id
     ):
         return
     logger.warning(
@@ -1431,7 +1458,8 @@ async def _decline_unanswered(submission_id: str, submission: _Submission, numbe
         _log_value(submission.name),
         CONFIRM_TIMEOUT,
     )
-    submission.answered = number
+    # A late answer to it gets a 409, like any other answer to a prompt that isn't pending.
+    submission.prompt_id = None
     await _write_line(submission.process, {"accept": False})
 
 
@@ -1444,7 +1472,7 @@ def _running_submission(body: dict[str, Any]) -> _Submission | web.Response:
 
 @PromptServer.instance.routes.post("/deadline/jobs/confirm")
 async def confirm_submission(request: web.Request) -> web.Response:
-    """Answers a submission's confirmation."""
+    """Answers the submission's pending confirmation, which the request names by its promptId."""
     body = await _read_body(request)
     if isinstance(body, web.Response):
         return body
@@ -1453,11 +1481,20 @@ async def confirm_submission(request: web.Request) -> web.Response:
         return submission
     if _client_id(body) != submission.client_id:
         return _error(403, "Only the browser tab that started this submission can confirm it.")
-    if submission.canceled or submission.confirms <= submission.answered:
-        return _error(409, "That submission has no pending confirmation.")
+    # Only true is a yes. Checked before the prompt is claimed, so a bad answer leaves it pending.
+    accept = body.get("accept")
+    if not isinstance(accept, bool):
+        return _error(400, "accept must be true or false.")
+    prompt_id = body.get("promptId")
+    if submission.canceled or prompt_id is None or prompt_id != submission.prompt_id:
+        return _error(
+            409,
+            "That submission has no pending confirmation with that promptId. It was answered, or "
+            "declined because nobody answered it in time.",
+        )
     # Claim this prompt before yielding to the bridge, so another answer cannot queue behind it.
-    submission.answered = submission.confirms
-    if not await _write_line(submission.process, {"accept": body.get("accept") is True}):
+    submission.prompt_id = None
+    if not await _write_line(submission.process, {"accept": accept}):
         return _error(404, "That submission isn't running.")
     return web.json_response({})
 

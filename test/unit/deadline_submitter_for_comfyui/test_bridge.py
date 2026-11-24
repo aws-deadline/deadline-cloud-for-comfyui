@@ -299,7 +299,18 @@ def test_submit_streams_progress_and_asks_to_confirm(deadline_api, monkeypatch, 
     assert deadline_api.config_file.written is None
 
 
-@pytest.mark.parametrize("answers", [[{"accept": False}], [], ["not an object"]])
+@pytest.mark.parametrize(
+    "answers",
+    [
+        [{"accept": False}],
+        [],
+        ["not an object"],
+        # Only true is a yes, not other values that are truthy.
+        [{"accept": "yes"}],
+        [{"accept": 1}],
+        [{"accept": "false"}],
+    ],
+)
 def test_submit_stops_unless_confirmed(deadline_api, monkeypatch, capsys, answers):
     code, events = run(monkeypatch, capsys, "submit", SUBMISSION, answers=answers)
     assert code == 1

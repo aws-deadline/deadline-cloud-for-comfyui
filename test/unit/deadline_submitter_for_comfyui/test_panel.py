@@ -62,8 +62,9 @@ def _run_scenario(tmp_path: Path, ui_source: str, scenario: str) -> dict:
         " pollJobs as __pollJobs, formFromRequirements as __formFromRequirements,"
         " requirementsFromForm as __requirementsFromForm,"
         " createView as __createView, itemEditBase as __itemEditBase,"
-        " DIALOG_SECTIONS as __dialogSections, loadQueue as __loadQueue,"
-        " loadQueues as __loadQueues, loadFarms as __loadFarms,"
+        " DIALOG_SECTIONS as __dialogSections, PANEL_SECTIONS as __panelSections,"
+        " loadQueue as __loadQueue, loadQueues as __loadQueues, loadFarms as __loadFarms,"
+        " attachmentEdits as __attachmentEdits,"
         " answerConfirmation as __answerConfirmation, cancelSubmission as __cancelSubmission };\n"
     )
     (web / "deadline_ui.js").write_text(ui_source + exports, encoding="utf-8")
@@ -108,28 +109,31 @@ def test_a_confirmation_before_the_response_is_shown(run_scenario):
     assert result["submission"]["confirm"] == {
         "message": "Upload 5 GB?",
         "default": True,
+        "promptId": "prompt-1",
     }
     assert result["submission"]["starting"] is False
 
 
-def test_confirmation_answers_include_the_submitting_client(run_scenario):
+def answer(prompt_id: str, accept: bool) -> dict:
+    return {"submissionId": "a" * 32, "clientId": "tab-1", "promptId": prompt_id, "accept": accept}
+
+
+def test_confirmation_answers_name_their_prompt_and_the_submitting_client(run_scenario):
+    """The server only takes an answer that names the prompt pending now."""
     result = run_scenario("answer-confirmation")
-    assert result == {
-        "answers": [{"submissionId": "a" * 32, "clientId": "tab-1", "accept": True}],
-        "pending": None,
-    }
+    assert result == {"answers": [answer("prompt-1", True)], "pending": None}
 
 
 def test_a_new_confirmation_survives_an_earlier_answer_finishing(run_scenario):
     result = run_scenario("answer-while-next-prompt-arrives")
-    assert result["answersWhileFirstPending"] == [
-        {"submissionId": "a" * 32, "clientId": "tab-1", "accept": True}
-    ]
-    assert result["nextPrompt"] == {"message": "Run hooks?", "default": False}
-    assert result["answers"] == [
-        {"submissionId": "a" * 32, "clientId": "tab-1", "accept": True},
-        {"submissionId": "a" * 32, "clientId": "tab-1", "accept": False},
-    ]
+    assert result["answersWhileFirstPending"] == [answer("prompt-1", True)]
+    assert result["nextPrompt"] == {
+        "message": "Run hooks?",
+        "default": False,
+        "promptId": "prompt-2",
+    }
+    # Each answer names the prompt it was shown with, so the first can't answer the second.
+    assert result["answers"] == [answer("prompt-1", True), answer("prompt-2", False)]
     assert result["pending"] is None
 
 
@@ -304,10 +308,123 @@ def test_an_earlier_queues_details_dont_replace_the_chosen_queues(run_scenario):
 def test_a_farm_or_queue_the_panel_doesnt_list_isnt_submitted_to(run_scenario):
     assert run_scenario("target-not-listed") == {
         "queueId": "",
-        "storageProfileId": "",
+        # Not chosen for the next queue, rather than None, so the account's default can fill it.
+        "storageProfileId": None,
         "canSubmitUnlisted": False,
         "canSubmitWithoutFarms": False,
     }
+
+
+def test_switching_queues_forgets_the_previous_queues_details(run_scenario):
+    """Nothing from queue 1, its parameters or its storage profile, is shown or sent to queue 2."""
+    result = run_scenario("switch-queue")
+    assert result["queue1Sent"] == {
+        "parameters": {"Queue1Parameter": "for queue 1", "Shared": "edited for queue 1"},
+        "storageProfileId": "sp-1",
+    }
+    assert result["canSubmitBeforeSwitching"] is True
+    assert result["queueWhileLoading"] is None
+    assert result["queueParametersWhileLoading"] is None
+    assert result["canSubmitWhileLoading"] is False
+    assert result["blockerWhileLoading"] == "Loading the queue's details…"
+    assert result["sentWhileLoading"] is None
+    assert result["canSubmitLoaded"] is True
+    # Shared has the same name on both queues, but its edit was for queue 1.
+    assert result["queue2Sent"] == {
+        "queueId": "queue-2",
+        "parameters": {"Queue2Parameter": "for queue 2"},
+        "storageProfileId": "",
+    }
+
+
+def test_submit_waits_for_the_latest_queue_details(run_scenario):
+    result = run_scenario("pending-queue-details")
+    assert result["canSubmitWhilePending"] is False
+    assert result["blockerWhilePending"] == "Loading the queue's details…"
+    assert result["sentWhilePending"] is None
+    # An earlier answer for the same queue came last, and was ignored.
+    assert result["parameters"] == ["Newer"]
+    assert result["profiles"] == ["sp-new"]
+    assert result["canSubmitLoaded"] is True
+    assert result["blockerLoaded"] is None
+    # Details that fail to load keep Submit off, and Submit says why.
+    assert result["queueFailed"] is None
+    assert result["canSubmitFailed"] is False
+    assert result["blockerFailed"].startswith("Couldn't load the queue's details:")
+    assert "ThrottlingException" in result["blockerFailed"]
+
+
+def test_a_storage_profile_of_none_survives_reloading_the_account(run_scenario):
+    """None is a choice, not a missing value that the account's default fills in again."""
+    result = run_scenario("storage-profile-none")
+    # The default isn't dropped while the queue's details load.
+    assert result["whileLoading"] == {"storageProfileId": "sp-1", "canSubmit": False}
+    assert result["defaultSent"] == "sp-1"
+    assert result["afterReload"] == ""
+    assert result["noneSent"] == ""
+    assert result["savedDefaults"] == [""]
+
+
+def test_a_default_storage_profile_the_queue_doesnt_list_needs_a_choice(run_scenario):
+    """Submitting without it would upload files that are on shared storage, without saying so."""
+    result = run_scenario("storage-profile-cleared")
+    assert result["storageProfileId"] is None
+    assert result["canSubmit"] is False
+    assert "doesn't list the storage profile sp-gone" in result["blocker"]
+    assert result["sentBeforeChoosing"] is None
+    assert result["canSubmitAfterNone"] is True
+    assert result["blockerAfterNone"] is None
+    assert result["noneSent"] == ""
+
+
+def test_attachment_changes_stay_with_their_workflow(run_scenario):
+    """A file added to workflow A, or removed from it, doesn't change workflow B's job."""
+    result = run_scenario("workflow-attachments")
+    in_a = {
+        "attachments": {"filenames": ["/manual/clip.mov"], "directories": []},
+        "excludedModels": ["checkpoints/sd.safetensors"],
+    }
+    assert result["fromA"] == in_a
+    assert result["fromB"] == {
+        "attachments": {"filenames": ["/input/old.png"], "directories": []},
+        "excludedModels": [],
+    }
+    # Back in A, its changes are as the artist left them.
+    assert result["backInA"] == in_a
+
+
+def test_a_file_dialog_that_closes_after_switching_workflows_adds_nothing(run_scenario):
+    result = run_scenario("late-file-dialog")
+    assert result["fromB"] == ["/input/old.png"]
+    assert result["fromA"] == ["/input/old.png"]
+    assert "warn" in result["toasts"]
+
+
+def test_both_views_show_what_the_job_attaches_next_to_submit(run_scenario):
+    result = run_scenario("attachment-summary")
+    assert result["planned"] == "Attaches 2 files, 2 models and 1 custom node pack."
+    summary = (
+        "Attaches 2 files, 1 folder, 1 model and 1 custom node pack. "
+        "You added /outside/clip.mov, /outside/frames."
+    )
+    assert result["summary"] == summary
+    assert result["sidebar"] == summary
+    assert result["dialog"] == summary
+    # The summary is what's sent.
+    assert result["sent"] == {
+        "attachments": {
+            "filenames": ["/input/old.png", "/outside/clip.mov"],
+            "directories": ["/outside/frames"],
+        },
+        "excludedModels": ["checkpoints/b.safetensors"],
+        "excludedNodes": [],
+    }
+
+
+def test_the_sidebar_lists_the_attachments_before_submit(run_scenario):
+    sections = run_scenario("panel-sections")["sections"]
+    assert sections.index("attachments") < sections.index("submit")
+    assert sections[-1] == "submit"
 
 
 def test_the_panel_has_the_submitters_task_limit(run_scenario):
