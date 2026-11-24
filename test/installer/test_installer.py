@@ -5,6 +5,7 @@ folder that contains the installer, or set COMFYUI_INSTALLER_PATH to it.
 """
 
 import glob
+import json
 import os
 import platform
 import re
@@ -390,14 +391,14 @@ class TestUserInstall:
         assert (installation.comfyui / "custom_nodes" / "other-node" / "__init__.py").is_file()
 
 
-@pytest.mark.parametrize("problem", ["no main.py", "a clone of the extension"])
+@pytest.mark.parametrize("problem", ["no custom_nodes", "a clone of the extension"])
 def test_invalid_comfyui_folders_are_rejected(installer_path: Path, tmp_path: Path, problem: str):
     # GIVEN
     prefix = tmp_path / "dne"
     comfyui = _make_comfyui(tmp_path)
     extension = comfyui / "custom_nodes" / EXTENSION_NAME
-    if problem == "no main.py":
-        (comfyui / "main.py").unlink()
+    if problem == "no custom_nodes":
+        shutil.rmtree(comfyui / "custom_nodes")
     else:
         # Uninstalling removes the extension folder, so the installer mustn't take over a clone.
         extension.mkdir()
@@ -414,11 +415,57 @@ def test_invalid_comfyui_folders_are_rejected(installer_path: Path, tmp_path: Pa
     # THEN
     assert result.returncode != 0
     assert not (prefix / "installer_version.txt").exists()
-    if problem == "no main.py":
+    if problem == "no custom_nodes":
         assert not extension.exists()
     else:
         assert [f.name for f in extension.iterdir()] == ["__init__.py"]
         assert (extension / "__init__.py").read_text() == "# a clone\n"
+
+
+def test_a_base_directory_without_main_py_is_accepted(installer_path: Path, tmp_path: Path):
+    """ComfyUI started with --base-directory, or legacy Comfy Desktop, loads custom_nodes from a
+    folder without main.py."""
+    # GIVEN
+    prefix = tmp_path / "dne"
+    comfyui = _make_comfyui(tmp_path)
+    (comfyui / "main.py").unlink()
+
+    # WHEN
+    subprocess.run(_installer_args(installer_path, prefix, comfyui), check=True)
+
+    # THEN
+    _validate_files(Installation(prefix=prefix, comfyui=comfyui))
+
+
+@pytest.mark.skipif(
+    platform.system() != "Darwin", reason="Comfy Desktop's build list is faked on macOS"
+)
+def test_defaults_to_the_first_comfy_desktop_build(installer_path: Path, tmp_path: Path):
+    """Without --comfyui-directory, and with no ComfyUI in ~/ComfyUI, the installer uses the first
+    build in Comfy Desktop's installations.json."""
+    # GIVEN a home folder of its own, so the real Comfy Desktop builds are never touched
+    home = tmp_path / "home"
+    builds = [home / "ComfyUI-Installs" / name for name in ("First build", "Second build")]
+    for build in builds:
+        _make_comfyui(build)
+    builds_file = home / "Library" / "Application Support" / "Comfy Desktop" / "installations.json"
+    builds_file.parent.mkdir(parents=True)
+    builds_file.write_text(
+        json.dumps(
+            [{"id": f"inst-{i}", "installPath": str(b)} for i, b in enumerate(builds)], indent=2
+        )
+    )
+    prefix = tmp_path / "dne"
+    args = _installer_args(installer_path, prefix, builds[1] / "ComfyUI")
+    index = args.index("--comfyui-directory")
+    del args[index : index + 2]
+
+    # WHEN
+    subprocess.run(args, check=True, env={**os.environ, "HOME": str(home)})
+
+    # THEN
+    _validate_files(Installation(prefix=prefix, comfyui=builds[0] / "ComfyUI"))
+    assert not (builds[1] / "ComfyUI" / "custom_nodes" / EXTENSION_NAME).exists()
 
 
 @pytest.mark.skipif(

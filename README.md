@@ -94,10 +94,18 @@ environment doesn't need boto3 or the deadline package.
 ### Windows and macOS installer
 
 Quit ComfyUI, then run `DeadlineCloudForComfyUISubmitter-windows-x64-installer.exe` or
-`DeadlineCloudForComfyUISubmitter-osx-installer.app`, and choose the ComfyUI folder that contains
-`main.py` and `custom_nodes`. To install without prompts, pass
-`--mode unattended --comfyui-directory /path/to/ComfyUI`. `--prefix` sets the installation folder,
-which holds the uninstaller. It's `~/DeadlineCloudForComfyUISubmitter` by default.
+`DeadlineCloudForComfyUISubmitter-osx-installer.app`, and choose the folder whose `custom_nodes`
+ComfyUI loads extensions from:
+
+- Comfy Desktop: the `ComfyUI` folder inside the build's folder, such as
+  `~/ComfyUI-Installs/ComfyUI/ComfyUI`. The installer suggests the first build that Comfy Desktop
+  lists when `~/ComfyUI` isn't a ComfyUI folder.
+- A git clone or the Windows portable build: the `ComfyUI` folder that contains `main.py`.
+- ComfyUI started with `--base-directory`: that folder.
+
+To install without prompts, pass `--mode unattended --comfyui-directory /path/to/ComfyUI`.
+`--prefix` sets the installation folder, which holds the uninstaller. It's
+`~/DeadlineCloudForComfyUISubmitter` by default.
 
 The installer puts the extension in `custom_nodes/deadline-cloud-for-comfyui`, with the Deadline
 Cloud library and its dependencies in the extension's `dependencies` folder. ComfyUI's own Python,

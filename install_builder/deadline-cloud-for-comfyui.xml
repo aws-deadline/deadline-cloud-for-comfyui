@@ -55,6 +55,37 @@
     </folderList>
     <initializationActionList>
         <setInstallerVariable name="all_components" value="${all_components} deadline_cloud_for_comfyui" />
+        <!-- Comfy Desktop lists its builds in installations.json. When ~/ComfyUI isn't a ComfyUI
+        folder, start with the first build's ComfyUI folder instead. These actions run before
+        InstallBuilder reads the command line, so a folder given on the command line still wins,
+        and the folder page can change it. -->
+        <setInstallerVariable name="comfyui_desktop_builds" value="${user_home_directory}/Library/Application Support/Comfy Desktop/installations.json">
+            <ruleList>
+                <platformTest type="osx"/>
+            </ruleList>
+        </setInstallerVariable>
+        <setInstallerVariable name="comfyui_desktop_builds" value="${windows_folder_appdata}/Comfy Desktop/installations.json">
+            <ruleList>
+                <platformTest type="windows"/>
+            </ruleList>
+        </setInstallerVariable>
+        <if>
+            <conditionRuleList>
+                <fileTest path="${comfyui_directory}/custom_nodes" condition="is_directory" negate="1"/>
+                <fileExists path="${comfyui_desktop_builds}"/>
+            </conditionRuleList>
+            <actionList>
+                <readFile path="${comfyui_desktop_builds}" name="comfyui_desktop_builds_text" abortOnError="0" showMessageOnError="0"/>
+                <setInstallerVariableFromRegEx name="comfyui_desktop_build" text="${comfyui_desktop_builds_text}" pattern="^.*?&quot;installPath&quot;\s*:\s*&quot;([^&quot;]+)&quot;.*$" substitution="\1"/>
+                <!-- JSON doubles the backslashes in Windows paths. -->
+                <setInstallerVariableFromRegEx name="comfyui_desktop_build" text="${comfyui_desktop_build}" pattern="\\\\" substitution="\\"/>
+                <setInstallerVariable name="comfyui_directory" value="${comfyui_desktop_build}/ComfyUI">
+                    <ruleList>
+                        <fileTest path="${comfyui_desktop_build}/ComfyUI/custom_nodes" condition="is_directory"/>
+                    </ruleList>
+                </setInstallerVariable>
+            </actionList>
+        </if>
     </initializationActionList>
     <parameterList>
         <stringParameter name="deadline_cloud_for_comfyui_summary" ask="0" cliOptionShow="0">
@@ -63,13 +94,13 @@
 - Installs the Deadline Cloud dependencies next to the extension. ComfyUI's Python runs them in a separate process.
             </value>
         </stringParameter>
-        <!-- ComfyUI loads extensions from the custom_nodes folder of its installation, so the
-        installer asks for that folder rather than discovering it like other integrations. -->
+        <!-- ComfyUI loads extensions from the custom_nodes folder of its installation, or of the
+        base directory it's started with, so the installer asks for that folder. -->
         <directoryParameter>
             <name>comfyui_directory</name>
             <title>ComfyUI</title>
             <description>ComfyUI folder</description>
-            <explanation>Choose the ComfyUI folder that contains main.py and custom_nodes.</explanation>
+            <explanation>Choose the folder whose custom_nodes folder ComfyUI loads extensions from. For Comfy Desktop, that's the ComfyUI folder inside the build's folder in ComfyUI-Installs. For a git clone or the Windows portable build, it's the ComfyUI folder that contains main.py. If you start ComfyUI with --base-directory, choose that folder.</explanation>
             <value></value>
             <default>${user_home_directory}/ComfyUI</default>
             <allowEmptyValue>0</allowEmptyValue>
@@ -78,10 +109,8 @@
             <mustExist>1</mustExist>
             <width>40</width>
             <validationActionList>
-                <throwError text="Choose the ComfyUI folder that contains main.py and custom_nodes.">
-                    <ruleEvaluationLogic>or</ruleEvaluationLogic>
+                <throwError text="Choose the ComfyUI folder that contains custom_nodes.">
                     <ruleList>
-                        <fileTest path="${comfyui_directory}/main.py" condition="not_exists"/>
                         <fileTest path="${comfyui_directory}/custom_nodes" condition="is_directory" negate="1"/>
                     </ruleList>
                 </throwError>
@@ -98,10 +127,8 @@
     </parameterList>
     <readyToInstallActionList>
         <!-- validationActionList doesn't run in unattended mode, so check the folder again. -->
-        <throwError text="Choose the ComfyUI folder that contains main.py and custom_nodes.">
-            <ruleEvaluationLogic>or</ruleEvaluationLogic>
+        <throwError text="Choose the ComfyUI folder that contains custom_nodes.">
             <ruleList>
-                <fileTest path="${comfyui_directory}/main.py" condition="not_exists"/>
                 <fileTest path="${comfyui_directory}/custom_nodes" condition="is_directory" negate="1"/>
             </ruleList>
         </throwError>
