@@ -47,7 +47,15 @@ def test_copyright_headers():
     while not (root_project_dir / "test").exists():
         root_project_dir = root_project_dir.parent
     # Call out every directory & extension we expect to see copyright headers in; non-exhaustive but best-effort
-    top_level_dirs = ["src", "test", "scripts", "frontend"]
+    top_level_dirs = [
+        "src",
+        "test",
+        "scripts",
+        "frontend",
+        "installer",
+        "install_builder",
+        "pipeline",
+    ]
     file_count = 0
     failed_files = set()
     for top_level_dir in top_level_dirs:

@@ -63,7 +63,8 @@ def setup_install_builder(
 def build_panel(root: Path) -> None:
     """Compile the panel's TypeScript into the web folder that the installer packs."""
     frontend = root / "frontend"
-    run("npm ci --no-audit --no-fund", cwd=frontend)
+    # The panel only needs TypeScript, so no package's install scripts have to run.
+    run("npm ci --ignore-scripts --no-audit --no-fund", cwd=frontend)
     run("npm run build", cwd=frontend)
 
 

@@ -54,7 +54,11 @@ def installer_path() -> Path:
         installer = installer / "Contents" / "MacOS" / "installbuilder.sh"
 
     if not installer.is_file():
-        raise FileNotFoundError(f"Installer not found at '{installer}'")
+        message = f"Installer not found at '{installer}'"
+        # In the shared build, a missing installer is a failed build rather than a test to skip.
+        if os.getenv("CODEBUILD_SRC_DIR") is not None:
+            raise FileNotFoundError(message)
+        pytest.skip(message)
 
     if not os.access(installer, os.X_OK) and not platform.system() == "Darwin":
         raise PermissionError(f"Installer at '{installer}' is not executable")
