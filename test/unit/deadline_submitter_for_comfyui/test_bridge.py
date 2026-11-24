@@ -609,3 +609,46 @@ def test_submit_registers_its_job_creation_events_once(deadline_api, monkeypatch
     handlers = deadline_api.api.client.meta.events.handlers
     assert len(handlers["before-call.deadline.CreateJob"]) == 1
     assert len(handlers["after-call.deadline.CreateJob"]) == 1
+
+
+def _embedded_python_path(tmp_path: Path) -> list[str]:
+    """sys.path of ComfyUI portable's embedded Python, after its ._pth file imported site."""
+    python = tmp_path / "python_embeded"
+    site_packages = python / "Lib" / "site-packages"
+    return [
+        str(python / "python313.zip"),
+        str(python),
+        str(tmp_path / "ComfyUI"),
+        str(site_packages),
+        # pywin32.pth in ComfyUI's site-packages adds folders inside it.
+        str(site_packages / "win32" / "lib"),
+    ]
+
+
+def _dependencies(tmp_path: Path) -> Path:
+    dependencies = tmp_path / "dependencies"
+    (dependencies / "win32").mkdir(parents=True)
+    (dependencies / "pywin32.pth").write_text("win32\n")
+    return dependencies
+
+
+def test_dependencies_replace_comfyuis_site_packages_when_site_ran(monkeypatch, tmp_path):
+    """On ComfyUI portable, a ._pth file runs site despite -S, so ComfyUI's packages are dropped."""
+    path = _embedded_python_path(tmp_path)
+    monkeypatch.setattr(sys, "path", list(path))
+    dependencies = _dependencies(tmp_path)
+
+    bridge._use_dependencies(str(dependencies), site_ran=True)
+
+    assert sys.path == [*path[:3], str(dependencies), str(dependencies / "win32")]
+
+
+def test_dependencies_are_added_after_the_path_when_site_didnt_run(monkeypatch, tmp_path):
+    """-S kept site from running, so sys.path has no site-packages to drop."""
+    path = _embedded_python_path(tmp_path)[:3]
+    monkeypatch.setattr(sys, "path", list(path))
+    dependencies = _dependencies(tmp_path)
+
+    bridge._use_dependencies(str(dependencies), site_ran=False)
+
+    assert sys.path == [*path, str(dependencies), str(dependencies / "win32")]
