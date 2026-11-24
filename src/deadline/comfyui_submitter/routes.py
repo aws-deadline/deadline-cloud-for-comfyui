@@ -40,9 +40,12 @@ from .get_local_assets import (
 )
 from .submit import (
     DEFAULT_WORKFLOW_NAME,
+    FOLDER_LOADERS,
     PICKER_KINDS,
     SubmitError,
+    TaskLists,
     check_cli_version,
+    check_item_range,
     check_parameter_values,
     create_job_bundle,
     host_requirements,
@@ -52,13 +55,16 @@ from .submit import (
     local_node_packs,
     parse_bool,
     picker_command,
+    plan_task_lists,
     read_job_template,
     resolve_cli_python,
     resolve_conda_channels,
     resolve_deadline_cli,
     resolve_job_template,
     template_defines_parameter,
+    template_has_own_task_parameters,
     template_host_requirements,
+    template_supports_task_lists,
     validate_api_workflow,
     workflow_models,
     write_private_text,
@@ -103,6 +109,9 @@ SUBMISSION_MARKER = ".deadline-submission"
 OLD_SUBMISSION_AGE = 24 * 60 * 60
 # The queue environment parameter that the config's conda_channels fills in.
 CONDA_CHANNELS_PARAMETER = "CondaChannels"
+# How much of each source's items the plan sends for previews.
+MAX_PREVIEW_VALUES = 100
+MAX_PREVIEW_LENGTH = 120
 
 # Keeps a reference to each background task so it isn't garbage collected while it runs.
 _watchers: set[asyncio.Task] = set()
@@ -134,7 +143,9 @@ _submissions: dict[str, _Submission] = {}
 class _Prepared:
     """What a workflow submits with, before the job bundle exists."""
 
+    # The workflow to submit: with its lists marked, when the template runs them as tasks.
     workflow: dict[str, Any]
+    items: TaskLists | None = None
     # Job parameter values the submitter fills in. WorkflowFile isn't known until the bundle exists.
     values: dict[str, Any] = field(default_factory=dict)
     conda_channels: str | None = None
@@ -448,13 +459,43 @@ def _workflow_name(body: dict[str, Any]) -> str:
     return name[: -len(".json")] if name.lower().endswith(".json") else name
 
 
+def _has_lists(workflow: dict[str, Any]) -> bool:
+    """Whether the workflow has nodes whose items could run as separate tasks."""
+    return any(
+        node.get("class_type") in ("CreateList", *FOLDER_LOADERS) for node in workflow.values()
+    )
+
+
 def _prepare(
     body: dict[str, Any], workflow: dict[str, Any], template: Path, config: dict[str, Any]
 ) -> _Prepared:
-    """Finds what the workflow needs attached and fills in the parameters. Raises SubmitError."""
-    prepared = _Prepared(workflow=workflow, conda_channels=resolve_conda_channels(config))
+    """
+    Plans the task lists, finds what the workflow needs attached and fills in the parameters.
+    Raises SubmitError.
+    """
+    input_dir = Path(folder_paths.get_input_directory())
+    # A template without the ITEMS line in its task script, or whose step has task parameters of
+    # its own, runs the workflow as one task.
+    items = None
+    if template_supports_task_lists(template):
+        reserved = {
+            str(parameter.get("name"))
+            for parameter in read_job_template(template).get("parameterDefinitions") or []
+            if isinstance(parameter, dict)
+        }
+        items = plan_task_lists(workflow, input_dir, reserved)
+    prepared = _Prepared(
+        workflow=items.workflow if items else workflow,
+        items=items,
+        conda_channels=resolve_conda_channels(config),
+    )
+    if items is None and template_has_own_task_parameters(template) and _has_lists(workflow):
+        prepared.warnings.append(
+            f"The job template {template.name} already has task parameters, so the workflow's "
+            "lists run whole in one task."
+        )
     prepared.values["OutputDir"] = folder_paths.get_output_directory()
-    prepared.values["InputDir"] = folder_paths.get_input_directory()
+    prepared.values["InputDir"] = str(input_dir)
     # A template without Model Directory can't map attached models on the worker.
     if template_defines_parameter(template, "ModelDirectory"):
         prepared.local_models, prepared.model_directories = _local_model_paths(
@@ -720,7 +761,8 @@ def _start(coroutine) -> None:
 def _plan(body: dict[str, Any], workflow: dict[str, Any], template: Path) -> dict[str, Any]:
     """Works out the panel's plan. It reads files, so it runs in a thread. Raises SubmitError."""
     prepared = _prepare(body, workflow, template, load_config())
-    job_template = read_job_template(template)
+    sources = prepared.items.active if prepared.items else []
+    job_template = read_job_template(template, sources)
     assets = _local_assets(workflow)
     return {
         "name": _workflow_name(body),
@@ -730,6 +772,21 @@ def _plan(body: dict[str, Any], workflow: dict[str, Any], template: Path) -> dic
         "queueValues": (
             {CONDA_CHANNELS_PARAMETER: prepared.conda_channels} if prepared.conda_channels else {}
         ),
+        "sources": [
+            {
+                "name": source.name,
+                "parameter": source.parameter,
+                "label": source.label,
+                "title": source.title,
+                "kind": source.kind,
+                "values": [
+                    value[:MAX_PREVIEW_LENGTH] for value in source.values[:MAX_PREVIEW_VALUES]
+                ],
+                "count": source.count,
+                "range": source.range,
+            }
+            for source in sources
+        ],
         "attachments": {
             "filenames": [str(path) for path in assets.filenames],
             "directories": [str(path) for path in assets.directories],
@@ -748,6 +805,8 @@ def _plan(body: dict[str, Any], workflow: dict[str, Any], template: Path) -> dic
         # Attached when submitting, unless the artist turns off Attach Custom Nodes.
         "localNodes": [_local_node(name, path) for name, path in prepared.local_nodes.items()],
         "warnings": prepared.warnings,
+        # About splitting the lists into tasks, so only for Multiple tasks.
+        "taskWarnings": prepared.items.warnings if prepared.items else [],
         "nodeWarnings": prepared.node_warnings,
     }
 
@@ -978,14 +1037,42 @@ async def _build_bundle(
     # Refused before anything is prepared, staged or copied for the job.
     check_parameter_values(definitions, parameters)
 
+    # The panel splits the workflow's lists into tasks only when the artist chooses to. Otherwise
+    # the job is one task, with no task parameters, and the lists run whole in it.
+    split = body.get("splitTasks", False)
+    if not isinstance(split, bool):
+        raise SubmitError("splitTasks must be true or false.")
+
     prepared = await asyncio.to_thread(_prepare, body, workflow, template, config)
-    defined = {parameter.get("name") for parameter in definitions if isinstance(parameter, dict)}
+    items = prepared.items if split else None
+    sources = items.active if items else None
+    # One task has no list parameters, such as ones from a panel loaded before One task was the
+    # default.
+    for source in prepared.items.sources if prepared.items and not split else []:
+        parameters.pop(source.parameter, None)
+    if items:
+        prepared.warnings = [*items.warnings, *prepared.warnings]
+    for source in sources or []:
+        check_item_range(source, parameters.get(source.parameter, source.range))
+    defined = {
+        parameter.get("name")
+        for parameter in read_job_template(template, sources).get("parameterDefinitions", [])
+    }
+    # A list's field from an older plan, such as before the list was renamed, before anything is
+    # staged. Queue parameters aren't in the template, but don't end in "Items".
+    stale = sorted(name for name in parameters if name.endswith("Items") and name not in defined)
+    if split and stale:
+        raise SubmitError(
+            f"The workflow's lists changed since it was read ({', '.join(stale)}). Read the "
+            "workflow again, then choose their items."
+        )
     bundle_dir, workflow_path = create_job_bundle(
         template,
-        workflow,
+        prepared.workflow,
         _workflow_name(body),
         _submissions_dir(),
         requirements=requirements,
+        sources=sources,
         description=description,
     )
     # Marked before the models are staged, so a bundle left by a crash while copying them is

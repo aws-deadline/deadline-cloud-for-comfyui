@@ -1,4 +1,5 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+import copy
 import json
 import os
 import re
@@ -24,10 +25,12 @@ from deadline.comfyui_submitter.submit import (
     get_safe_path,
     local_node_packs,
     parse_cli_version,
+    plan_task_lists,
     resolve_deadline_cli,
     resolve_job_template,
     safe_name,
     template_defines_parameter,
+    template_supports_task_lists,
     validate_api_workflow,
     workflow_models,
 )
@@ -638,3 +641,480 @@ def test_check_parameter_values_says_what_is_wrong(parameters, error):
     with pytest.raises(SubmitError) as raised:
         submit.check_parameter_values(TYPED_PARAMETERS, parameters)
     assert str(raised.value) == error
+
+
+SOURCES = [
+    submit.ItemSource("List1", "Create List #1", 4),
+    submit.ItemSource(
+        "Folder6", "Folder cats (#6)", 3, "folder", values=["a.png", "b.png", "c.png"]
+    ),
+]
+
+
+def _create_list(*items):
+    return {
+        "class_type": "CreateList",
+        "inputs": {f"inputs.input{i}": [n, 0] for i, n in enumerate(items)},
+    }
+
+
+def _marked(plan, node_id):
+    return plan.workflow[node_id].get("_meta", {})
+
+
+def _names(plan):
+    return [(source.name, source.label, source.count) for source in plan.sources]
+
+
+def test_plan_task_lists_for_create_list():
+    workflow = {
+        "1": _create_list("2", "3", "4", "5"),
+        "6": {"class_type": "SaveImage", "inputs": {}},
+    }
+    plan = plan_task_lists(workflow)
+    assert _names(plan) == [("List1", "Create List #1", 4)]
+    assert _marked(plan, "1") == {submit.ITEM_META: "List1"}
+    assert "_meta" not in plan.workflow["6"]
+    assert plan.warnings == []
+    # The workflow passed in is unchanged.
+    assert "_meta" not in workflow["1"]
+
+
+def test_plan_task_lists_without_the_inputs_prefix():
+    workflow = {
+        "1": {"class_type": "CreateList", "inputs": {"input0": ["2", 0], "input1": ["3", 0]}}
+    }
+    assert _names(plan_task_lists(workflow)) == [("List1", "Create List #1", 2)]
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    [
+        {"1": {"class_type": "SaveImage", "inputs": {}}},
+        {"1": _create_list("2")},
+    ],
+)
+def test_plan_task_lists_without_lists(workflow):
+    plan = plan_task_lists(workflow)
+    assert plan.sources == []
+    assert plan.warnings == []
+    assert plan.workflow == workflow
+
+
+def test_plan_task_lists_keeps_lists_of_different_lengths_separate():
+    plan = plan_task_lists({"1": _create_list("2", "3"), "4": _create_list("5", "6", "7")})
+    assert _names(plan) == [("List1", "Create List #1", 2), ("List4", "Create List #4", 3)]
+    assert _marked(plan, "4") == {submit.ITEM_META: "List4"}
+    assert plan.warnings == []
+
+
+def test_plan_task_lists_names_subgraph_nodes():
+    plan = plan_task_lists({"57:27": _create_list("2", "3")})
+    assert _names(plan) == [("List57_27", "Create List #57:27", 2)]
+
+
+def test_plan_task_lists_leaves_lists_past_the_most_a_step_takes_whole():
+    workflow = {str(n): _create_list("a", "b") for n in range(1, submit.MAX_ITEM_SOURCES + 3)}
+    plan = plan_task_lists(workflow)
+    assert len(plan.active) == submit.MAX_ITEM_SOURCES
+    assert "_meta" not in plan.workflow["17"]
+    assert plan.warnings == [
+        (
+            f"Deadline Cloud splits up to {submit.MAX_ITEM_SOURCES} fields into tasks, so "
+            "these run whole in each task: Create List #17, Create List #18."
+        )
+    ]
+
+
+def test_bundled_template_splits_lists():
+    assert template_supports_task_lists(submit.JOB_TEMPLATE)
+
+
+def test_template_supports_task_lists_missing_file(tmp_path):
+    assert not template_supports_task_lists(tmp_path / "missing.yaml")
+
+
+def test_add_task_lists():
+    base = yaml.safe_load(submit.JOB_TEMPLATE.read_text())
+    template = submit.add_task_lists(base, SOURCES)
+    names = [parameter["name"] for parameter in template["parameterDefinitions"]]
+    # After the workflow parameters.
+    at = names.index("OutputDir") + 1
+    assert names[at : at + 2] == ["List1Items", "Folder6Items"]
+    folder = template["parameterDefinitions"][at + 1]
+    assert folder["default"] == "1-3"
+    assert folder["userInterface"] == {
+        "control": "LINE_EDIT",
+        "label": "Folder cats (#6)",
+        "groupLabel": "Tasks",
+    }
+    assert folder["description"].endswith("Items: 1: a.png; 2: b.png; 3: c.png.")
+    step = template["steps"][0]
+    assert "combination" not in step["parameterSpace"]
+    assert step["parameterSpace"]["taskParameterDefinitions"] == [
+        {"name": "List1", "type": "INT", "range": "{{Param.List1Items}}"},
+        {"name": "Folder6", "type": "INT", "range": "{{Param.Folder6Items}}"},
+    ]
+    # The task script gets the task's items as arguments, and its code is unchanged.
+    assert step["script"]["actions"]["onRun"]["args"] == [
+        "{{Task.File.Run}}",
+        "List1={{Task.Param.List1}}",
+        "Folder6={{Task.Param.Folder6}}",
+    ]
+    assert step["script"]["embeddedFiles"] == base["steps"][0]["script"]["embeddedFiles"]
+    # The template passed in is unchanged.
+    assert base == yaml.safe_load(submit.JOB_TEMPLATE.read_text())
+
+
+def test_add_task_lists_leaves_a_studio_templates_other_steps_alone():
+    """A studio step with its own task parameters, and the ITEMS line, keeps its parameter space."""
+    base = yaml.safe_load(submit.JOB_TEMPLATE.read_text())
+    frames = copy.deepcopy(base["steps"][0])
+    frames["name"] = "StudioFrames"
+    frames["parameterSpace"] = {
+        "taskParameterDefinitions": [{"name": "Frame", "type": "INT", "range": "1-3"}],
+        "combination": "Frame",
+    }
+    base["steps"].append(frames)
+    template = submit.add_task_lists(base, SOURCES)
+    assert template["steps"][1] == frames
+    decode_job_template(template=template, supported_extensions=["EXPR"])
+
+
+def test_bundle_scripts_have_no_parameter_values_written_into_them(tmp_path):
+    """The scripts read job and task parameters from environment variables and arguments."""
+    bundle_dir, _ = create_job_bundle(
+        submit.JOB_TEMPLATE, API_WORKFLOW, "w", tmp_path, sources=SOURCES
+    )
+    template = yaml.safe_load((bundle_dir / "template.yaml").read_text())
+    scripts = [
+        file["data"]
+        for container in [*template["jobEnvironments"], *template["steps"]]
+        for file in container["script"]["embeddedFiles"]
+    ]
+    assert len(scripts) == 4
+    assert not [script for script in scripts if "{{Param." in script or "{{Task.Param." in script]
+
+
+def test_add_task_lists_shortens_long_item_lists():
+    source = submit.ItemSource(
+        "Folder5", "Folder cats (#5)", 12, "folder", [str(n) * 70 for n in range(10)]
+    )
+    parameter = submit.add_task_lists({"steps": []}, [source])["parameterDefinitions"][0]
+    assert f"1: {'0' * 60}...; " in parameter["description"]
+    assert parameter["description"].endswith("10: " + "9" * 60 + "...; and 2 more.")
+
+
+def test_add_task_lists_leaves_out_control_characters_openjd_refuses():
+    """A folder name or a list item can hold one, which would make the template invalid."""
+    source = submit.ItemSource(
+        "Folder5", "Folder shots\x07a (#5)", 2, "folder", ["a\x01b.png", "line\nbreak\ttab\x9f"]
+    )
+    template = {
+        "specificationVersion": "jobtemplate-2023-09",
+        "name": "fox",
+        "steps": [{"name": "Run", "script": {"actions": {"onRun": {"command": "true"}}}}],
+    }
+    parameter = submit.add_task_lists(template, [source])["parameterDefinitions"][0]
+    assert parameter["userInterface"]["label"] == "Folder shots a (#5)"
+    assert parameter["description"].endswith("Items: 1: a b.png; 2: line\nbreak\ttab .")
+    decode_job_template(template=submit.add_task_lists(template, [source]))
+
+
+def test_add_task_lists_lists_ten_items_in_full():
+    source = submit.ItemSource(
+        "Folder5", "Folder cats (#5)", 10, "folder", [str(n) for n in range(10)]
+    )
+    parameter = submit.add_task_lists({"steps": []}, [source])["parameterDefinitions"][0]
+    assert parameter["description"].endswith(
+        "Items: 1: 0; 2: 1; 3: 2; 4: 3; 5: 4; 6: 5; 7: 6; 8: 7; 9: 8; 10: 9."
+    )
+
+
+def test_generated_template_is_valid_and_crosses_every_source(tmp_path):
+    bundle_dir, _ = create_job_bundle(
+        submit.JOB_TEMPLATE, API_WORKFLOW, "w", tmp_path, sources=SOURCES
+    )
+    tasks = _tasks(bundle_dir, tmp_path)
+    # 4 list items and 3 images.
+    assert len(tasks) == 12
+    assert tasks[-1] == {"List1": "4", "Folder6": "3"}
+
+
+def test_create_job_bundle_adds_task_lists_to_json_templates(tmp_path):
+    template = tmp_path / "studio.json"
+    template.write_text(json.dumps(yaml.safe_load(submit.JOB_TEMPLATE.read_text())))
+    bundle_dir, _ = create_job_bundle(template, API_WORKFLOW, "w", tmp_path / "s", sources=SOURCES)
+    written = json.loads((bundle_dir / "template.json").read_text())
+    assert written == submit.add_task_lists(json.loads(template.read_text()), SOURCES)
+
+
+def test_image_files(tmp_path):
+    for name in ("b.PNG", "a.webp", "c.txt"):
+        (tmp_path / name).write_text("x")
+    (tmp_path / "d.jpg").mkdir()
+    assert submit.image_files(tmp_path) == ["a.webp", "b.PNG"]
+    assert submit.image_files(tmp_path / "missing") == []
+
+
+def test_plan_task_lists_for_folder_loaders(tmp_path):
+    input_dir = _input_dir(tmp_path)
+    workflow = {"3": {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": "cats"}}}
+    plan = plan_task_lists(workflow, input_dir)
+    assert _names(plan) == [("Folder3", "Folder cats (#3)", 2)]
+    assert plan.sources[0].values == ["a.png", "b.jpg"]
+    assert _marked(plan, "3") == {
+        submit.FILES_META: ["cats/a.png", "cats/b.jpg"],
+        submit.ITEM_META: "Folder3",
+    }
+    # Without the input directory, such as in a test, folders aren't split.
+    assert plan_task_lists(workflow).sources == []
+
+
+def test_plan_task_lists_drops_the_workflows_own_submitter_keys(tmp_path):
+    """A shared workflow can't preset the keys the task script follows on a node."""
+    input_dir = _input_dir(tmp_path)
+    preset = {submit.ITEM_META: "List1", submit.FILES_META: ["../../secret.png"] * 2}
+    workflow = {
+        "1": _create_list("3", "4"),
+        # A folder of one image isn't split. The submitter writes nothing on it.
+        "5": {
+            "class_type": "LoadImageDataSetFromFolder",
+            "inputs": {"folder": "one"},
+            "_meta": {**preset, "title": "Plates"},
+        },
+        "6": {"class_type": "SaveImage", "inputs": {}, "_meta": dict(preset)},
+    }
+    (input_dir / "one").mkdir()
+    (input_dir / "one" / "a.png").write_bytes(b"x")
+    plan = plan_task_lists(workflow, input_dir)
+    assert [source.name for source in plan.active] == ["List1"]
+    assert plan.workflow["5"]["_meta"] == {"title": "Plates"}
+    assert "_meta" not in plan.workflow["6"]
+    # The workflow passed in is unchanged.
+    assert workflow["6"]["_meta"] == preset
+
+
+def _titles(workflow):
+    return [source.title for source in plan_task_lists(workflow).sources]
+
+
+def test_lists_that_look_like_links_arent_connections():
+    workflow = {
+        "1": _create_list("3", "4"),
+        "2": {"class_type": "Other", "inputs": {"choices": ["1", "2"]}},
+    }
+    assert _titles(workflow) == ["Create List #1"]
+
+
+def test_folders_keep_their_label_as_title(tmp_path):
+    (tmp_path / "cats").mkdir()
+    for name in ("a.png", "b.png"):
+        (tmp_path / "cats" / name).write_text("x")
+    workflow = {"3": {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": "cats"}}}
+    sources = plan_task_lists(workflow, tmp_path).sources
+    assert [source.title for source in sources] == ["Folder cats (#3)"]
+
+
+def test_lists_are_named_by_the_title_an_artist_gave_them(tmp_path):
+    """The title names the list's column in Deadline Cloud monitor and its output files."""
+    (tmp_path / "cats").mkdir()
+    for name in ("a.png", "b.png"):
+        (tmp_path / "cats" / name).write_text("x")
+    workflow = {
+        "1": {**_create_list("2", "3"), "_meta": {"title": "Subject"}},
+        "4": {**_create_list("5", "6"), "_meta": {"title": "Subject"}},
+        "7": {**_create_list("8", "9"), "_meta": {"title": "Create List"}},
+        "10": {
+            "class_type": "LoadImageDataSetFromFolder",
+            "inputs": {"folder": "cats"},
+            "_meta": {"title": "Cat photos"},
+        },
+        "11": {**_create_list("12", "13"), "_meta": {"title": "2nd pass!"}},
+    }
+    plan = plan_task_lists(workflow, tmp_path)
+    assert [(source.name, source.title) for source in plan.sources] == [
+        ("Subject", "Subject"),
+        # Two lists with the same title keep it, with their node IDs.
+        ("Subject_4", "Subject"),
+        # ComfyUI's own title isn't a name the artist gave it.
+        ("List7", "Create List #7"),
+        ("Cat_photos", "Cat photos"),
+        ("_2nd_pass", "2nd pass!"),
+    ]
+    bundle_dir, _ = create_job_bundle(
+        submit.JOB_TEMPLATE, API_WORKFLOW, "w", tmp_path / "bundles", sources=plan.sources
+    )
+    # OpenJD accepts the names as task parameters.
+    assert _tasks(bundle_dir, tmp_path)[0] == {
+        "Subject": "1",
+        "Subject_4": "1",
+        "List7": "1",
+        "Cat_photos": "1",
+        "_2nd_pass": "1",
+    }
+
+
+def test_json_templates_run_task_lists_too(tmp_path):
+    """A JSON template keeps its script on one line, with the ITEMS line after an escaped newline."""
+    template = yaml.safe_load(submit.JOB_TEMPLATE.read_text())
+    json_template = tmp_path / "studio.json"
+    json_template.write_text(json.dumps(template))
+    assert template_supports_task_lists(json_template)
+    for file in template["steps"][0]["script"]["embeddedFiles"]:
+        file["data"] = file["data"].replace("ITEMS = {}", "ITEMS = load_items()")
+    json_template.write_text(json.dumps(template))
+    assert not template_supports_task_lists(json_template)
+
+
+def test_create_list_items_are_named_for_the_panel():
+    workflow = {
+        "1": {
+            "class_type": "CreateList",
+            "inputs": {
+                "inputs.input10": ["6", 0],
+                "inputs.input2": ["5", 0],
+                "inputs.input0": "a red fox",
+                "inputs.input1": 7,
+            },
+        },
+        "5": {"class_type": "PrimitiveStringMultiline", "inputs": {"value": "a white fox"}},
+        "6": {"class_type": "LoadImage", "inputs": {"image": "fox.png"}, "_meta": {"title": "Fox"}},
+    }
+    [source] = plan_task_lists(workflow).sources
+    # In the order the task script numbers them, input10 after input2.
+    assert source.values == ["a red fox", "7", "a white fox", "Fox #6"]
+
+
+def test_lists_with_a_null_meta_are_planned():
+    workflow = {"1": {**_create_list("2", "3"), "_meta": None}}
+    [source] = plan_task_lists(workflow).sources
+    assert source.name == "List1"
+
+
+def test_renamed_lists_get_unique_names_even_when_a_node_id_is_taken():
+    workflow = {
+        "3": {**_create_list("a", "b"), "_meta": {"title": "A_7"}},
+        "5": {**_create_list("a", "b"), "_meta": {"title": "A"}},
+        "7": {**_create_list("a", "b"), "_meta": {"title": "A"}},
+    }
+    assert [source.name for source in plan_task_lists(workflow).sources] == ["A_7", "A", "A_7_2"]
+
+
+@pytest.mark.parametrize(
+    ("value", "valid"),
+    [
+        ("0", True),
+        ("1-3", True),
+        (" 3, 1 ", True),
+        ("1-3:2", True),
+        ("4", False),
+        ("1-4", False),
+        ("0,1", False),
+        ("1-3,2", False),
+        ("1,,2", False),
+        ("1 - 3", True),
+        ("x", False),
+        ("", False),
+        ("1 0", False),
+        ("\u0661", False),
+    ],
+)
+def test_check_item_range(value, valid):
+    """The submitter checks a list's range again, with the panel's rules."""
+    source = submit.ItemSource("List5", "Create List #5", 3)
+    if valid:
+        submit.check_item_range(source, value)
+    else:
+        with pytest.raises(SubmitError, match="Create List #5"):
+            submit.check_item_range(source, value)
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("4", "Create List #5 has 3 items, so it can't run '4'. Read the workflow again"),
+        ("1-3,2", "Create List #5: '1-3,2' lists an item more than once."),
+        ("x", "Create List #5: use item numbers such as 1-3 or 2,3, not 'x'."),
+        ("9" * 5000, "Create List #5: use item numbers such as 1-3 or 2,3"),
+    ],
+)
+def test_check_item_range_says_what_is_wrong(value, message):
+    with pytest.raises(SubmitError, match=re.escape(message)):
+        submit.check_item_range(submit.ItemSource("List5", "Create List #5", 3), value)
+
+
+def test_list_names_fit_openjd_even_with_a_node_id_added():
+    title = "A" * 60
+    workflow = {
+        "123:45:67": {**_create_list("a", "b"), "_meta": {"title": title}},
+        "123:45:68": {**_create_list("a", "b"), "_meta": {"title": title}},
+    }
+    names = [source.parameter for source in plan_task_lists(workflow).sources]
+    assert names == ["A" * 48 + "Items", "A" * 48 + "_123_45_68Items"]
+    assert all(len(name) <= 64 for name in names)
+
+
+def test_list_names_fit_openjd_for_very_long_node_ids():
+    node = ":".join(str(1000 + i) for i in range(20))
+    workflow = {
+        node: _create_list("a", "b"),
+        node + "1": {**_create_list("a", "b"), "_meta": {"title": "List" + node}},
+    }
+    names = [source.parameter for source in plan_task_lists(workflow).sources]
+    assert len(set(names)) == 2
+    assert all(len(name) <= 64 for name in names)
+
+
+def _studio_template(
+    tmp_path: Path, task_parameters: bool = False, job_parameter: str = ""
+) -> Path:
+    """The bundled template, with a step that has its own task parameter or an extra job one."""
+    template = yaml.safe_load(submit.JOB_TEMPLATE.read_text())
+    if task_parameters:
+        template["steps"][0]["parameterSpace"] = {
+            "taskParameterDefinitions": [{"name": "Frame", "type": "INT", "range": "1-3"}],
+            "combination": "Frame",
+        }
+    if job_parameter:
+        template["parameterDefinitions"].append(
+            {"name": job_parameter, "type": "STRING", "default": "x"}
+        )
+    path = tmp_path / "studio.yaml"
+    path.write_text(yaml.safe_dump(template, sort_keys=False))
+    return path
+
+
+def test_templates_whose_step_has_task_parameters_dont_split_lists(tmp_path):
+    """Their names, the 16-parameter limit and their combination would all have to fit around."""
+    studio = _studio_template(tmp_path, task_parameters=True)
+    assert not template_supports_task_lists(studio)
+    assert submit.template_has_own_task_parameters(studio)
+    assert not submit.template_has_own_task_parameters(submit.JOB_TEMPLATE)
+
+
+def test_list_job_parameters_steer_clear_of_the_templates_names(tmp_path):
+    """A studio template's own SubjectItems job parameter isn't repeated by a list called Subject."""
+    workflow = {"1": {**_create_list("a", "b"), "_meta": {"title": "Subject"}}}
+    plan = plan_task_lists(workflow, reserved={"SubjectItems", "WorkflowFile"})
+    [source] = plan.active
+    assert (source.name, source.parameter) == ("Subject_1", "Subject_1Items")
+    studio = _studio_template(tmp_path, job_parameter="SubjectItems")
+    template = submit.read_job_template(studio, plan.active)
+    decode_job_template(template=template, supported_extensions=["EXPR"])
+
+
+ITEM_RANGES = json.loads(
+    (Path(__file__).parent / "panel" / "item_ranges.json").read_text(encoding="utf-8")
+)
+
+
+@pytest.mark.parametrize("case", ITEM_RANGES, ids=lambda case: repr(case["value"]))
+def test_check_item_range_takes_the_same_ranges_as_the_panel(case):
+    """item_ranges.json is shared with test_panel.py, so the submitter and the panel agree."""
+    source = submit.ItemSource("List5", "Create List #5", case["items"])
+    if case["count"] is None:
+        with pytest.raises(SubmitError):
+            submit.check_item_range(source, case["value"])
+    else:
+        submit.check_item_range(source, case["value"])

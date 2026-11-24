@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -10,7 +11,8 @@ import os
 import re
 import shutil
 import sys
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -279,6 +281,21 @@ def validate_api_workflow(workflow: Any, ui_workflow: Any = None) -> dict[str, A
             raise SubmitError(f"Node {_quoted(node_id)} has no node type in the workflow.")
         if not isinstance(node.get("inputs", {}), dict):
             raise SubmitError(f"Node {_quoted(node_id)} has inputs that aren't an object.")
+        if node.get("_meta") is not None and not isinstance(node["_meta"], dict):
+            raise SubmitError(f"Node {_quoted(node_id)} has a _meta that isn't an object.")
+        if node["class_type"] == "CreateList":
+            for key in node.get("inputs", {}):
+                ascii_digits = _ANY_LIST_ITEM_INPUT.fullmatch(str(key))
+                if _UNICODE_LIST_ITEM_INPUT.fullmatch(str(key)) and not ascii_digits:
+                    raise SubmitError(
+                        f"Create List {_quoted(node_id)} has an input named {_quoted(key)}, "
+                        "numbered with digits that ComfyUI doesn't use."
+                    )
+                if ascii_digits and not _LIST_ITEM_INPUT.fullmatch(str(key)):
+                    raise SubmitError(
+                        f"Create List {_quoted(node_id)} has an input numbered past "
+                        f"{_MAX_LIST_ITEM_DIGITS} digits, which ComfyUI doesn't make."
+                    )
     return workflow
 
 
@@ -288,10 +305,43 @@ def _quoted(value: Any) -> str:
     return text if len(text) <= 40 else text[:39] + "…"
 
 
+# Task lists: the values that the comfy-cli job runs as separate tasks. Each source of them in the
+# workflow becomes its own task parameter, so tasks run every combination of their items. The job
+# template's task script selects each task's item, using these names, which
+# test_template_script.py keeps in step.
 # Core nodes that load every image in a folder of the input directory as a list.
 FOLDER_LOADERS = ("LoadImageDataSetFromFolder",)
 # Nodes whose folder input names a folder of the input directory, which is sent with the job.
 FOLDER_INPUT_NODES = (*FOLDER_LOADERS, "LoadImageTextDataSetFromFolder")
+# The images that LoadImageDataSetFromFolder loads.
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
+# The _meta key that marks the nodes the task script splits, with the task parameter of each.
+ITEM_META = "deadline_item"
+# The images of a folder, as paths in the input directory, in the order its items are numbered.
+FILES_META = "deadline_files"
+# OpenJD allows 16 task parameters in a step.
+MAX_ITEM_SOURCES = 16
+# The line that marks the task script that selects each task's items, which it reads from its
+# NAME=NUMBER arguments. A job template without it runs whole lists.
+ITEMS_PLACEHOLDER = "ITEMS = {}"
+# The group of the job parameters that hold each list's items to run.
+TASKS_GROUP = "Tasks"
+
+# A Create List's item inputs: input0, input1 and so on, or inputs.input0 inside a subgraph. The
+# number is bounded so it's always safe to read, in the submitter and the task script.
+_MAX_LIST_ITEM_DIGITS = 9
+_LIST_ITEM_INPUT = re.compile(rf"(inputs\.)?input\d{{1,{_MAX_LIST_ITEM_DIGITS}}}", re.ASCII)
+_ANY_LIST_ITEM_INPUT = re.compile(r"(inputs\.)?input\d+", re.ASCII)
+# Digits in any script, such as Arabic-Indic ones, which Python's \d matches without re.ASCII.
+_UNICODE_LIST_ITEM_INPUT = re.compile(r"(inputs\.)?input\d+")
+# The _meta keys the submitter writes for the task script. A workflow's own are dropped.
+_SUBMITTER_META_PREFIX = "deadline_"
+# The titles ComfyUI gives the nodes that list tasks. Any other title is one the artist gave.
+_DEFAULT_TITLES = {
+    "CreateList": "Create List",
+    "LoadImageDataSetFromFolder": "Load Image (from Folder)",
+}
+_ITEMS_PLACEHOLDER_LINE = re.compile(rf"^[ \t]*{re.escape(ITEMS_PLACEHOLDER)}[ \t]*$", re.MULTILINE)
 
 
 def input_path(input_dir: Path | str, name: Any) -> Path | None:
@@ -311,6 +361,18 @@ def input_path(input_dir: Path | str, name: Any) -> Path | None:
     return path if path != base and path.is_relative_to(base) else None
 
 
+def image_files(directory: Path) -> list[str]:
+    """The images in a folder that LoadImageDataSetFromFolder loads, in name order."""
+    try:
+        return sorted(
+            entry.name
+            for entry in directory.iterdir()
+            if entry.is_file() and entry.name.lower().endswith(IMAGE_EXTENSIONS)
+        )
+    except OSError:
+        return []
+
+
 def input_folders(workflow: dict[str, Any], input_dir: Path) -> list[Path]:
     """
     Returns the folders in ComfyUI's input directory that the workflow's folder loaders read.
@@ -323,6 +385,364 @@ def input_folders(workflow: dict[str, Any], input_dir: Path) -> list[Path]:
         if path is not None and path.is_dir():
             folders.add(path)
     return sorted(folders)
+
+
+@dataclass
+class ItemSource:
+    """A node whose items can run as separate tasks."""
+
+    # The task parameter that selects the item, such as "List12". Its job parameter, "List12Items",
+    # holds the range to run.
+    name: str
+    label: str
+    count: int
+    # "list" or "folder".
+    kind: str = "list"
+    # The items, as far as the submitter knows them, for the job parameter's description.
+    values: list[str] = field(default_factory=list)
+    # Whether it gets a task parameter. A step can have only MAX_ITEM_SOURCES of them.
+    enabled: bool = True
+    # The job parameter's default range of item numbers.
+    range: str = ""
+    node_id: str = ""
+    # What the panel calls it. The label names the node.
+    title: str = ""
+
+    def __post_init__(self) -> None:
+        self.range = self.range or f"1-{self.count}"
+        self.title = self.title or self.label
+
+    @property
+    def parameter(self) -> str:
+        """The job parameter that holds the range of items to run."""
+        return f"{self.name}Items"
+
+
+# OpenJD identifiers are at most 64 characters, and a list's job parameter adds "Items".
+MAX_SOURCE_NAME = 64 - len("Items")
+
+
+# One part of a range of item numbers, with spaces allowed around "-" and ":", as in the panel.
+# Item numbers are capped at 9 digits, far past any list, so int() never reaches Python's limit.
+_ITEM_RANGE_PART = re.compile(r"(\d{1,9})(?:\s*-\s*(\d{1,9})(?:\s*:\s*(\d{1,9}))?)?", re.ASCII)
+
+
+def check_item_range(source: ItemSource, value: Any) -> None:
+    """
+    Checks the range of a list's items to run, as OpenJD and the task script take it: "0" on its
+    own, or item numbers from 1 to the list's count, in parts that don't overlap. The panel checks
+    it against the plan it made, so this catches a list that changed since. Raises SubmitError.
+    """
+    text = str(value).strip()
+    if text == "0":
+        return
+    spans: list[tuple[int, int]] = []
+    for part in text.split(","):
+        match = _ITEM_RANGE_PART.fullmatch(part.strip())
+        if match:
+            start, end, step = int(match[1]), int(match[2] or match[1]), int(match[3] or 1)
+        if not match or end < start or step < 1:
+            raise SubmitError(
+                f"{source.title}: use item numbers such as 1-{source.count} or 2,3, not {text!r}."
+            )
+        spans.append((start, start + (end - start) // step * step))
+    spans.sort()
+    if any(spans[i][1] >= spans[i + 1][0] for i in range(len(spans) - 1)):
+        raise SubmitError(f"{source.title}: {text!r} lists an item more than once.")
+    if spans[0][0] < 1 or spans[-1][1] > source.count:
+        raise SubmitError(
+            f"{source.title} has {source.count} items, so it can't run {text!r}. Read the "
+            "workflow again, then choose its items."
+        )
+
+
+@dataclass
+class TaskLists:
+    """What plan_task_lists found in a workflow."""
+
+    # The workflow with each split node marked.
+    workflow: dict[str, Any]
+    # Every source found, in workflow order.
+    sources: list[ItemSource] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def active(self) -> list[ItemSource]:
+        """The sources whose items run as separate tasks."""
+        return [source for source in self.sources if source.enabled]
+
+
+def _unique_name(name: str, suffix: str) -> str:
+    """name with suffix added, shortened so that it's still a valid OpenJD identifier."""
+    # A very long node ID keeps its end, which tells it apart, and name keeps its first letter.
+    suffix = suffix[-(MAX_SOURCE_NAME - 1) :]
+    return name[: MAX_SOURCE_NAME - len(suffix)] + suffix
+
+
+def _identifier(text: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9_]+", "_", text).strip("_")
+    return ("_" + name if name[:1].isdigit() else name)[:48]
+
+
+def _renamed_title(node: dict[str, Any]) -> str | None:
+    """The title an artist gave a node, if they renamed it."""
+    title = (node.get("_meta") or {}).get("title")
+    default = _DEFAULT_TITLES.get(str(node.get("class_type")))
+    return str(title).strip() or None if title and title != default else None
+
+
+def _source_name(kind: str, node_id: str, node: dict[str, Any]) -> str:
+    """
+    The task parameter's name: the node's title, when the artist renamed it, so a list called
+    Subject is the Subject column in Deadline Cloud monitor. Otherwise the kind and node ID, such
+    as List12.
+    """
+    title = _renamed_title(node)
+    name = _identifier(title) if title else ""
+    # A node inside a subgraph has an API ID like "57:27".
+    return name or (kind.capitalize() + re.sub(r"[^A-Za-z0-9_]", "_", node_id))[:MAX_SOURCE_NAME]
+
+
+def _connection_title(node_id: str, workflow: dict[str, Any]) -> str | None:
+    """What a node's output connects to, such as "Image Scale · width" or "Image Scale · width +1"."""
+    connections = [
+        (other, key)
+        for other in workflow.values()
+        for key, value in (other.get("inputs") or {}).items()
+        if isinstance(value, list)
+        and len(value) == 2
+        and isinstance(value[1], int)
+        and str(value[0]) == str(node_id)
+    ]
+    if not connections:
+        return None
+    other, key = connections[0]
+    name = (other.get("_meta") or {}).get("title") or other.get("class_type")
+    more = f" +{len(connections) - 1}" if len(connections) > 1 else ""
+    return f"{name} · {key}{more}"
+
+
+def _list_items(inputs: dict[str, Any], workflow: dict[str, Any]) -> list[str]:
+    """
+    What a Create List's items are, in the order the task script numbers them, for the panel to
+    preview: a typed value, the value of a primitive node wired into it, or the wired node's name.
+    """
+    keys = sorted(
+        (key for key in inputs if _LIST_ITEM_INPUT.fullmatch(key)),
+        # "input12" or "inputs.input12".
+        key=lambda key: int(key.rsplit("input", 1)[1]),
+    )
+    items = []
+    for key in keys:
+        value = inputs[key]
+        if isinstance(value, list) and len(value) == 2:
+            node = workflow.get(str(value[0]))
+            node = node if isinstance(node, dict) else {}
+            primitive = (node.get("inputs") or {}).get("value")
+            if isinstance(primitive, (str, int, float)) and not isinstance(primitive, bool):
+                value = primitive
+            else:
+                title = (node.get("_meta") or {}).get("title") or node.get("class_type")
+                value = f"{title or 'node'} #{value[0]}"
+        items.append(str(value))
+    return items
+
+
+def _source_title(source: ItemSource, workflow: dict[str, Any]) -> str:
+    """
+    Names a source for the panel by what it changes: its node's given title or what its output
+    connects to, and otherwise its label. A folder's label names the folder.
+    """
+    node = workflow[source.node_id]
+    renamed = _renamed_title(node)
+    if renamed or source.kind == "folder":
+        return renamed or source.label
+    return _connection_title(source.node_id, workflow) or source.label
+
+
+def plan_task_lists(
+    api_workflow: dict[str, Any], input_dir: Path | None = None, reserved: Collection[str] = ()
+) -> TaskLists:
+    """
+    Finds the values in a workflow that the comfy-cli job can run as separate tasks: the items of
+    Create List nodes and the images in the folders of folder loaders. Each is its own source of
+    items, and tasks run every combination of them. reserved lists the job template's parameter
+    names, which the lists' job parameters steer clear of.
+    """
+    workflow = copy.deepcopy(api_workflow)
+    plan = TaskLists(workflow)
+    for node_id, node in workflow.items():
+        class_type = node.get("class_type")
+        inputs = node.get("inputs", {})
+        meta = node.get("_meta")
+        if not isinstance(meta, dict):
+            meta = node["_meta"] = {}
+        # The task script follows these keys, so a shared workflow's own could make a node follow
+        # another list's items, or load files the panel never showed.
+        for key in [key for key in meta if str(key).startswith(_SUBMITTER_META_PREFIX)]:
+            del meta[key]
+        source: ItemSource | None = None
+        if class_type == "CreateList":
+            values = _list_items(inputs, workflow)
+            if len(values) > 1:
+                source = ItemSource(
+                    "", f"Create List #{node_id}", len(values), values=values, node_id=node_id
+                )
+        elif class_type in FOLDER_LOADERS:
+            folder = inputs.get("folder")
+            directory = input_path(input_dir, folder) if input_dir else None
+            files = image_files(directory) if directory else []
+            if len(files) > 1:
+                meta[FILES_META] = [f"{folder}/{name}" for name in files]
+                source = ItemSource(
+                    "",
+                    f"Folder {folder} (#{node_id})",
+                    len(files),
+                    "folder",
+                    files,
+                    node_id=node_id,
+                )
+        if source:
+            source.name = _source_name(source.kind, node_id, node)
+            source.title = _source_title(source, workflow)
+            plan.sources.append(source)
+    # Two lists the artist gave the same title keep it, with their node IDs, and a number when that's
+    # taken too.
+    names: set[str] = set()
+
+    def taken(name: str) -> bool:
+        # reserved holds the job template's own parameter names, which a list's can't repeat.
+        return name in names or f"{name}Items" in reserved
+
+    for source in plan.sources:
+        if taken(source.name):
+            name, node = source.name, re.sub(r"[^A-Za-z0-9_]", "_", source.node_id)
+            source.name, number = _unique_name(name, f"_{node}"), 2
+            while taken(source.name):
+                source.name, number = _unique_name(name, f"_{node}_{number}"), number + 1
+        names.add(source.name)
+    active = plan.active
+    for source in active[MAX_ITEM_SOURCES:]:
+        source.enabled = False
+    if len(active) > MAX_ITEM_SOURCES:
+        plan.warnings.append(
+            f"Deadline Cloud splits up to {MAX_ITEM_SOURCES} fields into tasks, so these run "
+            f"whole in each task: {', '.join(s.label for s in active[MAX_ITEM_SOURCES:])}."
+        )
+    # Mark the nodes of the sources that run as separate tasks. The task script runs others whole.
+    for source in plan.active:
+        workflow[source.node_id]["_meta"][ITEM_META] = source.name
+    for node in workflow.values():
+        if not node["_meta"]:
+            del node["_meta"]
+    return plan
+
+
+# OpenJD refuses Unicode's control characters in a label, and all but line breaks and tabs in a
+# description. A list item, a folder name or a file name can hold one.
+_LABEL_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_DESCRIPTION_CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def _item_parameters(source: ItemSource) -> dict[str, Any]:
+    """The job parameter that holds the range of a source's items to run."""
+    shown = []
+    for index, value in enumerate(source.values, start=1):
+        shown.append(f"{index}: {value[:60]}{'...' if len(value) > 60 else ''}")
+        if index == 10 and source.count > 10:
+            shown.append(f"and {source.count - 10} more")
+            break
+    description = (
+        f"The items of {source.label} to run as separate tasks, numbered from 1, for example "
+        f'"1-{source.count}" or "2,3". "0" on its own runs the whole list in each task. Every '
+        "combination of the lists is a task."
+    )
+    if shown:
+        description += " Items: " + "; ".join(shown) + "."
+    return {
+        "name": source.parameter,
+        "type": "STRING",
+        "userInterface": {
+            "control": "LINE_EDIT",
+            "label": _LABEL_CONTROL_CHARACTERS.sub(" ", source.label)[:64],
+            "groupLabel": TASKS_GROUP,
+        },
+        "default": source.range,
+        "description": _DESCRIPTION_CONTROL_CHARACTERS.sub(" ", description)[:2048],
+    }
+
+
+def _task_lists_step(job_template: dict[str, Any]) -> dict[str, Any] | None:
+    """The step whose task script has the line that selects each task's items, if any."""
+    for step in job_template.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        files = (step.get("script") or {}).get("embeddedFiles") or []
+        if any(
+            isinstance(file, dict) and _ITEMS_PLACEHOLDER_LINE.search(str(file.get("data", "")))
+            for file in files
+        ):
+            return step
+    return None
+
+
+def _has_task_parameters(step: dict[str, Any]) -> bool:
+    space = step.get("parameterSpace")
+    return isinstance(space, dict) and bool(space.get("taskParameterDefinitions"))
+
+
+def template_supports_task_lists(template: Path) -> bool:
+    """
+    Whether the submitter can add the workflow's lists to a job template as task parameters: its
+    task script has the line that selects each task's items, and that step has no task parameters
+    of its own, which the lists' names, number and combination would have to fit around. The
+    template is parsed first, since a JSON template keeps each script on one line, with escaped
+    newlines.
+    """
+    try:
+        step = _task_lists_step(read_job_template(template))
+    except SubmitError:
+        return False
+    return step is not None and not _has_task_parameters(step)
+
+
+def template_has_own_task_parameters(template: Path) -> bool:
+    """Whether the step that selects each task's items already has task parameters."""
+    try:
+        step = _task_lists_step(read_job_template(template))
+    except SubmitError:
+        return False
+    return step is not None and _has_task_parameters(step)
+
+
+def add_task_lists(template: dict[str, Any], sources: list[ItemSource]) -> dict[str, Any]:
+    """
+    Returns a copy of a job template with a job parameter and a task parameter for each list, in
+    the step whose task script has the ITEMS placeholder. The task script gets each task's items
+    as NAME=NUMBER arguments, so no value is written into its code. A studio template's other
+    steps are left as they are.
+    """
+    template = copy.deepcopy(template)
+    definitions = template.setdefault("parameterDefinitions", [])
+    # Task lists follow the workflow parameters.
+    at = len(definitions)
+    for index, definition in enumerate(definitions):
+        if (definition.get("userInterface") or {}).get("groupLabel") == "Workflow Parameters":
+            at = index + 1
+    definitions[at:at] = [_item_parameters(source) for source in sources]
+    step = _task_lists_step(template)
+    if step is None:
+        return template
+    on_run = step.setdefault("script", {}).setdefault("actions", {}).setdefault("onRun", {})
+    on_run.setdefault("args", []).extend(
+        f"{source.name}={{{{Task.Param.{source.name}}}}}" for source in sources
+    )
+    space = step.setdefault("parameterSpace", {})
+    space.setdefault("taskParameterDefinitions", []).extend(
+        {"name": source.name, "type": "INT", "range": f"{{{{Param.{source.parameter}}}}}"}
+        for source in sources
+    )
+    return template
 
 
 def _dump_template(job_template: dict[str, Any]) -> str:
@@ -419,8 +839,11 @@ def get_safe_path(user_input: str, base_dir: Path | str) -> Path:
     return Path(target)
 
 
-def read_job_template(template: Path) -> dict[str, Any]:
-    """Reads a YAML or JSON job template."""
+def read_job_template(template: Path, sources: list[ItemSource] | None = None) -> dict[str, Any]:
+    """
+    Reads a YAML or JSON job template, with a parameter for each of the workflow's sources of work
+    items.
+    """
     import yaml
 
     try:
@@ -430,7 +853,7 @@ def read_job_template(template: Path) -> dict[str, Any]:
         raise SubmitError(f"Couldn't read the job template {template}: {e}")
     if not isinstance(base, dict):
         raise SubmitError(f"The job template {template} isn't a YAML or JSON object.")
-    return base
+    return add_task_lists(base, sources) if sources else base
 
 
 # The worker capabilities that the panel has their own fields for. Other names are custom ones.
@@ -644,18 +1067,19 @@ def create_job_bundle(
     dest_dir: Path,
     now: datetime | None = None,
     requirements: dict[str, Any] | None = None,
+    sources: list[ItemSource] | None = None,
     description: str | None = None,
 ) -> tuple[Path, Path]:
     """
     Creates <dest_dir>/<timestamp>_<name>/ with the job template and the API-format workflow, and
     returns the bundle directory and the workflow file. They have to outlive the submitter dialog
-    and the job attachments upload. The template is copied as it is, unless the artist changed its
-    host requirements or description.
+    and the job attachments upload. The template is copied as it is, unless the workflow has
+    task lists to add to it, or the artist changed its host requirements or description.
     """
     suffix = ".json" if template.suffix.lower() == ".json" else ".yaml"
     text = None
-    if requirements is not None or description:
-        job_template = read_job_template(template)
+    if sources or requirements is not None or description:
+        job_template = read_job_template(template, sources)
         if description:
             job_template["description"] = description
         if requirements is not None:

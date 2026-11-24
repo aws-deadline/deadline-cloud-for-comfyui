@@ -1,9 +1,10 @@
 specificationVersion: 'jobtemplate-2023-09'
 name: ComfyUI Workflow (comfy-cli)
 description: >
-  Runs a ComfyUI workflow headlessly with comfy-cli. A job environment starts ComfyUI once
-  per session with comfy launch, loading the models and custom nodes attached to the job,
-  and the task runs the workflow with comfy run.
+  Runs a ComfyUI workflow headlessly with comfy-cli, as a task for each combination of its lists.
+  A job environment starts ComfyUI once per session with comfy launch, loading the models and
+  custom nodes attached to the job, so every task in the session reuses the warm server. Each
+  task sets its items in the workflow and runs it with comfy run.
 # Attach Custom Nodes is a BOOL parameter, which needs EXPR.
 extensions: ["EXPR"]
 
@@ -50,7 +51,8 @@ parameterDefinitions:
     groupLabel: Workflow Parameters
   default: "./output"
   description: >
-    Choose the output directory. ComfyUI writes the outputs of Save nodes here.
+    Choose the output directory. ComfyUI writes the outputs of Save nodes here, with each
+    task's items added to each file name prefix.
 
 # Model Parameters
 - name: ModelDirectory
@@ -617,11 +619,15 @@ steps:
       data: |
         import json
         import os
+        import re
         import subprocess
         import sys
         import urllib.request
 
         PORT = os.environ["COMFYUI_PORT"]
+        # The task's item of each list it runs as tasks, by task parameter. The ComfyUI Submitter
+        # passes them as NAME=NUMBER arguments, read below. A source without one runs whole.
+        ITEMS = {}
         OUTPUT_DIR = os.environ["COMFYUI_OUTPUT_DIR"]
         WORKFLOW_TIMEOUT = int(os.environ["COMFYUI_WORKFLOW_TIMEOUT"])
         SERVER = ["--where", "local", "--host", "127.0.0.1", "--port", PORT]
@@ -644,6 +650,16 @@ steps:
             sys.exit(1)
 
 
+        for argument in sys.argv[1:]:
+            name, _, number = argument.partition("=")
+            if not (
+                re.fullmatch(r"[A-Za-z0-9_]{1,64}", name, re.ASCII)
+                and re.fullmatch(r"-?[0-9]{1,9}", number, re.ASCII)
+            ):
+                fail(f"The task argument {argument!r} isn't a list name and an item number.")
+            ITEMS[name] = int(number)
+
+
         def interrupt():
             """Stops the running prompt, so the session's next task doesn't wait behind it."""
             try:
@@ -651,6 +667,15 @@ steps:
                 urllib.request.urlopen(request, timeout=30).close()
             except OSError as e:
                 diagnostic(f"Couldn't interrupt the workflow: {e}")
+
+
+        def has_node(class_type):
+            """Whether the worker's ComfyUI has a node type. If it can't tell, comfy run reports it."""
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/object_info/{class_type}", timeout=30) as response:
+                    return class_type in json.load(response)
+            except Exception:
+                return True
 
 
         def comfy_run(*args, timeout=None):
@@ -693,11 +718,85 @@ steps:
         if not isinstance(workflow, dict) or not workflow:
             fail("comfy run --print-prompt returned no workflow")
 
-        task_workflow = os.path.abspath("workflow_api.json")
+        # Select this task's item of each source, which the ComfyUI Submitter marks with _meta keys.
+        # Item 0 runs the source whole.
+        found = set()
+
+
+        def item(name, count, what):
+            found.add(name)
+            index = ITEMS.get(name, 0)
+            if index < 0 or index > count:
+                fail(f"Item {index} of {name} doesn't exist. {what} has {count} items.")
+            return index
+
+
+        for node_id, node in workflow.items():
+            class_type = node.get("class_type")
+            inputs = node.get("inputs", {})
+            meta = node.get("_meta") or {}
+            name = meta.get("deadline_item")
+            if class_type == "LoadImageDataSetFromFolder" and name:
+                # Load just the task's image. Load Image has the same first output.
+                files = meta["deadline_files"]
+                index = item(name, len(files), f"The folder of node {node_id}")
+                if index:
+                    node.update(class_type="LoadImage", inputs={"image": files[index - 1]})
+            elif class_type == "CreateList" and name:
+                # The node takes its items from inputs named input0, input1 and so on, in order.
+                # ASCII digits alone, as the submitter counts them: \d also matches other scripts'.
+                items = sorted(
+                    (key for key in inputs if re.fullmatch(r"(inputs\.)?input[0-9]{1,9}", key)),
+                    key=lambda key: int(re.search(r"[0-9]+$", key).group()),
+                )
+                index = item(name, len(items), "A Create List")
+                if index:
+                    chosen = inputs[items[index - 1]]
+                    for key in items:
+                        del inputs[key]
+                    inputs[items[0]] = chosen
+
+        # A list the task selects an item of, but whose node isn't in the workflow, would otherwise run
+        # whole in every task.
+        missing = sorted(name for name, index in ITEMS.items() if index and name not in found)
+        if missing:
+            fail(f"The workflow has no node for {', '.join(missing)}, so it can't select their items.")
+
+        # Add the task's items to output file names so tasks don't overwrite each other.
+        chosen_items = {name: value for name, value in ITEMS.items() if value}
+        prefix_suffix = "".join(f"_{name}-{value}" for name, value in chosen_items.items())
+        # File names are at most 255 bytes, so long list names give way to the item numbers alone.
+        if len(prefix_suffix) > 100:
+            prefix_suffix = "_items-" + "-".join(str(value) for value in chosen_items.values())
+            diagnostic(f"Output files end in {prefix_suffix}, for " + ", ".join(chosen_items) + ".")
+        # A prefix wired from another node gets them through ComfyUI's Concatenate Text node.
+        can_concatenate = None
+        for node_id, node in list(workflow.items()):
+            inputs = node.get("inputs", {})
+            prefix = inputs.get("filename_prefix")
+            if isinstance(prefix, str):
+                inputs["filename_prefix"] = prefix + prefix_suffix
+            elif isinstance(prefix, list) and prefix_suffix:
+                if can_concatenate is None:
+                    can_concatenate = has_node("StringConcatenate")
+                if not can_concatenate:
+                    fail(
+                        "A Save node's file name prefix is wired from another node, which needs ComfyUI "
+                        "0.3.35 or later on the worker to add the task's items to it."
+                    )
+                concatenate = f"deadline_prefix_{node_id}"
+                workflow[concatenate] = {
+                    "class_type": "StringConcatenate",
+                    "inputs": {"string_a": prefix, "string_b": prefix_suffix, "delimiter": ""},
+                }
+                inputs["filename_prefix"] = [concatenate, 0]
+
+        task_workflow = os.path.abspath(f"workflow{prefix_suffix}_api.json")
         with open(task_workflow, "w", encoding="utf-8") as f:
             json.dump(workflow, f, indent=2)
 
-        print("openjd_status: Running the workflow", flush=True)
+        label = ", ".join(f"{name} {value}" for name, value in chosen_items.items()) or "the workflow"
+        print(f"openjd_status: Running the workflow with {label}", flush=True)
         before = {os.path.join(root, name) for root, _, names in os.walk(OUTPUT_DIR) for name in names}
         # The timeout is how long comfy run waits without hearing from ComfyUI. Its default of 120
         # seconds is shorter than loading a large model can take.
@@ -710,7 +809,7 @@ steps:
             for root, _, names in os.walk(OUTPUT_DIR) for name in names
             if (path := os.path.join(root, name)) not in before
         )
-        diagnostic(f"Finished the workflow. Outputs in {OUTPUT_DIR!r}:")
+        diagnostic(f"Finished {label}. Outputs in {OUTPUT_DIR!r}:")
         for path in outputs:
             diagnostic(f"  {path!r}")
         if not outputs:
