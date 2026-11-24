@@ -242,10 +242,48 @@ def _check_sdk_has_bool(bundle_dir: str) -> None:
         )
 
 
+def _report_job_creation(request: dict[str, Any]) -> None:
+    """
+    Emits "creating" just before the library calls CreateJob, and "created" with the job's ID once
+    it returns. The library then waits for the job, prints its monitor URL and runs hooks before
+    it returns, so without these a failure or Cancel in that time would hide a job that runs.
+    """
+    from deadline.client import api
+
+    get_client = api.get_boto3_client
+
+    def creating(**kwargs: Any) -> None:
+        emit("creating")
+
+    def created(parsed: Any = None, **kwargs: Any) -> None:
+        job_id = parsed.get("jobId") if isinstance(parsed, dict) else None
+        if isinstance(job_id, str):
+            emit(
+                "created",
+                jobId=job_id,
+                farmId=request.get("farmId"),
+                queueId=request.get("queueId"),
+            )
+
+    def get_boto3_client(service_name: str, *args: Any, **kwargs: Any) -> Any:
+        client = get_client(service_name, *args, **kwargs)
+        if service_name == "deadline":
+            # botocore's per-client events. unique_id keeps a cached client from getting two.
+            events = client.meta.events
+            events.register(
+                "before-call.deadline.CreateJob", creating, unique_id="comfyui-creating"
+            )
+            events.register("after-call.deadline.CreateJob", created, unique_id="comfyui-created")
+        return client
+
+    api.get_boto3_client = get_boto3_client
+
+
 def submit(request: dict[str, Any]) -> dict[str, Any]:
     from deadline.client import api
 
     _check_sdk_has_bool(request["bundleDir"])
+    _report_job_creation(request)
     settings = request.get("settings", {})
     options = {
         argument: settings[key]

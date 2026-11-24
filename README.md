@@ -117,7 +117,7 @@ to **Run** appear. If they don't, check the ComfyUI server log for lines that st
 | `--deadline-cli PATH` | Use this Deadline Cloud CLI, 0.60.8 or later. The default is the first `deadline` on the `PATH`. |
 | `--private-cli` | Install a private copy of the CLI in the extension folder, even if one is on the `PATH`. |
 | `--link` | Symlink this checkout into `custom_nodes` instead of copying it, for development. |
-| `--force` | Replace a `custom_nodes/deadline-cloud-for-comfyui` folder that isn't this extension. |
+| `--force` | Replace a `custom_nodes/deadline-cloud-for-comfyui` folder that isn't a copy this installer made, such as another folder or a git checkout of the extension. Its files, including a checkout's history and uncommitted changes, are deleted. |
 
 Run the script again to update the extension and the CLI. It doesn't prompt, so it can run from
 configuration management such as Ansible. To uninstall, delete the extension folder from
@@ -305,7 +305,11 @@ the same machine.
   isn't a secret: ComfyUI lists it in the queue and history, and anyone who can reach ComfyUI can
   connect with it, so this keeps tabs apart rather than protecting the messages.
 - A submission requires a valid browser client ID. Only that client can confirm or cancel it,
-  and confirmation answers are accepted only while a prompt is pending.
+  and confirmation answers are accepted only while a prompt is pending. Once the job is being
+  created, Cancel can't stop it, and a job that was created is always reported, even when a later
+  step, such as waiting for it, fails.
+- The job template's hidden paths, Model Directory and Custom Nodes Directory, are set by the
+  extension, not by the request, so a request can't point a job's custom nodes at another folder.
 - Job bundles in `ComfyUI/user/deadline_submissions/` hold your workflows, prompts and file paths.
   On Linux and macOS that folder and each bundle in it can only be opened by the user that runs
   ComfyUI (mode `0700`), and the files the extension writes there can only be read by that user

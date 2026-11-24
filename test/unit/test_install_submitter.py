@@ -109,6 +109,37 @@ def test_install_extension_refuses_to_replace_other_directory(comfyui):
     assert (custom_nodes / install.EXTENSION_DIR_NAME / "mine.txt").exists()
 
 
+@pytest.mark.parametrize("marker", [".git", ".hg", ".svn"])
+@pytest.mark.parametrize("link", [False, True])
+def test_install_extension_refuses_to_replace_a_checkout(comfyui, marker, link):
+    """A clone in custom_nodes, such as one ComfyUI-Manager made, keeps its history and changes."""
+    custom_nodes = install.find_custom_nodes(comfyui)
+    clone = custom_nodes / install.EXTENSION_DIR_NAME
+    (clone / "src" / "deadline" / "comfyui_submitter").mkdir(parents=True)
+    (clone / "__init__.py").write_text("")
+    (clone / marker).mkdir()
+    (clone / "uncommitted.py").write_text("work in progress")
+    with pytest.raises(install.InstallError, match="is a checkout of the extension.*--force"):
+        install.install_extension(REPO_ROOT, custom_nodes, link=link)
+    assert (clone / "uncommitted.py").read_text() == "work in progress"
+    assert (clone / marker).is_dir()
+    # --force still replaces it.
+    dest = install.install_extension(REPO_ROOT, custom_nodes, link=link, force=True)
+    assert not (dest / "uncommitted.py").exists()
+
+
+def test_install_extension_refuses_to_replace_a_git_worktree(comfyui):
+    """A git worktree has a .git file rather than a folder."""
+    custom_nodes = install.find_custom_nodes(comfyui)
+    clone = custom_nodes / install.EXTENSION_DIR_NAME
+    (clone / "src" / "deadline" / "comfyui_submitter").mkdir(parents=True)
+    (clone / "__init__.py").write_text("")
+    (clone / ".git").write_text("gitdir: /elsewhere/.git/worktrees/x\n")
+    with pytest.raises(install.InstallError, match="is a checkout"):
+        install.install_extension(REPO_ROOT, custom_nodes)
+    assert (clone / ".git").is_file()
+
+
 def test_install_extension_links(comfyui):
     custom_nodes = install.find_custom_nodes(comfyui)
     dest = install.install_extension(REPO_ROOT, custom_nodes, link=True)

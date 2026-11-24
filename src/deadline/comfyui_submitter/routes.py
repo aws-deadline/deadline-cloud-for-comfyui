@@ -136,6 +136,10 @@ class _Submission:
     bundle_dir: Path | None = None
     # Where the job's outputs download to, shown with the job in the panel.
     output_dir: str | None = None
+    # Whether the library has started CreateJob, after which Cancel can't stop the job.
+    creating: bool = False
+    # The job CreateJob made, reported even if a later step fails: {jobId, farmId, queueId}.
+    created: dict[str, str] | None = None
 
 
 _submissions: dict[str, _Submission] = {}
@@ -449,7 +453,10 @@ async def _read_request(
     if isinstance(body, web.Response):
         return body
     try:
-        workflow = validate_api_workflow(body.get("workflow"), body.get("ui_workflow"))
+        # Off the event loop: a large workflow mustn't hold up ComfyUI's server while it's read.
+        workflow = await asyncio.to_thread(
+            validate_api_workflow, body.get("workflow"), body.get("ui_workflow")
+        )
         template = resolve_job_template()
     except SubmitError as e:
         return _error(400, str(e))
@@ -1007,6 +1014,17 @@ class _Bundle:
     warnings: list[str]
 
 
+def _hidden_paths(definitions: list[Any]) -> set[str]:
+    """The job template's PATH parameters that its user interface hides."""
+    return {
+        str(definition.get("name"))
+        for definition in definitions
+        if isinstance(definition, dict)
+        and definition.get("type") == "PATH"
+        and (definition.get("userInterface") or {}).get("control") == "HIDDEN"
+    }
+
+
 def _attaches_nodes(definitions: list[Any], parameters: dict[str, Any]) -> bool:
     """
     Whether the job loads the attached custom node packs: the panel's Attach Custom Nodes, or the
@@ -1107,7 +1125,12 @@ async def _build_bundle(
     # The artist's values win over the ones the submitter fills in, except the workflow file. The
     # library rejects parameters that neither the job template nor the queue defines.
     filled = {key: value for key, value in prepared.values.items() if key in defined}
-    values = {**filled, **parameters, "WorkflowFile": str(workflow_path)}
+    # The submitter sets the job template's hidden paths, such as Model Directory and Custom Nodes
+    # Directory, which the panel doesn't show. A request's own value could point the job's
+    # custom nodes at any folder on the workers, or mark every path as known to the library.
+    hidden = _hidden_paths(definitions)
+    shown = {key: value for key, value in parameters.items() if key not in hidden}
+    values = {**filled, **shown, "WorkflowFile": str(workflow_path)}
     # Attached files are only mapped through these directories, so they win over the panel's values.
     if staged.model_dir is not None:
         values["ModelDirectory"] = str(staged.model_dir)
@@ -1262,6 +1285,17 @@ async def _watch_submission(submission_id: str) -> None:
                             _decline_unanswered(submission_id, submission, submission.confirms)
                         )
                     )
+                elif kind == "creating":
+                    submission.creating = True
+                elif kind == "created":
+                    ids = {key: event.get(key) for key in ("jobId", "farmId", "queueId")}
+                    checked = {
+                        key: value
+                        for key, value in ids.items()
+                        if isinstance(value, str) and _RESOURCE_ID.fullmatch(value)
+                    }
+                    if len(checked) == len(ids):
+                        submission.created = checked
                 elif kind == "result":
                     result = event.get("data")
             stderr = await stderr_task
@@ -1292,8 +1326,35 @@ async def _watch_submission(submission_id: str) -> None:
             submitted["outputDir"] = submission.output_dir
         _send(SUBMITTED_EVENT, submitted, submission.client_id)
         await asyncio.to_thread(_remove_bundle, submission.bundle_dir)
+    elif submission.created:
+        # CreateJob made the job, so it runs, but something after it failed, such as waiting for
+        # the job or a post-submission hook.
+        error = _bridge_failure(events, stderr, process.returncode)
+        logger.warning(
+            "Submitted %s to Deadline Cloud as %s, but the submission didn't finish: %s",
+            _log_value(submission.name),
+            _log_value(submission.created["jobId"]),
+            _log_block(_redact_aws(str(error))),
+        )
+        submitted = {
+            **base,
+            **submission.created,
+            "status": "SUBMITTED",
+            "warning": f"The job was created, but the submission didn't finish: {error}",
+        }
+        if submission.output_dir:
+            submitted["outputDir"] = submission.output_dir
+        _send(SUBMITTED_EVENT, submitted, submission.client_id)
+        await asyncio.to_thread(_remove_bundle, submission.bundle_dir)
     elif submission.canceled:
-        _send(SUBMITTED_EVENT, {**base, "status": "CANCELED"}, submission.client_id)
+        canceled: dict[str, Any] = {**base, "status": "CANCELED"}
+        if submission.creating:
+            # Cancel came as CreateJob was sent, so the job may exist.
+            canceled["warning"] = (
+                "The job may have been created before the submission stopped. Check Deadline "
+                "Cloud monitor."
+            )
+        _send(SUBMITTED_EVENT, canceled, submission.client_id)
         await asyncio.to_thread(_remove_bundle, submission.bundle_dir)
     else:
         # A failed submission's bundle is kept for a day, to look into or submit again.
@@ -1380,6 +1441,12 @@ async def cancel_submission(request: web.Request) -> web.Response:
         return submission
     if _client_id(body) != submission.client_id:
         return _error(403, "Only the browser tab that started this submission can cancel it.")
+    if submission.creating:
+        return _error(
+            409,
+            "The job is already being created, so it can't be canceled here. Cancel it in "
+            "Deadline Cloud monitor once it appears.",
+        )
     submission.canceled = True
     try:
         submission.process.kill()

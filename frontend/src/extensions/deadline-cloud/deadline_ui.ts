@@ -159,6 +159,8 @@ interface SubmissionEvent {
   queueId?: string;
   outputDir?: string;
   error?: string;
+  // A job that was created although the submission didn't finish, or may have been.
+  warning?: string;
 }
 
 interface DownloadEvent {
@@ -432,6 +434,12 @@ async function loadFarms() {
   state.cloudError = null;
   try {
     state.farms = (await cloud<{ farms: Farm[] }>("farms")).farms;
+    // A default farm that isn't listed can't be shown as chosen, so it isn't submitted to.
+    if (state.farmId && !state.farms.some((farm) => farm.farmId === state.farmId)) {
+      state.farmId = "";
+      state.queueId = "";
+      state.storageProfileId = "";
+    }
   } catch (error) {
     state.cloudError = messageOf(error);
   }
@@ -442,12 +450,26 @@ async function loadFarms() {
 }
 
 async function loadQueues() {
+  const farmId = state.farmId;
   state.queues = null;
   state.queue = null;
   refresh("target", "queueParameters");
   try {
-    state.queues = (await cloud<{ queues: Queue[] }>("queues", { farmId: state.farmId })).queues;
+    const { queues } = await cloud<{ queues: Queue[] }>("queues", { farmId });
+    // Each request runs its own bridge, so an earlier farm's answer can come last.
+    if (state.farmId !== farmId) {
+      return;
+    }
+    state.queues = queues;
+    // A default queue that isn't listed can't be shown as chosen, so it isn't submitted to.
+    if (state.queueId && !queues.some((queue) => queue.queueId === state.queueId)) {
+      state.queueId = "";
+      state.storageProfileId = "";
+    }
   } catch (error) {
+    if (state.farmId !== farmId) {
+      return;
+    }
     state.cloudError = messageOf(error);
   }
   refresh("target");
@@ -457,13 +479,22 @@ async function loadQueues() {
 }
 
 async function loadQueue() {
+  const { farmId, queueId } = state;
+  // Whether the answer is still for the chosen queue. An earlier queue's can come last.
+  const current = () => state.farmId === farmId && state.queueId === queueId;
   try {
-    const queue = await cloud<QueueDetails>("queue", { farmId: state.farmId, queueId: state.queueId });
+    const queue = await cloud<QueueDetails>("queue", { farmId, queueId });
+    if (!current()) {
+      return;
+    }
     state.queue = queue;
     if (!queue.storageProfiles.some((profile) => profile.storageProfileId === state.storageProfileId)) {
       state.storageProfileId = "";
     }
   } catch (error) {
+    if (!current()) {
+      return;
+    }
     state.cloudError = messageOf(error);
   }
   refresh("target", "queueParameters");
@@ -877,11 +908,29 @@ function jobName() {
   return state.jobName ?? `ComfyUI - ${state.plan?.name ?? "workflow"}`;
 }
 
+// Whether the chosen farm and queue are the ones the panel shows: listed, so their selects show
+// them, rather than a default that isn't, or one from before a list failed to load.
+function targetShown(): boolean {
+  return (
+    Boolean(state.farmId) &&
+    Boolean(state.queueId) &&
+    Boolean(state.farms?.some((farm) => farm.farmId === state.farmId)) &&
+    Boolean(state.queues?.some((queue) => queue.queueId === state.queueId))
+  );
+}
+
+// The storage profile to submit with: the chosen one, if the loaded queue lists it.
+function shownStorageProfileId(): string {
+  const listed = state.queue?.storageProfiles.some(
+    (profile) => profile.storageProfileId === state.storageProfileId
+  );
+  return listed ? state.storageProfileId : "";
+}
+
 export function canSubmit(): boolean {
   return (
     state.account?.authenticationStatus === "AUTHENTICATED" &&
-    Boolean(state.farmId) &&
-    Boolean(state.queueId) &&
+    targetShown() &&
     state.plan !== null &&
     !state.planning &&
     !state.planError &&
@@ -994,7 +1043,7 @@ export async function submit() {
       clientId: api.clientId,
       farmId: state.farmId,
       queueId: state.queueId,
-      storageProfileId: state.storageProfileId,
+      storageProfileId: shownStorageProfileId(),
       ...request,
     });
     // Events may already have updated the submission, or finished it and cleared it.
@@ -1088,7 +1137,11 @@ export function listenForSubmissions() {
   api.addEventListener<SubmissionEvent>("deadline.submitted", ({ detail }) => {
     const ours = detail.submissionId === state.submission?.id;
     if (detail.status === "SUBMITTED") {
-      toast("success", `Submitted ${detail.name} as ${detail.jobId}.`, 10000);
+      if (detail.warning) {
+        toast("warn", `Submitted ${detail.name} as ${detail.jobId}. ${detail.warning}`, 15000);
+      } else {
+        toast("success", `Submitted ${detail.name} as ${detail.jobId}.`, 10000);
+      }
       if (detail.jobId && detail.farmId && detail.queueId) {
         rememberJob({
           jobId: detail.jobId,
@@ -1103,7 +1156,11 @@ export function listenForSubmissions() {
     } else if (detail.status === "FAILED") {
       toast("error", `Couldn't submit ${detail.name}. ${detail.error ?? ""}`, 15000);
     } else if (detail.status === "CANCELED" && ours) {
-      toast("info", `Canceled submitting ${detail.name}.`);
+      toast(
+        detail.warning ? "warn" : "info",
+        `Canceled submitting ${detail.name}.${detail.warning ? ` ${detail.warning}` : ""}`,
+        detail.warning ? 15000 : undefined
+      );
     }
     if (ours) {
       state.submission = null;

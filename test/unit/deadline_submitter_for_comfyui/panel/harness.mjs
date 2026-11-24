@@ -56,7 +56,12 @@ api.handlers["/deadline/cloud/status"] = async () => ({
   farmId: "farm-1",
   queueId: "queue-1",
 });
-api.handlers["/deadline/cloud/farms"] = async () => ({ farms: [] });
+// The account's default farm and queue are listed, so the panel shows them as chosen.
+api.handlers["/deadline/cloud/farms"] = async () => ({ farms: [{ farmId: "farm-1", displayName: "Farm" }] });
+api.handlers["/deadline/cloud/queues"] = async () => ({
+  queues: [{ queueId: "queue-1", displayName: "Queue" }],
+});
+api.handlers["/deadline/cloud/queue"] = async () => ({ parameters: [], storageProfiles: [] });
 api.handlers["/deadline/plan"] = async (body) => planFor(body);
 api.handlers["/deadline/jobs"] = async (body) => ({ submissionId: body.submissionId });
 await ui.loadAccount(true);
@@ -484,6 +489,43 @@ if (scenario === "answer-confirmation") {
 }
 if (scenario === "dialog-sections") {
   result.sections = ui.__dialogSections;
+}
+if (scenario === "late-queue-details") {
+  // Each queue's details come from their own request. Queue 2's answer comes before queue 1's.
+  const answers = { "queue-1": deferred(), "queue-2": deferred() };
+  api.handlers["/deadline/cloud/queue"] = (body) => answers[body.queueId].promise;
+  state.queueId = "queue-1";
+  const first = ui.__loadQueue();
+  state.queueId = "queue-2";
+  const second = ui.__loadQueue();
+  answers["queue-2"].resolve({
+    parameters: [{ name: "Queue2Parameter" }],
+    storageProfiles: [{ storageProfileId: "sp-2", displayName: "Profile 2" }],
+  });
+  await second;
+  answers["queue-1"].resolve({ parameters: [{ name: "Queue1Parameter" }], storageProfiles: [] });
+  await first;
+  result.queueParameters = state.queue.parameters.map(({ name }) => name);
+}
+if (scenario === "target-not-listed") {
+  // The configured default queue isn't in the farm's list, so the Queue select can't show it.
+  api.handlers["/deadline/cloud/queues"] = async () => ({
+    queues: [{ queueId: "queue-2", displayName: "Other queue" }],
+  });
+  state.queueId = "queue-1";
+  state.storageProfileId = "sp-default";
+  await ui.__loadQueues();
+  result.queueId = state.queueId;
+  result.storageProfileId = state.storageProfileId;
+  result.canSubmitUnlisted = Boolean(ui.canSubmit());
+  // A farm list that fails to load shows no farm as chosen either.
+  api.handlers["/deadline/cloud/farms"] = async () => {
+    throw new Error("AccessDenied");
+  };
+  state.queueId = "queue-2";
+  state.farms = null;
+  await ui.__loadFarms();
+  result.canSubmitWithoutFarms = Boolean(ui.canSubmit());
 }
 if (scenario === "task-limit") {
   // Two lists whose items multiply past the most tasks a job can run, as the submitter allows.

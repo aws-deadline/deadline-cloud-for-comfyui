@@ -259,9 +259,13 @@ jobEnvironments:
         if [ -n "$COMFYUI_EXTRA_MODEL_PATHS_CONFIG" ]; then
             MODEL_PATH_FILES+=("$COMFYUI_EXTRA_MODEL_PATHS_CONFIG")
         fi
+        # Each file is attached to its own option with "=". The option takes several values, so
+        # a separate value such as "--enable-cors-header" would otherwise be read as an option.
         MODEL_PATH_ARGS=()
         if [ ${#MODEL_PATH_FILES[@]} -gt 0 ]; then
-            MODEL_PATH_ARGS=(--extra-model-paths-config "${MODEL_PATH_FILES[@]}")
+            for MODEL_PATH_FILE in "${MODEL_PATH_FILES[@]}"; do
+                MODEL_PATH_ARGS+=("--extra-model-paths-config=$MODEL_PATH_FILE")
+            done
         fi
 
         # Keep ComfyUI's data out of the shared conda environment: use a base directory

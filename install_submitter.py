@@ -168,6 +168,21 @@ def _is_this_extension(path: Path) -> bool:
     ).is_dir()
 
 
+# What a source checkout has and an installed copy doesn't, since the copy leaves them out.
+_CHECKOUT_MARKERS = (".git", ".hg", ".svn")
+
+
+def _is_installed_copy(path: Path) -> bool:
+    """
+    Whether a folder is a copy this installer made, which it can replace. A checkout of the
+    extension, such as one cloned into custom_nodes, has the same files, but replacing it would
+    delete its history and uncommitted changes.
+    """
+    return _is_this_extension(path) and not any(
+        os.path.lexists(path / marker) for marker in _CHECKOUT_MARKERS
+    )
+
+
 def install_extension(
     source: Path, custom_nodes: Path, link: bool = False, force: bool = False
 ) -> Path:
@@ -186,7 +201,12 @@ def install_extension(
             log(f"Already linked: {dest} -> {source}")
             return dest
         dest.unlink()
-    elif dest.exists() and not _is_this_extension(dest) and not force:
+    elif dest.exists() and not _is_installed_copy(dest) and not force:
+        if _is_this_extension(dest):
+            raise InstallError(
+                f"{dest} is a checkout of the extension. Run the installer from it to use it in "
+                "place, or pass --force to replace it, which deletes its history and changes."
+            )
         raise InstallError(
             f"{dest} exists and isn't this extension. Remove it or pass --force to replace it."
         )

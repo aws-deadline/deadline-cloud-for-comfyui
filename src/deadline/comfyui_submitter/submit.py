@@ -215,19 +215,69 @@ def check_cli_version(cli: str, version_output: str) -> None:
         )
 
 
-def _describe_missing_node(node_id: str, ui_workflow: Any) -> str:
-    # A node inside a subgraph has an API ID like "12:137"; its UI ID is the last part.
-    ui_id = node_id.rsplit(":", 1)[-1]
-    for node in _workflow_nodes(ui_workflow):
-        if str(node.get("id")) != ui_id:
-            continue
-        description = f"{node_id} ({node.get('type')}"
-        properties = node.get("properties")
-        pack = properties.get("cnr_id") if isinstance(properties, dict) else None
-        if isinstance(pack, str):
-            description += f", from the {pack} node pack"
-        return description + ")"
-    return node_id
+class _UiNodes:
+    """
+    A UI-format workflow's nodes, indexed once: the top-level nodes and each subgraph's nodes, by
+    ID. A node inside a subgraph has an API ID like "12:137": node 137 of the subgraph that
+    top-level node 12 is an instance of.
+    """
+
+    def __init__(self, ui_workflow: Any):
+        self.top: dict[str, dict[str, Any]] = {}
+        self.subgraphs: dict[str, dict[str, dict[str, Any]]] = {}
+        # Any subgraph's node, by its own ID, for an API ID whose path can't be followed.
+        self.anywhere: dict[str, dict[str, Any]] = {}
+        if isinstance(ui_workflow, dict):
+            self.top = self._index(ui_workflow.get("nodes"))
+            self._add_subgraphs(ui_workflow, depth=0)
+
+    @staticmethod
+    def _index(nodes: Any) -> dict[str, dict[str, Any]]:
+        index: dict[str, dict[str, Any]] = {}
+        for node in nodes if isinstance(nodes, list) else []:
+            if isinstance(node, dict):
+                index.setdefault(str(node.get("id")), node)
+        return index
+
+    def _add_subgraphs(self, value: dict[str, Any], depth: int) -> None:
+        definitions = value.get("definitions")
+        subgraphs = definitions.get("subgraphs") if isinstance(definitions, dict) else None
+        # ComfyUI keeps every subgraph's definition at the top. The depth limit is for nesting.
+        if not isinstance(subgraphs, list) or depth > 32:
+            return
+        for subgraph in subgraphs:
+            if not isinstance(subgraph, dict):
+                continue
+            nodes = self._index(subgraph.get("nodes"))
+            self.subgraphs.setdefault(str(subgraph.get("id")), nodes)
+            for node_id, node in nodes.items():
+                self.anywhere.setdefault(node_id, node)
+            self._add_subgraphs(subgraph, depth + 1)
+
+    def find(self, api_id: str) -> dict[str, Any] | None:
+        *path, last = api_id.split(":")
+        scope: dict[str, dict[str, Any]] | None = self.top
+        for part in path:
+            instance = scope.get(part) if scope is not None else None
+            scope = self.subgraphs.get(str(instance.get("type"))) if instance else None
+        node = scope.get(last) if scope is not None else None
+        return node or (self.anywhere.get(last) if path else None)
+
+
+def _describe_missing_node(node_id: str, ui_nodes: _UiNodes) -> str:
+    node = ui_nodes.find(node_id)
+    if node is None:
+        return node_id
+    description = f"{node_id} ({node.get('type')}"
+    properties = node.get("properties")
+    pack = properties.get("cnr_id") if isinstance(properties, dict) else None
+    if isinstance(pack, str):
+        description += f", from the {pack} node pack"
+    return description + ")"
+
+
+# The most missing nodes an error describes. A workflow can have thousands.
+_MAX_DESCRIBED_NODES = 20
 
 
 # Job bundles hold the artist's workflow, prompts and file paths, so only the user that runs
@@ -263,12 +313,19 @@ def validate_api_workflow(workflow: Any, ui_workflow: Any = None) -> dict[str, A
         raise SubmitError("The workflow is in UI format. The submitter needs the API format.")
     # ComfyUI leaves out class_type for a node type it has no definition for, so the node can't
     # be turned into the API format.
-    missing = [
-        _describe_missing_node(str(node_id), ui_workflow)
+    missing_ids = [
+        str(node_id)
         for node_id, node in workflow.items()
         if not isinstance(node, dict) or "class_type" not in node
     ]
-    if missing:
+    if missing_ids:
+        ui_nodes = _UiNodes(ui_workflow)
+        missing = [
+            _describe_missing_node(node_id, ui_nodes)
+            for node_id in missing_ids[:_MAX_DESCRIBED_NODES]
+        ]
+        if len(missing_ids) > _MAX_DESCRIBED_NODES:
+            missing.append(f"and {len(missing_ids) - _MAX_DESCRIBED_NODES} more")
         raise SubmitError(
             f"This ComfyUI can't convert node {', '.join(missing)} because its node type isn't "
             "installed. Install the missing node packs and restart ComfyUI. Manager > Install "

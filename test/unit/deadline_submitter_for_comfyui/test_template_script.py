@@ -324,7 +324,7 @@ def test_an_empty_extra_model_paths_file_isnt_passed_to_comfyui(tmp_path):
     """ComfyUI can't read an empty extra_model_paths.yaml."""
     assert model_path_args(tmp_path) == []
     studio = "/mnt/studio/extra_model_paths.yaml"
-    assert model_path_args(tmp_path, studio) == ["--extra-model-paths-config", studio]
+    assert model_path_args(tmp_path, studio) == [f"--extra-model-paths-config={studio}"]
 
 
 def test_conda_custom_nodes_and_the_studio_config_are_both_passed(tmp_path):
@@ -332,9 +332,8 @@ def test_conda_custom_nodes_and_the_studio_config_are_both_passed(tmp_path):
     conda_nodes.mkdir()
     studio = "/mnt/studio/extra_model_paths.yaml"
     assert model_path_args(tmp_path, studio, conda_nodes) == [
-        "--extra-model-paths-config",
-        str(tmp_path / "extra_model_paths.yaml"),
-        studio,
+        f"--extra-model-paths-config={tmp_path / 'extra_model_paths.yaml'}",
+        f"--extra-model-paths-config={studio}",
     ]
 
 
@@ -343,9 +342,8 @@ def test_attached_models_and_the_studio_config_are_both_passed(tmp_path):
     (attached / "loras").mkdir(parents=True)
     studio = "/mnt/studio/extra_model_paths.yaml"
     assert model_path_args(tmp_path, studio, model_directory=attached) == [
-        "--extra-model-paths-config",
-        str(tmp_path / "extra_model_paths.yaml"),
-        studio,
+        f"--extra-model-paths-config={tmp_path / 'extra_model_paths.yaml'}",
+        f"--extra-model-paths-config={studio}",
     ]
 
 
@@ -360,9 +358,8 @@ def test_model_paths_preserve_quotes_and_line_breaks(tmp_path):
     }
     studio = str(tmp_path / 'artist\'s "config"; $(touch injected).yaml')
     assert model_path_args(tmp_path, studio, conda_nodes, attached) == [
-        "--extra-model-paths-config",
-        str(tmp_path / "extra_model_paths.yaml"),
-        studio,
+        f"--extra-model-paths-config={tmp_path / 'extra_model_paths.yaml'}",
+        f"--extra-model-paths-config={studio}",
     ]
     assert not (tmp_path / "injected").exists()
 
@@ -441,7 +438,7 @@ def test_enter_passes_paths_and_extra_arguments_as_literal_argv(tmp_path):
     assert result.returncode == 0, result.stderr
     assert args[args.index("--input-directory") + 1] == inputs
     assert args[args.index("--output-directory") + 1] == output
-    assert args[args.index("--extra-model-paths-config") + 1] == config
+    assert f"--extra-model-paths-config={config}" in args
     start = args.index("--") + 1
     assert args[start : start + 8] == [
         "--lowvram",
@@ -502,6 +499,30 @@ def test_enter_keeps_the_required_server_arguments_authoritative(tmp_path, extra
     assert parsed.output_directory == output
     assert parsed.base_directory == str(tmp_path / "comfyui")
     assert parsed.input_directory == str(tmp_path / "comfyui" / "input")
+
+
+@pytest.mark.parametrize(
+    "config", ["--enable-cors-header=*", "--temp-directory=/shared/x", "--enable-manager"]
+)
+def test_the_studio_model_paths_config_cant_be_read_as_an_option(tmp_path, config):
+    """ComfyUI's --extra-model-paths-config takes several values, so each file is attached."""
+    attached = tmp_path / "attached models"
+    (attached / "loras").mkdir(parents=True)
+    result, args = run_enter(tmp_path, ModelDirectory=str(attached), ExtraModelPathsConfig=config)
+    assert result.returncode == 0, result.stderr
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--extra-model-paths-config", nargs="+", action="append")
+    parser.add_argument("--enable-cors-header", nargs="?", const="*")
+    parser.add_argument("--temp-directory")
+    parser.add_argument("--enable-manager", action="store_true")
+    parsed, _ = parser.parse_known_args(args[args.index("--") + 1 :])
+    assert parsed.enable_cors_header is None
+    assert parsed.temp_directory is None
+    assert parsed.enable_manager is False
+    assert parsed.extra_model_paths_config == [
+        [str(tmp_path / "extra_model_paths.yaml")],
+        [config],
+    ]
 
 
 @pytest.mark.parametrize(

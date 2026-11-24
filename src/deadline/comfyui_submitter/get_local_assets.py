@@ -521,6 +521,8 @@ def _model_directories(ui_workflow: Any) -> dict[str, list[tuple[str, bool]]]:
     whether the loader declares it, rather than it being a guess from a subgraph.
     """
     subgraphs = _subgraphs_by_id(ui_workflow)
+    # Each subgraph is indexed once, however many nodes are instances of it.
+    indexes: dict[str, _SubgraphIndex] = {}
     directories: dict[str, list[tuple[str, bool]]] = {}
     nodes = ui_workflow.get("nodes") if isinstance(ui_workflow, Mapping) else None
     if not isinstance(nodes, list):
@@ -530,9 +532,15 @@ def _model_directories(ui_workflow: Any) -> dict[str, list[tuple[str, bool]]]:
         if not isinstance(node, Mapping) or node.get("mode") in (2, 4):
             continue
         node_type = node.get("type")
-        subgraph = subgraphs.get(node_type) if isinstance(node_type, str) else None
+        index = None
+        if isinstance(node_type, str) and node_type in subgraphs:
+            index = indexes.get(node_type)
+            if index is None:
+                index = indexes[node_type] = _SubgraphIndex(subgraphs[node_type])
+        widgets = _widget_names_by_value(node) if index else {}
+        declared = _node_models(node)
         for filename in _model_filenames(node):
-            hint = _model_directory(node, filename, subgraph)
+            hint = _model_directory(declared, filename, widgets.get(filename, ()), index)
             # workflow_models normalizes separators, so the lookup key has to match.
             folders = directories.setdefault(filename.replace("\\", "/"), [])
             if hint and hint not in folders:
@@ -621,19 +629,25 @@ def _widget_name(item: Mapping[str, Any]) -> str | None:
     return fallback if isinstance(fallback, str) else None
 
 
-def _widget_names_for_filename(node: Mapping[str, Any], filename: str) -> list[str]:
-    names: list[str] = []
+def _widget_names_by_value(node: Mapping[str, Any]) -> dict[str, list[str]]:
+    """Each string widget value on a node, with the names of the widgets that hold it."""
+    names: dict[str, list[str]] = {}
+    seen: set[tuple[str, str]] = set()
+
+    def add(value: Any, name: Any) -> None:
+        if isinstance(value, str) and isinstance(name, str) and (value, name) not in seen:
+            seen.add((value, name))
+            names.setdefault(value, []).append(name)
+
     named = node.get("widgets_values_named")
     if isinstance(named, Mapping):
-        names.extend(
-            key for key, value in named.items() if isinstance(key, str) and value == filename
-        )
+        for key, value in named.items():
+            add(value, key)
     widgets = node.get("widgets_values")
     if isinstance(widgets, list):
         for index, item in enumerate(_widget_inputs(node)):
-            label = _widget_name(item)
-            if label and label not in names and index < len(widgets) and widgets[index] == filename:
-                names.append(label)
+            if index < len(widgets):
+                add(widgets[index], _widget_name(item))
     return names
 
 
@@ -645,54 +659,77 @@ def _directory_from_models(models: Iterable[dict[str, Any]], filename: str) -> s
     return None
 
 
-def _linked_directory(
-    node: Mapping[str, Any], filename: str, subgraph: Mapping[str, Any] | None
-) -> str | None:
-    """Folder type of the definition loader a subgraph widget feeds this file name into."""
-    if subgraph is None:
-        return None
-    widget_names = set(_widget_names_for_filename(node, filename))
-    if not widget_names:
-        return None
-    link_ids: list[Any] = []
-    inputs = subgraph.get("inputs")
-    if isinstance(inputs, list):
-        for item in inputs:
-            if not isinstance(item, Mapping) or item.get("name") not in widget_names:
+def _hashable(value: Any) -> bool:
+    try:
+        hash(value)
+    except TypeError:
+        return False
+    return True
+
+
+class _SubgraphIndex:
+    """
+    What a subgraph's widget inputs feed: the links each input has, and, for each link, the first
+    inner node that it connects to and that declares a model folder. Built once per subgraph, so
+    looking up a file name doesn't read every inner node again.
+    """
+
+    def __init__(self, subgraph: Mapping[str, Any]):
+        self.input_links: dict[str, list[Any]] = {}
+        inputs = subgraph.get("inputs")
+        for item in inputs if isinstance(inputs, list) else []:
+            ids = item.get("linkIds") if isinstance(item, Mapping) else None
+            name = item.get("name") if isinstance(item, Mapping) else None
+            if isinstance(name, str) and isinstance(ids, list):
+                self.input_links.setdefault(name, []).extend(i for i in ids if _hashable(i))
+        # For each link, the position of the first inner node it feeds that declares a folder,
+        # and that folder.
+        self.first_directory: dict[Any, tuple[int, str]] = {}
+        nodes = subgraph.get("nodes")
+        for position, inner in enumerate(nodes if isinstance(nodes, list) else []):
+            if not isinstance(inner, Mapping) or not isinstance(inner.get("inputs"), list):
                 continue
-            ids = item.get("linkIds")
-            if isinstance(ids, list):
-                link_ids.extend(ids)
-    if not link_ids:
-        return None
-    nodes = subgraph.get("nodes")
-    if not isinstance(nodes, list):
-        return None
-    for inner in nodes:
-        if not isinstance(inner, Mapping):
-            continue
-        inner_inputs = inner.get("inputs")
-        if not isinstance(inner_inputs, list):
-            continue
-        if not any(
-            isinstance(item, Mapping) and item.get("link") in link_ids for item in inner_inputs
-        ):
-            continue
-        for model in _node_models(inner):
-            directory = model.get("directory")
-            if isinstance(directory, str):
-                return directory
-    return None
+            directory = next(
+                (
+                    model["directory"]
+                    for model in _node_models(inner)
+                    if isinstance(model.get("directory"), str)
+                ),
+                None,
+            )
+            if directory is None:
+                continue
+            for item in inner["inputs"]:
+                link = item.get("link") if isinstance(item, Mapping) else None
+                if link is not None and _hashable(link):
+                    self.first_directory.setdefault(link, (position, directory))
+
+    def directory(self, widget_names: Iterable[str]) -> str | None:
+        """The folder of the first inner loader that these widget inputs feed, if any."""
+        found = [
+            self.first_directory[link]
+            for name in set(widget_names)
+            for link in self.input_links.get(name, ())
+            if link in self.first_directory
+        ]
+        return min(found)[1] if found else None
 
 
 def _model_directory(
-    node: Mapping[str, Any], filename: str, subgraph: Mapping[str, Any] | None
+    declared: list[dict[str, Any]],
+    filename: str,
+    widget_names: Iterable[str],
+    subgraph: _SubgraphIndex | None,
 ) -> tuple[str, bool] | None:
-    """The folder a node loads a model file from, and whether the node declares it."""
-    declared = _directory_from_models(_node_models(node), filename)
-    if declared:
-        return declared, True
-    guessed = _linked_directory(node, filename, subgraph)
+    """
+    The folder a node loads a model file from, and whether the node declares it. declared is the
+    node's own models, and widget_names the widgets that hold the file name, which a subgraph
+    feeds into its inner loaders.
+    """
+    folder = _directory_from_models(declared, filename)
+    if folder:
+        return folder, True
+    guessed = subgraph.directory(widget_names) if subgraph else None
     return (guessed, False) if guessed else None
 
 

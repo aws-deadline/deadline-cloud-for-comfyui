@@ -365,6 +365,46 @@ def test_find_workflow_local_models_reads_extensions_under_nodes(tmp_path):
     assert directories == {f"checkpoints/{name}": "checkpoints" for name in names}
 
 
+def test_model_folders_read_each_subgraph_once(tmp_path, monkeypatch):
+    """Many instances of a large subgraph used to read all of it again for every file name."""
+    from deadline.comfyui_submitter import get_local_assets
+
+    model = touch(tmp_path / "checkpoints" / "sd.safetensors")
+    folders = {"checkpoints": ([str(model.parent)], {".safetensors"})}
+    loader = {
+        "type": "CheckpointLoaderSimple",
+        "inputs": [{"name": "ckpt_name", "widget": {"name": "ckpt_name"}, "link": 1}],
+        "properties": {"models": [{"name": "sd.safetensors", "directory": "checkpoints"}]},
+    }
+    padding = [
+        {"type": "Note", "inputs": [{"name": f"x{i}", "link": 10_000 + i}]} for i in range(500)
+    ]
+    subgraph = {
+        "id": "sg",
+        "inputs": [{"name": "ckpt_name", "linkIds": [1, *range(2, 2000)]}],
+        "nodes": [*padding, loader],
+    }
+    instance = {
+        "type": "sg",
+        "inputs": [{"name": "ckpt_name", "widget": {"name": "ckpt_name"}}],
+        "widgets_values": ["sd.safetensors"],
+    }
+    ui = {"nodes": [instance] * 200, "definitions": {"subgraphs": [subgraph]}}
+    api = {"1": {"inputs": {"ckpt_name": "sd.safetensors"}}}
+    calls = []
+    node_models = get_local_assets._node_models
+
+    def counted(node):
+        calls.append(1)
+        return node_models(node)
+
+    monkeypatch.setattr(get_local_assets, "_node_models", counted)
+    found, _ = find_workflow_local_models(ui, api, folders)
+    assert found == {"checkpoints/sd.safetensors": model}
+    # The subgraph's 501 inner nodes once, and each of the 200 instances once.
+    assert len(calls) <= 501 + 200
+
+
 def test_find_workflow_local_models_reads_properties_on_a_node_inside_a_subgraph(tmp_path):
     """A subgraph node's properties name the folder. A URL there doesn't stop it being staged."""
     checkpoint = touch(tmp_path / "checkpoints" / "sd.safetensors")

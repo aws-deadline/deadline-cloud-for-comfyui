@@ -233,6 +233,41 @@ def test_validate_api_workflow_finds_missing_node_in_subgraph():
         validate_api_workflow({**API_WORKFLOW, "12:137": {"inputs": {}}}, ui_workflow)
 
 
+def test_validate_api_workflow_follows_a_subgraph_nodes_path():
+    """Subgraph node IDs often repeat top-level ones, so 12:137 is node 137 of 12's subgraph."""
+    ui_workflow = {
+        "nodes": [{"id": 137, "type": "KSampler"}, {"id": 12, "type": "subgraph-a"}],
+        "definitions": {
+            "subgraphs": [
+                {"id": "subgraph-b", "nodes": [{"id": 137, "type": "OtherNode"}]},
+                {"id": "subgraph-a", "nodes": [{"id": 137, "type": "MissingNode"}]},
+            ]
+        },
+    }
+    with pytest.raises(SubmitError, match=r"node 12:137 \(MissingNode\)"):
+        validate_api_workflow({**API_WORKFLOW, "12:137": {"inputs": {}}}, ui_workflow)
+
+
+def test_validate_api_workflow_describes_a_bounded_number_of_missing_nodes(monkeypatch):
+    """A workflow with thousands of missing nodes reads its UI workflow once."""
+    missing: dict[str, dict] = {str(n): {"inputs": {}} for n in range(100, 20100)}
+    ui_workflow = {"nodes": [{"id": n, "type": f"Missing{n}"} for n in range(100, 20100)]}
+    indexed: list[int] = []
+    ui_nodes = submit._UiNodes
+
+    def counted(value):
+        indexed.append(1)
+        return ui_nodes(value)
+
+    monkeypatch.setattr(submit, "_UiNodes", counted)
+    with pytest.raises(SubmitError) as error:
+        validate_api_workflow({**API_WORKFLOW, **missing}, ui_workflow)
+    assert indexed == [1]
+    assert "node 100 (Missing100), " in str(error.value)
+    assert "and 19980 more" in str(error.value)
+    assert len(str(error.value)) < 2000
+
+
 def test_workflow_models():
     workflow = {
         "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sdxl.safetensors"}},

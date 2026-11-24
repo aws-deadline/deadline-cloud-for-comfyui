@@ -1010,6 +1010,79 @@ def test_jobs_can_be_canceled(comfy, monkeypatch):
     assert (event, data["status"]) == ("deadline.submitted", "CANCELED")
 
 
+def created_event() -> dict:
+    return {"event": "created", "jobId": JOB_ID, "farmId": FARM, "queueId": QUEUE}
+
+
+def test_jobs_cant_be_canceled_once_the_job_is_being_created(comfy, monkeypatch):
+    """Killing the bridge after CreateJob would hide a job that runs."""
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    fake_bridge(
+        monkeypatch, comfy.tmp_path, {"submit": [{"event": "creating"}, created_event(), "hang"]}
+    )
+
+    async def submit_and_cancel():
+        app = web.Application()
+        app.add_routes(comfy.server.routes)
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post("/deadline/jobs", json=JOB)
+            submission_id = (await response.json())["submissionId"]
+            for _ in range(200):
+                if comfy.routes._submissions[submission_id].creating:
+                    break
+                await asyncio.sleep(0.05)
+            canceled = await client.post(
+                "/deadline/jobs/cancel",
+                json={"submissionId": submission_id, "clientId": JOB["clientId"]},
+            )
+            body = await canceled.json()
+            # Stop the stand-in, as the library finishing would.
+            comfy.routes._submissions[submission_id].process.kill()
+            await asyncio.gather(*comfy.routes._watchers)
+            return canceled.status, body
+
+    status, body = run(submit_and_cancel())
+    assert status == 409
+    assert "already being created" in body["error"]
+    event, data = comfy.server.events[-1]
+    assert (event, data["status"], data["jobId"]) == ("deadline.submitted", "SUBMITTED", JOB_ID)
+
+
+def test_jobs_report_a_created_job_when_a_later_step_fails(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    failed = {"event": "error", "message": "Timed out waiting for the job"}
+    fake_bridge(
+        monkeypatch, comfy.tmp_path, {"submit": [{"event": "creating"}, created_event(), failed]}
+    )
+    status, _ = run(call(comfy, "/deadline/jobs", JOB))
+    assert status == 202
+    event, data = comfy.server.events[-1]
+    assert event == "deadline.submitted"
+    assert {key: data[key] for key in ("status", "jobId", "farmId", "queueId")} == {
+        "status": "SUBMITTED",
+        "jobId": JOB_ID,
+        "farmId": FARM,
+        "queueId": QUEUE,
+    }
+    assert "Timed out waiting for the job" in data["warning"]
+
+
+@pytest.mark.parametrize(
+    "created",
+    [
+        {"event": "created", "jobId": "job-1", "farmId": "farm-" + "1" * 32},
+        {"event": "created", "jobId": "job-" + "3" * 32, "farmId": "farm\nx"},
+        {"event": "created", "jobId": 7},
+    ],
+)
+def test_jobs_ignore_a_created_event_without_deadline_ids(comfy, monkeypatch, created):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    failed = {"event": "error", "message": "Boom"}
+    fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [created, failed]})
+    run(call(comfy, "/deadline/jobs", JOB))
+    assert comfy.server.events[-1][1]["status"] == "FAILED"
+
+
 def test_resolve_cli_python_reads_the_shebang(tmp_path, monkeypatch):
     monkeypatch.delenv(submit.PYTHON_ENV_VAR, raising=False)
     python = tmp_path / "env" / "python3.11"
@@ -1647,7 +1720,8 @@ def test_jobs_doesnt_attach_a_local_model_the_artist_removed(comfy, monkeypatch)
     assert not (bundle / "local_models").exists()
     references = yaml.safe_load((bundle / "asset_references.yaml").read_text())
     assert not references["assetReferences"]["inputs"]["filenames"]
-    assert bridge_requests(requests)[0]["request"]["parameters"]["ModelDirectory"] == ""
+    # Nothing is staged, so the job keeps the template's empty Model Directory.
+    assert bridge_requests(requests)[0]["request"]["parameters"].get("ModelDirectory", "") == ""
 
 
 def test_jobs_attaches_the_local_models_the_artist_kept(comfy, monkeypatch):
@@ -1674,6 +1748,14 @@ def test_jobs_rejects_bad_excluded_models(comfy, monkeypatch, excluded):
 
 
 def test_jobs_keeps_the_artists_model_directory_when_nothing_is_attached(comfy, monkeypatch):
+    """A studio template that shows Model Directory lets the artist choose it."""
+    template = yaml.safe_load(submit.JOB_TEMPLATE.read_text())
+    for definition in template["parameterDefinitions"]:
+        if definition["name"] == "ModelDirectory":
+            definition["userInterface"] = {"control": "CHOOSE_DIRECTORY"}
+    studio = comfy.tmp_path / "studio.yaml"
+    studio.write_text(yaml.safe_dump(template, sort_keys=False))
+    monkeypatch.setenv(submit.TEMPLATE_ENV_VAR, str(studio))
     fake_cli(monkeypatch, comfy.tmp_path, "")
     requests = fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
     body = {**JOB, "parameters": {"ModelDirectory": "/shared/models"}}
@@ -1681,6 +1763,20 @@ def test_jobs_keeps_the_artists_model_directory_when_nothing_is_attached(comfy, 
     assert status == 202
     sent = bridge_requests(requests)[0]["request"]["parameters"]
     assert sent["ModelDirectory"] == "/shared/models"
+
+
+def test_jobs_ignore_hidden_paths_from_the_request(comfy, monkeypatch):
+    """The panel doesn't show them, and a custom nodes folder of any path would load as code."""
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
+    parameters = {"CustomNodesDirectory": "/tmp", "ModelDirectory": "/", "ComfyUIArgs": "--lowvram"}
+    status, _ = run(call(comfy, "/deadline/jobs", {**JOB, "parameters": parameters}))
+    assert status == 202
+    sent = bridge_requests(requests)[0]["request"]["parameters"]
+    assert "CustomNodesDirectory" not in sent
+    assert "ModelDirectory" not in sent
+    # Parameters the panel shows are still the artist's.
+    assert sent["ComfyUIArgs"] == "--lowvram"
 
 
 def test_jobs_warns_when_a_planned_local_model_cant_be_staged(comfy, monkeypatch):

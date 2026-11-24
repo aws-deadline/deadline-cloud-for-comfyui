@@ -62,7 +62,8 @@ def _run_scenario(tmp_path: Path, ui_source: str, scenario: str) -> dict:
         " pollJobs as __pollJobs, formFromRequirements as __formFromRequirements,"
         " requirementsFromForm as __requirementsFromForm,"
         " createView as __createView, itemEditBase as __itemEditBase,"
-        " DIALOG_SECTIONS as __dialogSections,"
+        " DIALOG_SECTIONS as __dialogSections, loadQueue as __loadQueue,"
+        " loadQueues as __loadQueues, loadFarms as __loadFarms,"
         " answerConfirmation as __answerConfirmation, cancelSubmission as __cancelSubmission };\n"
     )
     (web / "deadline_ui.js").write_text(ui_source + exports, encoding="utf-8")
@@ -293,6 +294,20 @@ def test_a_finished_download_says_where_the_files_are(run_scenario, scenario, de
 def test_bool_parameters_are_read_as_openjd_reads_them(run_scenario):
     """So the Attach Custom Nodes checkbox and the attachments agree with what the job does."""
     assert run_scenario("parse-bool")["values"] == [True] * 6 + [False] * 6 + [None] * 5
+
+
+def test_an_earlier_queues_details_dont_replace_the_chosen_queues(run_scenario):
+    """The queue parameters and storage profiles sent are the chosen queue's."""
+    assert run_scenario("late-queue-details") == {"queueParameters": ["Queue2Parameter"]}
+
+
+def test_a_farm_or_queue_the_panel_doesnt_list_isnt_submitted_to(run_scenario):
+    assert run_scenario("target-not-listed") == {
+        "queueId": "",
+        "storageProfileId": "",
+        "canSubmitUnlisted": False,
+        "canSubmitWithoutFarms": False,
+    }
 
 
 def test_the_panel_has_the_submitters_task_limit(run_scenario):
