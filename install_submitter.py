@@ -7,8 +7,9 @@ Sets up the Deadline Cloud Submitter for a ComfyUI install.
 
 1. Builds the panel: runs npm ci and npm run build in frontend/, which compiles its TypeScript
    into the extension's web folder.
-2. Copies this extension into ComfyUI's custom_nodes directory. If this checkout is already in
-   custom_nodes, for example cloned there by ComfyUI-Manager, it's used where it is.
+2. Copies the extension's runtime files, listed in RUNTIME_FILES, and the compiled panel into
+   ComfyUI's custom_nodes directory. Nothing else in the checkout is copied. If this checkout is
+   already in custom_nodes, for example cloned there by ComfyUI-Manager, it's used where it is.
 3. Finds the Deadline Cloud CLI. It uses the `deadline` on the PATH when it's new enough and
    runs on a Python the extension can find, since the panel runs that Python. Otherwise it
    creates a Python environment inside the extension and installs deadline[gui,console] into it. Use
@@ -50,49 +51,34 @@ CLI_ENV_DIR_NAME = ".deadline-cli"
 CLI_REQUIREMENT = "deadline[gui,console]>={},<0.61".format(".".join(map(str, MIN_CLI_VERSION)))
 BOTO3_REQUIREMENT = "boto3>={}".format(".".join(map(str, MIN_BOTOCORE_VERSION)))
 
-_IGNORE_PATTERNS = shutil.ignore_patterns(
-    ".git",
-    ".github",
-    # Local settings and credentials that a checkout can hold.
-    ".env",
-    ".env.*",
-    ".aws",
-    ".claude",
-    ".idea",
-    ".vscode",
-    ".venv",
-    "venv",
-    "build",
-    "dist",
-    "test",
-    # The panel's TypeScript source and build tools. ComfyUI loads the web folder build_panel fills.
-    "frontend",
-    "node_modules",
-    "__pycache__",
-    "*.pyc",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".coverage*",
-    CLI_ENV_DIR_NAME,
-    CONFIG_FILE_NAME,
-)
-
-
-def COPY_IGNORE(directory: str, names: list[str]) -> set[str]:
-    """
-    What the installer doesn't copy into custom_nodes: the patterns above, and links, which can
-    point anywhere, such as at a models folder or ~/.ssh, and would be copied with their targets.
-    """
-    ignored = set(_IGNORE_PATTERNS(directory, names))
-    ignored.update(name for name in names if os.path.islink(os.path.join(directory, name)))
-    return ignored
-
-
 FRONTEND_DIR = Path("frontend")
-WEB_DIR = Path("src", "deadline", "comfyui_submitter", "web")
+PACKAGE_DIR = Path("src", "deadline", "comfyui_submitter")
+WEB_DIR = PACKAGE_DIR / "web"
 PANEL_FILES = ("deadline_submit.js", "deadline_ui.js")
 MIN_NODE_VERSION = (22,)
+
+# Everything a copied install has, relative to the checkout. A checkout can also hold local
+# settings, credentials, logs, old builds and experiments, and other tools and users may be able to
+# read custom_nodes, so only these files are copied. ComfyUI imports the root __init__.py, which
+# imports the package under src/. src/deadline has no __init__.py, as it's a namespace package.
+# install_submitter.py is copied so the installed copy can run it again to update its CLI. A module
+# added to the package has to be added here too, which a unit test checks.
+RUNTIME_FILES = (
+    Path("__init__.py"),
+    Path("install_submitter.py"),
+    Path("LICENSE"),
+    Path("NOTICE"),
+    Path("README.md"),
+    PACKAGE_DIR / "__init__.py",
+    PACKAGE_DIR / "bridge.py",
+    PACKAGE_DIR / "comfy_cli_job_template.yaml",
+    PACKAGE_DIR / "get_local_assets.py",
+    PACKAGE_DIR / "routes.py",
+    PACKAGE_DIR / "submit.py",
+    # The panel that build_panel compiles. ComfyUI loads every script in the web folder, so other
+    # JavaScript there, such as from an older build, isn't copied.
+    *(WEB_DIR / name for name in PANEL_FILES),
+)
 
 
 class InstallError(Exception):
@@ -183,17 +169,70 @@ def _is_installed_copy(path: Path) -> bool:
     )
 
 
+def _link_on_the_way_to(source: Path, relative: Path) -> Path | None:
+    """
+    The first folder or file from source down to source / relative that's a symlink or a Windows
+    junction, if any. os.path.islink is False for a junction, so it's checked for separately.
+    """
+    path = source
+    for part in relative.parts:
+        path = path / part
+        if os.path.islink(path) or os.path.isjunction(path):
+            return path
+    return None
+
+
+def _check_runtime_files(source: Path) -> None:
+    """
+    Fails if a file in RUNTIME_FILES is missing from source, or is reached through a link, before
+    anything in custom_nodes is replaced. A link can point anywhere, such as at a models folder or
+    ~/.ssh, and copying it would copy its target.
+    """
+    links: list[str] = []
+    missing: list[str] = []
+    for relative in RUNTIME_FILES:
+        link = _link_on_the_way_to(source, relative)
+        if link is not None:
+            name = link.relative_to(source).as_posix()
+            if name not in links:
+                links.append(name)
+        elif not (source / relative).is_file():
+            missing.append(relative.as_posix())
+    if links:
+        raise InstallError(
+            f"{source} has links in place of files the extension needs: {', '.join(links)}. "
+            "Links and Windows junctions can point anywhere, so the installer doesn't copy them. "
+            "Replace them with the files from the repository."
+        )
+    if missing:
+        raise InstallError(
+            f"{source} is missing {', '.join(missing)}, which the extension needs. Run this "
+            "script from a complete checkout."
+        )
+
+
+def _copy_runtime_files(source: Path, staging: Path) -> None:
+    # Made new, so the copy can't be written through a link left at the staging folder's path.
+    staging.mkdir()
+    for relative in RUNTIME_FILES:
+        (staging / relative).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source / relative, staging / relative)
+
+
 def install_extension(
     source: Path, custom_nodes: Path, link: bool = False, force: bool = False
 ) -> Path:
     """
-    An existing copy keeps its CLI environment and config, so updates don't reinstall the CLI.
-    Replacing a copy with a link keeps its config.
+    Copies the files in RUNTIME_FILES from source into custom_nodes, or with link, links to
+    source. An existing copy keeps its CLI environment and config, so updates don't reinstall the
+    CLI. Replacing a copy with a link keeps its config.
     """
     source = source.resolve()
     if source.parent == custom_nodes:
         log(f"Using the extension in place: {source}")
         return source
+    if not link:
+        _check_runtime_files(source)
 
     dest = custom_nodes / EXTENSION_DIR_NAME
     if dest.is_symlink():
@@ -222,7 +261,7 @@ def install_extension(
     staging = custom_nodes / f".{EXTENSION_DIR_NAME}.installing"
     if staging.exists():
         shutil.rmtree(staging)
-    shutil.copytree(source, staging, ignore=COPY_IGNORE)
+    _copy_runtime_files(source, staging)
     if dest.exists():
         for kept in (CLI_ENV_DIR_NAME, CONFIG_FILE_NAME):
             if (dest / kept).exists():
