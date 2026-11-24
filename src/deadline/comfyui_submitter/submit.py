@@ -420,35 +420,76 @@ def input_path(input_dir: Path | str, name: Any) -> Path | None:
         name = name[: -len(" [input]")]
     elif re.search(r" \[(output|temp)\]$", name):
         return None
-    # ComfyUI checks paths this way too, without resolving symbolic links.
+    # ComfyUI checks paths this way too, without resolving symbolic links. The submitter checks
+    # links as well, with leads_inside, before it attaches anything.
     base = Path(os.path.abspath(input_dir))
     path = Path(os.path.abspath(base / name))
     return path if path != base and path.is_relative_to(base) else None
 
 
-def image_files(directory: Path) -> list[str]:
-    """The images in a folder that LoadImageDataSetFromFolder loads, in name order."""
+def real_path(path: Path | str) -> Path:
+    """path with every link resolved, so a folder that's a link can still be a root."""
+    return Path(os.path.realpath(path))
+
+
+def leads_inside(path: Path | str, root: Path) -> bool:
+    """
+    Whether path, with every link resolved, is inside root, whose links are resolved already.
+    Job attachments uploads what a link points to, so a link in ComfyUI's input folder could
+    otherwise attach any file on the disk. Every path is resolved, not only symbolic links, since
+    Python doesn't count a Windows directory junction as one.
+    """
+    try:
+        real = real_path(path)
+    except (OSError, ValueError):
+        return False
+    return real != root and real.is_relative_to(root)
+
+
+def image_files(directory: Path, root: Path) -> list[str]:
+    """
+    The images in a folder that LoadImageDataSetFromFolder loads, in name order. root is the real
+    path of ComfyUI's input folder. An image that leads out of it isn't attached, so it's left out
+    here too: a task couldn't load it.
+    """
     try:
         return sorted(
             entry.name
             for entry in directory.iterdir()
-            if entry.is_file() and entry.name.lower().endswith(IMAGE_EXTENSIONS)
+            if entry.is_file()
+            and entry.name.lower().endswith(IMAGE_EXTENSIONS)
+            and leads_inside(entry, root)
         )
     except OSError:
         return []
 
 
-def input_folders(workflow: dict[str, Any], input_dir: Path) -> list[Path]:
+def input_folders(
+    workflow: Mapping[str, Any], input_dir: Path, warnings: list[str] | None = None
+) -> list[Path]:
     """
-    Returns the folders in ComfyUI's input directory that the workflow's folder loaders read.
+    Returns the folders in ComfyUI's input directory that the workflow's folder loaders read. A
+    folder that leads out of the input directory through a link is left out, with a warning in
+    warnings. The folders aren't attached whole: get_local_assets attaches the files in them.
     """
+    root = real_path(input_dir)
     folders = set()
-    for node in workflow.values():
-        if node.get("class_type") not in FOLDER_INPUT_NODES:
+    for node_id, node in workflow.items():
+        if not isinstance(node, Mapping) or node.get("class_type") not in FOLDER_INPUT_NODES:
             continue
-        path = input_path(input_dir, node.get("inputs", {}).get("folder"))
-        if path is not None and path.is_dir():
+        inputs = node.get("inputs")
+        folder = inputs.get("folder") if isinstance(inputs, Mapping) else None
+        path = input_path(input_dir, folder)
+        if path is None or not path.is_dir():
+            continue
+        if leads_inside(path, root):
             folders.add(path)
+        elif warnings is not None:
+            warnings.append(
+                f"Node {_quoted(node_id)} loads the folder {_quoted(folder)!r}, which links "
+                "outside ComfyUI's input folder, so it isn't attached. Add it with Add folder… "
+                "if the job needs it."
+            )
     return sorted(folders)
 
 
@@ -699,6 +740,9 @@ def plan_task_lists(
     plan = TaskLists(workflow)
     consumers = _consumers(workflow)
     base = Path(os.path.abspath(input_dir)) if input_dir else None
+    # An image that links outside the input directory, or is in a folder that does, isn't
+    # attached, so it can't be one of a task's items.
+    root = real_path(base) if base else None
     unplanned = 0
     for node_id, node in workflow.items():
         class_type = node.get("class_type")
@@ -720,7 +764,7 @@ def plan_task_lists(
         elif class_type in FOLDER_LOADERS:
             folder = inputs.get("folder")
             directory = input_path(base, folder) if base else None
-            files = image_files(directory) if directory else []
+            files = image_files(directory, root) if directory and root else []
             if directory and base and len(files) > 1:
                 # Relative to the input directory, which the job maps, whatever the workflow's
                 # folder says, such as an absolute path on this machine or one with "..".

@@ -1,10 +1,11 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 """
 Finds the local files an API-format ComfyUI workflow reads (input images, videos, audio and so on,
-but not custom nodes) and writes them to a job bundle's asset_references.yaml. Model files are
-not part of that scan. A model the workflow loads is staged into the job's model directory and
-attached from there. A custom node pack the workflow uses is staged into the job's custom nodes
-directory in the same way.
+but not custom nodes) and writes them to a job bundle's asset_references.yaml. Only the inputs
+that ComfyUI's node definitions mark as files are read, and only files in ComfyUI's input, output
+and temp folders are attached. Model files are not part of that scan. A model the workflow loads
+is staged into the job's model directory and attached from there. A custom node pack the workflow
+uses is staged into the job's custom nodes directory in the same way.
 """
 
 from __future__ import annotations
@@ -16,12 +17,19 @@ import logging
 import os
 import re
 import shutil
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
 from typing import Any
 
-from .submit import MODEL_EXTENSIONS, workflow_models, write_private_text
+from .submit import (
+    MODEL_EXTENSIONS,
+    input_folders,
+    leads_inside,
+    real_path,
+    workflow_models,
+    write_private_text,
+)
 
 # Loaders for these file types look in ComfyUI's input directory.
 MEDIA_EXTENSIONS = frozenset(
@@ -43,6 +51,29 @@ _MAX_VALUE_LENGTH = 1024
 # A path that starts with two separators: a UNC or Windows device path.
 _NETWORK_PATH = re.compile(r"[\\/]{2}")
 
+# The options a ComfyUI node definition sets on an input whose widget uploads a file into
+# ComfyUI's input folder, such as LoadImage's image. The input's value names the file to load.
+UPLOAD_OPTIONS = frozenset(
+    {"image_upload", "animated_image_upload", "video_upload", "audio_upload", "file_upload"}
+)
+# Input types whose widget saves a capture into ComfyUI's folders and names it, such as
+# WebcamCapture's image.
+CAPTURE_INPUT_TYPES = frozenset({"WEBCAM", "AUDIO_RECORD"})
+# The file inputs of ComfyUI's own loaders. get_local_assets reads these when it isn't given the
+# node definitions' own, such as in a test, or when ComfyUI's nodes module can't be imported.
+CORE_FILE_INPUTS: dict[str, frozenset[str]] = {
+    "LoadImage": frozenset({"image"}),
+    "LoadImageMask": frozenset({"image"}),
+    "LoadImageOutput": frozenset({"image"}),
+    "LoadVideo": frozenset({"file"}),
+    "LoadAudio": frozenset({"audio"}),
+    "Load3D": frozenset({"model_file"}),
+    "WebcamCapture": frozenset({"image"}),
+}
+# The most files a folder loader's folder attaches, so the plan stays quick to make and to show.
+# The artist can add a bigger folder in the panel.
+MAX_FOLDER_FILES = 10_000
+
 # folder_paths.folder_names_and_paths maps a folder type to (directories, extensions).
 ModelFolders = Mapping[str, Sequence[Any]]
 
@@ -53,9 +84,64 @@ logger = logging.getLogger(__name__)
 class LocalAssets:
     filenames: list[Path] = field(default_factory=list)
     directories: list[Path] = field(default_factory=list)
+    # What the workflow names but isn't attached, and why, for the panel to show.
+    warnings: list[str] = field(default_factory=list)
 
     def __bool__(self) -> bool:
         return bool(self.filenames or self.directories)
+
+
+def workflow_file_inputs(
+    workflow: Mapping[str, Any], node_classes: Mapping[str, Any]
+) -> dict[str, frozenset[str]]:
+    """
+    The file inputs of each node type in the workflow, by node type, as its ComfyUI node
+    definition marks them. node_classes is ComfyUI's nodes.NODE_CLASS_MAPPINGS. Node types
+    without file inputs, or whose definition can't be read, are left out.
+    """
+    class_types = {
+        node.get("class_type") for node in workflow.values() if isinstance(node, Mapping)
+    }
+    found: dict[str, frozenset[str]] = {}
+    for class_type in sorted(name for name in class_types if isinstance(name, str)):
+        names = node_file_inputs(node_classes.get(class_type))
+        if names:
+            found[class_type] = names
+    return found
+
+
+def node_file_inputs(node_class: Any) -> frozenset[str]:
+    """
+    The inputs that a node class's INPUT_TYPES marks as files: an upload widget, such as
+    LoadImage's image, or a capture widget, such as WebcamCapture's. Each input is (type,
+    options), in its "required" or "optional" inputs. A definition that can't be read has none.
+    """
+    if node_class is None:
+        return frozenset()
+    try:
+        definition = node_class.INPUT_TYPES()
+        names = set()
+        for group in ("required", "optional"):
+            inputs = definition.get(group) if isinstance(definition, Mapping) else None
+            for name, spec in inputs.items() if isinstance(inputs, Mapping) else ():
+                if isinstance(name, str) and _is_file_input(spec):
+                    names.add(name)
+    except Exception as e:  # noqa: BLE001 - one node's definition mustn't stop the plan.
+        # Any node's definition can fail, such as a custom node's that lists a missing folder.
+        # Its inputs then aren't attached, which the job's own error makes clear.
+        label = getattr(node_class, "__name__", type(node_class).__name__)
+        logger.warning("Couldn't read the inputs of node %s: %s", _shown(label), _shown(e))
+        return frozenset()
+    return frozenset(names)
+
+
+def _is_file_input(spec: Any) -> bool:
+    if not isinstance(spec, (tuple, list)) or not spec:
+        return False
+    if isinstance(spec[0], str) and spec[0] in CAPTURE_INPUT_TYPES:
+        return True
+    options = spec[1] if len(spec) > 1 else None
+    return isinstance(options, Mapping) and any(options.get(key) is True for key in UPLOAD_OPTIONS)
 
 
 def get_local_assets(
@@ -64,37 +150,115 @@ def get_local_assets(
     input_dir: str | os.PathLike[str],
     output_dir: str | os.PathLike[str] | None = None,
     temp_dir: str | os.PathLike[str] | None = None,
+    file_inputs: Mapping[str, Collection[str]] | None = None,
 ) -> LocalAssets:
     """
-    Returns the existing local files that the workflow's literal input values refer to. A value
-    counts when it names a media file that exists in the input directory, such as a LoadImage's
-    image, or an absolute path to a media file. Model files are left out of this scan.
+    Returns the existing local files the workflow loads: the files its file inputs name, such as
+    a LoadImage's image, and the files in the folders its folder loaders read. file_inputs is by
+    node type, as workflow_file_inputs finds them. Without it, the inputs of ComfyUI's own
+    loaders in CORE_FILE_INPUTS are read.
 
-    Values that link to another node's output are ignored, and so are custom nodes.
+    No other input is read, so a prompt, or any other text in a shared workflow, can't attach a
+    file by naming it. A file input names a media file in ComfyUI's input folder, such as
+    "fox.png" or "cats/fox.png", or with "[input]", "[output]" or "[temp]", any file in that
+    folder. An absolute path isn't attached: the artist can add files from anywhere in the panel.
+    Neither is a file or a folder's entry that leads out of its folder through a link. Each of
+    those adds a warning. Model files are left out of this scan.
     """
+    base = Path(os.path.abspath(input_dir))
     resolver = _Resolver(
-        input_dir=Path(input_dir),
-        annotated_dirs={
-            "input": Path(input_dir),
-            "output": Path(output_dir) if output_dir else None,
-            "temp": Path(temp_dir) if temp_dir else None,
-        },
+        {
+            "input": base,
+            "output": Path(os.path.abspath(output_dir)) if output_dir else None,
+            "temp": Path(os.path.abspath(temp_dir)) if temp_dir else None,
+        }
     )
+    file_inputs = CORE_FILE_INPUTS if file_inputs is None else file_inputs
 
     filenames: set[Path] = set()
-    directories: set[Path] = set()
-    for value in _literal_strings(workflow):
-        try:
-            resolved = resolver.resolve(value)
-        except (OSError, ValueError):
-            # An over-long or otherwise invalid path can't be one of the workflow's files.
+    warnings: list[str] = []
+    for node_id, node in workflow.items():
+        inputs = node.get("inputs") if isinstance(node, Mapping) else None
+        class_type = node.get("class_type") if isinstance(node, Mapping) else None
+        if not isinstance(inputs, Mapping) or not isinstance(class_type, str):
             continue
-        if resolved is None:
-            continue
-        path, is_directory = resolved
-        (directories if is_directory else filenames).add(path)
+        for name in sorted(file_inputs.get(class_type, ())):
+            value = inputs.get(name)
+            # A link to another node's output is a list.
+            if not isinstance(value, str):
+                continue
+            try:
+                path, problem = resolver.resolve(value)
+            except (OSError, ValueError):
+                # An over-long or otherwise invalid path can't be one of the workflow's files.
+                continue
+            if path is not None:
+                filenames.add(path)
+            elif problem:
+                warnings.append(
+                    f"Node {_shown(node_id)} loads {_shown(value)!r}, which {problem}, so it "
+                    "isn't attached. Add it with Add files… if the job needs it."
+                )
 
-    return LocalAssets(sorted(filenames), sorted(directories))
+    # Job attachments would upload what every link in a folder points to, so a folder is
+    # attached as the files in it that stay in the input folder.
+    root = real_path(base)
+    for folder in input_folders(workflow, base, warnings):
+        shown = _shown(folder.relative_to(base).as_posix())
+        files, outside = _folder_files(folder, root)
+        if files is None:
+            warnings.append(
+                f"The folder {shown!r} has more than {MAX_FOLDER_FILES:,} files, so it isn't "
+                "attached. Add it with Add folder… if the job needs it."
+            )
+            continue
+        filenames.update(files)
+        if outside:
+            names = [_shown(path.relative_to(folder).as_posix()) for path in outside]
+            more = f", and {len(names) - 5} more" if len(names) > 5 else ""
+            warnings.append(
+                f"Entries in the folder {shown!r} that link outside ComfyUI's input folder "
+                f"aren't attached: {', '.join(names[:5])}{more}."
+            )
+
+    return LocalAssets(sorted(filenames), [], list(dict.fromkeys(warnings)))
+
+
+def _folder_files(folder: Path, root: Path) -> tuple[list[Path] | None, list[Path]]:
+    """
+    The files in a folder loader's folder and its subfolders, and the entries that lead out of
+    root, the real path of ComfyUI's input folder. The files are None when there are more than
+    MAX_FOLDER_FILES. Every entry is resolved, not only symbolic links, since Python doesn't
+    count a Windows directory junction as one. A link to a folder in the input folder isn't
+    followed, so walking can't loop. A link to a file in it is attached under its own name.
+    """
+    files: list[Path] = []
+    outside: list[Path] = []
+    pending = [folder]
+    while pending:
+        directory = pending.pop()
+        try:
+            real_directory = os.path.realpath(directory)
+            with os.scandir(directory) as entries:
+                names = sorted(entry.name for entry in entries)
+        except (OSError, ValueError):
+            continue
+        for name in names:
+            path = directory / name
+            try:
+                real = real_path(path)
+            except (OSError, ValueError):
+                continue
+            if not real.is_relative_to(root):
+                outside.append(path)
+            elif real.is_dir():
+                if str(real) == os.path.join(real_directory, name):
+                    pending.append(path)
+            elif real.is_file():
+                files.append(path)
+                if len(files) > MAX_FOLDER_FILES:
+                    return None, outside
+    return sorted(files), sorted(outside)
 
 
 def write_asset_references(assets: LocalAssets, path: Path) -> Path:
@@ -771,60 +935,60 @@ def _search_local_models(
     return []
 
 
-def _literal_strings(workflow: Mapping[str, Any]) -> Iterable[str]:
-    """Yields every string input value. A link to another node is a list, so it's skipped."""
-    for node in workflow.values():
-        inputs = node.get("inputs") if isinstance(node, Mapping) else None
-        if not isinstance(inputs, Mapping):
-            continue
-        for value in inputs.values():
-            if isinstance(value, str):
-                yield value
+def _shown(value: Any, length: int = 60) -> str:
+    """
+    A value from the workflow for a message, on one line. A long one keeps its end, so a path
+    keeps its file name.
+    """
+    text = re.sub(r"[\s\x00-\x1f\x7f-\x9f]+", " ", str(value)).strip()
+    return text if len(text) <= length else "…" + text[-(length - 1) :]
 
 
 class _Resolver:
-    def __init__(
-        self,
-        input_dir: Path,
-        annotated_dirs: Mapping[str, Path | None],
-    ):
-        self._input_dir = input_dir
-        self._annotated_dirs = annotated_dirs
+    """Finds the file that a file input's value names, in ComfyUI's input, output or temp folder."""
 
-    def resolve(self, value: str) -> tuple[Path, bool] | None:
-        """Returns the (path, is_directory) that a value refers to, or None."""
+    def __init__(self, roots: Mapping[str, Path | None]):
+        self._roots = roots
+        self._real_roots: dict[str, Path] = {}
 
-        def accept(path: Path | None, is_directory: bool) -> tuple[Path, bool] | None:
-            if path is None:
-                return None
-            return path, is_directory
+    def _real_root(self, kind: str, root: Path) -> Path:
+        # Resolved, so a ComfyUI whose input folder is itself a link, such as to another disk,
+        # still attaches the files in it.
+        if kind not in self._real_roots:
+            self._real_roots[kind] = real_path(root)
+        return self._real_roots[kind]
 
+    def resolve(self, value: str) -> tuple[Path | None, str | None]:
+        """
+        The file a value names, or None, with why it isn't attached when the artist should know.
+        """
         if len(value) > _MAX_VALUE_LENGTH or "\n" in value or "\0" in value:
-            return None
+            return None, None
 
         annotated = _ANNOTATED.fullmatch(value)
-        if annotated:
-            base = self._annotated_dirs[annotated["directory"]]
-            path = self._contained(base, annotated["name"]) if base else None
-            return accept(path if path is not None and path.is_file() else None, False)
+        kind, name = (annotated["directory"], annotated["name"]) if annotated else ("input", value)
+        name = name.strip()
+        # Refused before anything is read from the disk. On Windows, checking a UNC
+        # (\\server\share) or device (\\?\, \\.\) path contacts that server or device, which can
+        # send the user's credentials to a host that a downloaded workflow names. An absolute
+        # path can name any file on the disk: the artist adds those in the panel.
+        if _NETWORK_PATH.match(name) or PurePath(name).is_absolute():
+            return None, "isn't in ComfyUI's input, output or temp folder"
+        # ComfyUI's loaders only list media files in the input folder.
+        if not annotated and PurePath(name).suffix.lower() not in MEDIA_EXTENSIONS:
+            return None, None
 
-        name = value.strip()
-        if _NETWORK_PATH.match(name):
-            # On Windows, checking a UNC (\\server\share) or device (\\?\, \\.\) path contacts
-            # that server or device, which can send the user's credentials to a host that a
-            # downloaded workflow names.
-            return None
-        if Path(name).is_absolute():
-            path = Path(os.path.normpath(name))
-            if path.suffix.lower() in MEDIA_EXTENSIONS and path.is_file():
-                return accept(path, False)
-            return None
-
-        if Path(name).suffix.lower() in MEDIA_EXTENSIONS:
-            path = self._contained(self._input_dir, name)
-            if path is not None and path.is_file():
-                return accept(path, False)
-        return None
+        root = self._roots.get(kind)
+        if root is None:
+            return None, None
+        path = self._contained(root, name)
+        if path is None:
+            return None, f"isn't in ComfyUI's {kind} folder"
+        if not path.is_file():
+            return None, None
+        if not leads_inside(path, self._real_root(kind, root)):
+            return None, f"links outside ComfyUI's {kind} folder"
+        return path, None
 
     @staticmethod
     def _contained(directory: Path, name: str) -> Path | None:

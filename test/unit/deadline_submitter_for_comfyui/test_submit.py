@@ -577,6 +577,42 @@ def test_input_folders(tmp_path):
     assert submit.input_folders(workflow, input_dir) == [input_dir / "cats"]
 
 
+def _symlink(link: Path, target: Path) -> None:
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(target, target_is_directory=target.is_dir())
+    except OSError:
+        pytest.skip("This system can't create symbolic links.")
+
+
+def test_input_folders_leave_out_a_folder_that_links_outside(tmp_path):
+    input_dir = _input_dir(tmp_path)
+    (tmp_path / "Documents").mkdir()
+    _symlink(input_dir / "documents", tmp_path / "Documents")
+    _symlink(input_dir / "kittens", input_dir / "cats")
+    workflow = {
+        "1": {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": "documents"}},
+        "2": {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": "kittens"}},
+    }
+    warnings: list[str] = []
+    # A link to another folder in the input directory is kept.
+    assert submit.input_folders(workflow, input_dir, warnings) == [input_dir / "kittens"]
+    assert warnings == [
+        (
+            "Node 1 loads the folder 'documents', which links outside ComfyUI's input folder, so "
+            "it isn't attached. Add it with Add folder… if the job needs it."
+        )
+    ]
+
+
+def test_input_folders_follow_an_input_directory_that_is_a_link(tmp_path):
+    disk = _input_dir(tmp_path / "disk")
+    input_dir = tmp_path / "ComfyUI" / "input"
+    _symlink(input_dir, disk)
+    workflow = {"1": {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": "cats"}}}
+    assert submit.input_folders(workflow, input_dir) == [input_dir / "cats"]
+
+
 @pytest.mark.parametrize(
     ("platform", "kind", "program", "expected"),
     [
@@ -888,8 +924,20 @@ def test_image_files(tmp_path):
     for name in ("b.PNG", "a.webp", "c.txt"):
         (tmp_path / name).write_text("x")
     (tmp_path / "d.jpg").mkdir()
-    assert submit.image_files(tmp_path) == ["a.webp", "b.PNG"]
-    assert submit.image_files(tmp_path / "missing") == []
+    root = submit.real_path(tmp_path)
+    assert submit.image_files(tmp_path, root) == ["a.webp", "b.PNG"]
+    assert submit.image_files(tmp_path / "missing", root) == []
+
+
+def test_image_files_leave_out_images_that_link_outside_the_input_directory(tmp_path):
+    input_dir = _input_dir(tmp_path)
+    secret = tmp_path / "Documents" / "passport.jpg"
+    secret.parent.mkdir()
+    secret.write_bytes(b"x")
+    _symlink(input_dir / "cats" / "passport.jpg", secret)
+    _symlink(input_dir / "cats" / "fox.png", input_dir / "fox.png")
+    root = submit.real_path(input_dir)
+    assert submit.image_files(input_dir / "cats", root) == ["a.png", "b.jpg", "fox.png"]
 
 
 def test_plan_task_lists_for_folder_loaders(tmp_path):
@@ -904,6 +952,34 @@ def test_plan_task_lists_for_folder_loaders(tmp_path):
     }
     # Without the input directory, such as in a test, folders aren't split.
     assert plan_task_lists(workflow).sources == []
+
+
+def test_folder_items_never_name_a_file_outside_the_input_directory(tmp_path):
+    """The task script loads each item, so one that links out can't be one, as it isn't attached."""
+    input_dir = _input_dir(tmp_path)
+    documents = tmp_path / "Documents"
+    documents.mkdir()
+    for name in ("passport.jpg", "visa.png"):
+        (documents / name).write_bytes(b"x")
+    _symlink(input_dir / "cats" / "passport.jpg", documents / "passport.jpg")
+    _symlink(input_dir / "documents", documents)
+    workflow = {
+        "3": {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": "cats"}},
+        "4": {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": "documents"}},
+    }
+    plan = plan_task_lists(workflow, input_dir)
+    assert [source.node_id for source in plan.sources] == ["3"]
+    assert _marked(plan, "3")[submit.FILES_META] == ["cats/a.png", "cats/b.jpg"]
+    assert submit.FILES_META not in plan.workflow["4"].get("_meta", {})
+
+
+def test_folder_items_in_an_input_directory_that_is_a_link(tmp_path):
+    disk = _input_dir(tmp_path / "disk")
+    input_dir = tmp_path / "ComfyUI" / "input"
+    _symlink(input_dir, disk)
+    workflow = {"3": {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": "cats"}}}
+    plan = plan_task_lists(workflow, input_dir)
+    assert _marked(plan, "3")[submit.FILES_META] == ["cats/a.png", "cats/b.jpg"]
 
 
 def test_plan_task_lists_drops_the_workflows_own_submitter_keys(tmp_path):
