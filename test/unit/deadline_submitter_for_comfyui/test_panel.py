@@ -301,6 +301,8 @@ def test_the_panel_has_the_submitters_task_limit(run_scenario):
     result = run_scenario("task-limit")
     assert result == {
         "maxTasks": submit.MAX_TASKS,
+        # As one task, the lists run whole, however many items they have.
+        "canSubmitOneTask": True,
         # 100 × 101 tasks is over the limit, and 100 × 100 is the limit.
         "canSubmitOverLimit": False,
         "canSubmitAtLimit": True,

@@ -748,10 +748,11 @@ function uncheckedTaskCount() {
   return sources.length ? taskCount(sources, itemsValue) : 1;
 }
 
-// The number of tasks, or null when a field has an error or there are more than MAX_TASKS.
+// The number of tasks, or null when a field has an error or there are more than MAX_TASKS. One task
+// is never over the limit: fieldCount counts every list as 1 unless the lists are split.
 function currentTaskCount() {
   const total = uncheckedTaskCount();
-  return total !== null && total > MAX_TASKS ? null : total;
+  return splitsTasks() && total !== null && total > MAX_TASKS ? null : total;
 }
 
 // Why the job can't be submitted with this many tasks, if it can't.

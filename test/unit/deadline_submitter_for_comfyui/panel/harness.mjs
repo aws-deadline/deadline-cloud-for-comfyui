@@ -497,7 +497,6 @@ if (scenario === "task-limit") {
     count,
     range: `1-${count}`,
   });
-  ui.setSplit(true);
   state.plan.sources = [source("List1", 100), source("List2", 101)];
   state.plan.parameters = state.plan.sources.map(({ parameter, range }) => ({
     name: parameter,
@@ -506,6 +505,10 @@ if (scenario === "task-limit") {
     userInterface: { groupLabel: "Tasks" },
   }));
   result.maxTasks = ui.MAX_TASKS;
+  // One task, the default, runs the lists whole, so their items don't multiply.
+  ui.setSplit(false);
+  result.canSubmitOneTask = Boolean(ui.canSubmit());
+  ui.setSplit(true);
   result.canSubmitOverLimit = Boolean(ui.canSubmit());
   state.edits.List2Items = "1-100";
   result.canSubmitAtLimit = Boolean(ui.canSubmit());
