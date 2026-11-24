@@ -10,6 +10,7 @@ import yaml
 
 from deadline.comfyui_submitter.get_local_assets import (
     CORE_FILE_INPUTS,
+    FileInputs,
     LocalAssets,
     NodePackSize,
     _search_local_models,
@@ -100,20 +101,41 @@ def test_reads_only_file_inputs(comfy, tmp_path):
         "4": node("LoadImage", image=["5", 0], upload="fox.png"),
         "5": node("StringConstant", string="fox.png [input]"),
     }
-    assert assets(workflow, comfy) == LocalAssets([], [])
+    found = assets(workflow, comfy)
+    assert not found
+    # The files they name aren't attached, and the artist is told so.
+    assert found.warnings == [
+        (
+            "These inputs hold file paths, which aren't attached: node 1's text, node 2's text, "
+            "node 3's filename_prefix, node 4's upload, node 5's string. Add the files with Add "
+            "files… if the job needs them."
+        )
+    ]
 
 
-def test_ignores_missing_files_and_unknown_extensions(comfy):
+def test_ignores_missing_files_and_models(comfy):
     touch(comfy["checkpoints"] / "notes.txt")
-    touch(comfy["input"] / "data.csv")
+    touch(comfy["input"] / "notes.txt")
+    # Model discovery attaches models, with or without an annotation.
+    touch(comfy["input"] / "m.ckpt")
     workflow = {
         "1": node("CheckpointLoaderSimple", ckpt_name="notes.txt"),
         "2": load_image("missing.png"),
         "3": node("CheckpointLoaderSimple", ckpt_name="gone.ckpt"),
-        "4": node("LoadVideo", file="data.csv"),
+        "4": node("LoadVideo", file="m.ckpt [input]"),
         "5": load_image("notes.png"),
     }
     assert assets(workflow, comfy) == LocalAssets([], [])
+
+
+def test_attaches_any_file_a_file_input_names(comfy):
+    """ComfyUI lists a loader's files by MIME type, so a file input's extension isn't checked."""
+    names = ["clip.mpg", "phone.3gp", "take.aiff", "photo.jfif", "scan.splat", "data.csv"]
+    files = [touch(comfy["input"] / name) for name in names]
+    out = touch(comfy["output"] / "render.ksplat")
+    workflow = {str(n): node("LoadVideo", file=name) for n, name in enumerate(names)}
+    workflow["9"] = load_image("render.ksplat [output]")
+    assert assets(workflow, comfy) == LocalAssets(sorted([*files, out]), [])
 
 
 def test_annotated_values(comfy):
@@ -159,10 +181,20 @@ def test_never_attaches_absolute_paths(comfy, tmp_path):
     assert len(found.warnings) == 2
     assert found.warnings[0].startswith("Node 1 loads '")
     assert found.warnings[0].endswith(
-        "v.mov', which isn't in ComfyUI's input, output or temp folder, so it isn't attached. "
-        "Add it with Add files… if the job needs it."
+        "v.mov', which is an absolute path, so it isn't attached automatically. Add it with Add "
+        "files… if the job needs it."
     )
     assert found.warnings[1].startswith("Node 2 loads '")
+    assert "fox.png [input]', which is an absolute path" in found.warnings[1]
+
+
+@pytest.mark.parametrize("value", [r"C:\Users\me\fox.png", "D:/fox.png", r"\fox.png"])
+def test_never_attaches_absolute_windows_paths(comfy, value):
+    """A workflow made on Windows names the same absolute paths when it's submitted elsewhere."""
+    found = assets({"1": load_image(value)}, comfy)
+    assert not found
+    [warning] = found.warnings
+    assert "which is an absolute path, so it isn't attached automatically." in warning
 
 
 @pytest.mark.parametrize(
@@ -256,7 +288,10 @@ def test_attaches_from_an_input_folder_that_is_a_link(tmp_path):
     }
     found = get_local_assets(workflow, input_dir=input_dir, file_inputs=FILE_INPUTS)
     # Attached as the paths ComfyUI uses, which the job's input directory maps.
-    assert found == LocalAssets([input_dir / "cats" / "a.png", input_dir / "fox.png"], [])
+    cat = input_dir / "cats" / "a.png"
+    assert found == LocalAssets(
+        [cat, input_dir / "fox.png"], [], folders={input_dir / "cats": [cat]}
+    )
 
 
 def test_folder_loaders_attach_the_files_that_stay_in_the_input_folder(comfy, tmp_path):
@@ -298,17 +333,62 @@ def test_folder_loaders_refuse_a_folder_that_links_out(comfy, tmp_path):
 
 
 def test_folder_loaders_leave_a_huge_folder_to_the_artist(comfy, monkeypatch):
-    monkeypatch.setattr("deadline.comfyui_submitter.get_local_assets.MAX_FOLDER_FILES", 2)
+    monkeypatch.setattr("deadline.comfyui_submitter.submit.MAX_FOLDER_FILES", 2)
     for name in ("a.png", "b.png", "c.png"):
         touch(comfy["input"] / "cats" / name)
     found = assets({"1": node("LoadImageDataSetFromFolder", folder="cats")}, comfy)
     assert not found
+    assert found.folders == {}
     assert found.warnings == [
         (
             "The folder 'cats' has more than 2 files, so it isn't attached. Add it with Add "
             "folder… if the job needs it."
         )
     ]
+
+
+def test_folder_loaders_read_a_bounded_number_of_entries_in_all(comfy, monkeypatch):
+    """Folders of empty folders, or of links that lead out, have no files to count."""
+    monkeypatch.setattr("deadline.comfyui_submitter.submit.MAX_FOLDER_ENTRIES", 5)
+    for index in range(4):
+        (comfy["input"] / "a_empty" / str(index)).mkdir(parents=True)
+    kept = touch(comfy["input"] / "b_one" / "a.png")
+    for name in ("a.png", "b.png"):
+        touch(comfy["input"] / "c_two" / name)
+    workflow = {
+        "1": node("LoadImageTextDataSetFromFolder", folder="a_empty"),
+        "2": node("LoadVideoDataSetFromFolder", folder="b_one"),
+        "3": node("LoadVideoTextDataSetFromFolder", folder="c_two"),
+    }
+    found = assets(workflow, comfy)
+    # The folders are read in name order, and the first two read all five entries.
+    assert found.filenames == [kept]
+    assert found.folders == {comfy["input"] / "a_empty": [], comfy["input"] / "b_one": [kept]}
+    assert found.warnings == [
+        (
+            "The folder 'c_two' takes the workflow's folders past 5 entries, so it isn't "
+            "attached. Add it with Add folder… if the job needs it."
+        )
+    ]
+
+
+def test_folders_group_the_files_attached_from_each(comfy):
+    """The panel shows each folder as one row. Its files are in filenames too."""
+    cats = [touch(comfy["input"] / "cats" / name) for name in ("b.png", "a.png", "2_x/c.png")]
+    dogs = touch(comfy["input"] / "dogs" / "d.png")
+    fox = touch(comfy["input"] / "fox.png")
+    workflow = {
+        "1": node("LoadImageDataSetFromFolder", folder="dogs"),
+        "2": node("LoadImageTextDataSetFromFolder", folder="./cats/"),
+        "3": node("LoadImageDataSetFromFolder", folder="cats"),
+        "4": load_image("fox.png"),
+    }
+    found = assets(workflow, comfy)
+    assert found.filenames == sorted([*cats, dogs, fox])
+    # By the folder's path in the input folder, once however many loaders read it.
+    assert found.folders == {comfy["input"] / "cats": sorted(cats), comfy["input"] / "dogs": [dogs]}
+    assert list(found.folders) == [comfy["input"] / "cats", comfy["input"] / "dogs"]
+    assert LocalAssets().folders == {}
 
 
 def test_tolerates_odd_values(comfy):
@@ -330,7 +410,14 @@ def test_deduplicates(comfy):
 def test_reads_comfyuis_own_loaders_without_node_definitions(comfy):
     image = touch(comfy["input"] / "cat.png")
     workflow = {"1": load_image("cat.png"), "2": node("Custom", image="cat.png")}
-    assert get_local_assets(workflow, input_dir=comfy["input"]) == LocalAssets([image], [])
+    found = get_local_assets(workflow, input_dir=comfy["input"])
+    assert found.filenames == [image]
+    assert found.warnings == [
+        (
+            "Node 2's image input holds a file path, which isn't attached. Add it with Add "
+            "files… if the job needs it."
+        )
+    ]
     assert CORE_FILE_INPUTS["LoadImage"] == {"image"}
 
 
@@ -407,8 +494,167 @@ def test_workflow_file_inputs_finds_each_node_types_file_inputs(comfy, caplog):
     node_classes = {"UploadLoader": UploadLoader, "TextNode": TextNode, "BrokenNode": BrokenNode}
     file_inputs = workflow_file_inputs(workflow, node_classes)
     assert file_inputs == {"UploadLoader": UPLOAD_INPUTS}
+    # Its other combo, with its choices. An upload widget's value needn't be one of its choices.
+    loader = file_inputs["UploadLoader"]
+    assert isinstance(loader, FileInputs) and loader.choices == {"mode": {"a", "b"}}
     assert "Couldn't read the inputs of node BrokenNode: its folder is missing" in caplog.text
-    assert assets(workflow, comfy, file_inputs) == LocalAssets([image], [])
+    found = assets(workflow, comfy, file_inputs)
+    assert found.filenames == [image]
+    assert found.warnings == [
+        (
+            "These inputs hold file paths, which aren't attached: node 1's note, node 2's "
+            "text, node 3's image, node 4's image. Add the files with Add files… if the job "
+            "needs them."
+        )
+    ]
+
+
+class VideoLoader:
+    """A custom loader, such as Video Helper Suite's, that adds its upload button in JavaScript."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {"video": (["clip.mp4", "other.mp4"],), "force_rate": ("FLOAT", {})},
+            # As a V3 node's combo is defined.
+            "optional": {"mesh": ("COMBO", {"options": ["3d/scan.splat", "none"]})},
+        }
+
+
+class Unused:
+    @classmethod
+    def INPUT_TYPES(cls):
+        raise AssertionError("A node type the workflow doesn't use is never read.")
+
+
+def video_assets(workflow, comfy):
+    classes = {"VideoLoader": VideoLoader, "Unused": Unused}
+    return assets(workflow, comfy, workflow_file_inputs(workflow, classes))
+
+
+def test_attaches_a_combos_value_when_its_one_of_the_choices(comfy):
+    clip = touch(comfy["input"] / "clip.mp4")
+    scan = touch(comfy["input"] / "3d" / "scan.splat")
+    touch(comfy["input"] / "third.mp4")
+    workflow = {
+        "1": node("VideoLoader", video="clip.mp4", mesh="3d/scan.splat"),
+        # Not one of the choices, so not a file, even though the input folder has it.
+        "2": node("VideoLoader", video="third.mp4", mesh="none", force_rate="0"),
+        "3": node("VideoLoader", video="other.mp4"),
+    }
+    found = video_assets(workflow, comfy)
+    assert found.filenames == [scan, clip]
+    # A value ComfyUI would refuse holds a path, which the artist is told isn't attached.
+    assert found.warnings == [
+        (
+            "Node 2's video input holds a file path, which isn't attached. Add it with Add "
+            "files… if the job needs it."
+        )
+    ]
+
+
+def test_a_combos_value_stays_in_comfyuis_folders(comfy, tmp_path):
+    """A choice that leads out of the input folder isn't attached, as a file input's isn't."""
+
+    class Outward:
+        @classmethod
+        def INPUT_TYPES(cls):
+            choices = ["../secret.mp4", "/etc/hosts", "link.mp4", "render.mp4 [output]"]
+            return {"required": {"video": (choices,)}}
+
+    touch(comfy["input"].parent / "secret.mp4")
+    _symlink(comfy["input"] / "link.mp4", touch(tmp_path / "home" / "clip.mp4"))
+    render = touch(comfy["output"] / "render.mp4")
+    values = ["../secret.mp4", "/etc/hosts", "link.mp4", "render.mp4 [output]"]
+    workflow = {str(n): node("Outward", video=value) for n, value in enumerate(values)}
+    found = assets(workflow, comfy, workflow_file_inputs(workflow, {"Outward": Outward}))
+    assert found.filenames == [render]
+    assert [warning.split("', which ")[1].split(".")[0] for warning in found.warnings] == [
+        "isn't in ComfyUI's input folder, so it isn't attached",
+        "is an absolute path, so it isn't attached automatically",
+        "links outside ComfyUI's input folder, so it isn't attached",
+    ]
+
+
+def test_a_combo_with_choices_that_arent_strings_isnt_a_file_input():
+    class Numbers:
+        @classmethod
+        def INPUT_TYPES(cls):
+            return {
+                "required": {
+                    "scale": ([1, 2, 4],),
+                    "mixed": (["fox.png", 3],),
+                    "empty": ([],),
+                    "tuple": (("fox.png",),),
+                    "v3": ("COMBO", {"options": "fox.png"}),
+                }
+            }
+
+    assert node_file_inputs(Numbers).choices == {}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "/home/me/clips/run.mp4",
+        r"C:\Users\me\clips",
+        r"\\studio\share\plates",
+        "~/plates",
+        "/mnt/plates",
+        "clips/run.mpg",
+        "scan.splat",
+        "run.mp4 [input]",
+    ],
+)
+def test_a_text_input_that_holds_a_file_path_gets_a_warning(comfy, value, monkeypatch):
+    touch(comfy["input"] / "clips" / "run.mpg")
+    checked: list[Path] = []
+
+    def is_file(self: Path) -> bool:
+        checked.append(self)
+        return True
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+    found = assets({"12": node("VHS_LoadVideoPath", video=value)}, comfy)
+    assert not found
+    assert found.warnings == [
+        (
+            "Node 12's video input holds a file path, which isn't attached. Add it with Add "
+            "files… if the job needs it."
+        )
+    ]
+    # The disk isn't checked.
+    assert checked == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://example.test/clip.mp4",
+        "s3://bucket/clip.mp4",
+        "sd/v1-5.safetensors",
+        r"C:\models\lora.pt",
+        "renders/shot",
+        "/imagine a fox",
+        "a fox, 1/2 lit",
+        "a fox\non clip.mp4",
+        "/",
+        "",
+    ],
+)
+def test_text_that_isnt_a_media_path_gets_no_warning(comfy, value):
+    """Model discovery finds models, a node downloads a URL, and the rest is text."""
+    assert assets({"1": node("Text", text=value)}, comfy).warnings == []
+
+
+def test_the_warning_about_paths_stays_short(comfy):
+    workflow = {str(n): node("VHS_LoadVideoPath", video=f"/clips/{n}.mp4") for n in range(1000)}
+    [warning] = assets(workflow, comfy).warnings
+    assert warning == (
+        "These inputs hold file paths, which aren't attached: node 0's video, node 1's video, "
+        "node 2's video, node 3's video, node 4's video, and 995 more. Add the files with Add "
+        "files… if the job needs them."
+    )
 
 
 def test_asset_references_yaml_format(tmp_path):

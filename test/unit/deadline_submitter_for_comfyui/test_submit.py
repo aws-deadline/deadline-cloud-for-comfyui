@@ -920,13 +920,25 @@ def test_create_job_bundle_adds_task_lists_to_json_templates(tmp_path):
     assert written == submit.add_task_lists(json.loads(template.read_text()), SOURCES)
 
 
+def _folder(name: str) -> dict[str, Any]:
+    return {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": name}}
+
+
+def _images(input_dir: Path, name: str) -> list[str]:
+    """The images that a folder loader's folder splits into, as plan_task_lists finds them."""
+    listed = submit.list_input_folders({"1": _folder(name)}, input_dir)
+    return submit.folder_images(input_dir / name, listed[input_dir / name].files)
+
+
 def test_image_files(tmp_path):
-    for name in ("b.PNG", "a.webp", "c.txt"):
-        (tmp_path / name).write_text("x")
-    (tmp_path / "d.jpg").mkdir()
-    root = submit.real_path(tmp_path)
-    assert submit.image_files(tmp_path, root) == ["a.webp", "b.PNG"]
-    assert submit.image_files(tmp_path / "missing", root) == []
+    input_dir = tmp_path / "input"
+    for name in ("b.PNG", "a.webp", "c.txt", "sub/e.png"):
+        (input_dir / "cats" / name).parent.mkdir(parents=True, exist_ok=True)
+        (input_dir / "cats" / name).write_text("x")
+    (input_dir / "cats" / "d.jpg").mkdir()
+    # The images in the folder itself, though the files of its subfolders are attached too.
+    assert _images(input_dir, "cats") == ["a.webp", "b.PNG"]
+    assert submit.list_input_folders({"1": _folder("missing")}, input_dir) == {}
 
 
 def test_image_files_leave_out_images_that_link_outside_the_input_directory(tmp_path):
@@ -936,8 +948,116 @@ def test_image_files_leave_out_images_that_link_outside_the_input_directory(tmp_
     secret.write_bytes(b"x")
     _symlink(input_dir / "cats" / "passport.jpg", secret)
     _symlink(input_dir / "cats" / "fox.png", input_dir / "fox.png")
-    root = submit.real_path(input_dir)
-    assert submit.image_files(input_dir / "cats", root) == ["a.png", "b.jpg", "fox.png"]
+    assert _images(input_dir, "cats") == ["a.png", "b.jpg", "fox.png"]
+
+
+def test_folder_loaders_include_the_video_dataset_loaders():
+    """Each loads its folder from ComfyUI's input folder, so the folder is attached."""
+    assert set(submit.FOLDER_INPUT_NODES) == {
+        "LoadImageDataSetFromFolder",
+        "LoadImageTextDataSetFromFolder",
+        "LoadVideoDataSetFromFolder",
+        "LoadVideoTextDataSetFromFolder",
+    }
+    # The task script splits only the images of LoadImageDataSetFromFolder.
+    assert submit.FOLDER_LOADERS == ("LoadImageDataSetFromFolder",)
+
+
+def test_a_folder_too_big_to_attach_isnt_split_into_tasks(tmp_path, monkeypatch):
+    """Its images aren't attached, so a task couldn't load them."""
+    monkeypatch.setattr(submit, "MAX_FOLDER_FILES", 3)
+    input_dir = _input_dir(tmp_path)
+    for name in ("a.png", "b.png", "c.png", "d.png"):
+        (input_dir / "dogs" / name).parent.mkdir(exist_ok=True)
+        (input_dir / "dogs" / name).write_bytes(b"x")
+    workflow = {"3": _folder("cats"), "4": _folder("dogs")}
+    plan = plan_task_lists(workflow, input_dir)
+    assert [source.node_id for source in plan.sources] == ["3"]
+    assert "_meta" not in plan.workflow["4"]
+    assert plan.warnings == [
+        "Folder dogs (#4) has more than 3 files, so it isn't attached or split into tasks."
+    ]
+    # Many are named in one short warning.
+    workflow = {str(n): _folder("dogs") for n in range(10, 20)}
+    [warning] = plan_task_lists(workflow, input_dir).warnings
+    assert warning == (
+        "These folders are too big to attach, so they aren't split into tasks: Folder dogs "
+        "(#10), Folder dogs (#11), Folder dogs (#12), Folder dogs (#13), Folder dogs (#14), and 5 "
+        "more."
+    )
+
+
+def test_folders_share_a_bounded_number_of_entries(tmp_path, monkeypatch):
+    """A folder of empty folders, or of links that lead out, has no files to count."""
+    monkeypatch.setattr(submit, "MAX_FOLDER_ENTRIES", 4)
+    input_dir = _input_dir(tmp_path)
+    for index in range(3):
+        (input_dir / "a_empty" / str(index)).mkdir(parents=True)
+    workflow = {
+        "1": {"class_type": "LoadImageTextDataSetFromFolder", "inputs": {"folder": "a_empty"}},
+        "3": _folder("cats"),
+    }
+    listed = submit.list_input_folders(workflow, input_dir)
+    assert listed[input_dir / "a_empty"] == submit.FolderFiles()
+    # cats is read second, in name order, with one entry left for its three.
+    assert listed[input_dir / "cats"] == submit.FolderFiles(
+        too_big="takes the workflow's folders past 4 entries"
+    )
+    # So the plan doesn't split what get_local_assets doesn't attach.
+    plan = plan_task_lists(workflow, input_dir)
+    assert plan.sources == []
+    assert plan.warnings == [
+        (
+            "Folder cats (#3) takes the workflow's folders past 4 entries, so it isn't attached or "
+            "split into tasks."
+        )
+    ]
+
+
+def test_folders_arent_listed_without_a_folder_loader_to_split(tmp_path, monkeypatch):
+    input_dir = _input_dir(tmp_path)
+    monkeypatch.setattr(submit, "list_input_folders", None)
+    workflow = {
+        "1": _create_list("2", "3"),
+        "4": {"class_type": "LoadImageTextDataSetFromFolder", "inputs": {"folder": "cats"}},
+    }
+    assert [source.node_id for source in plan_task_lists(workflow, input_dir).sources] == ["1"]
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        (r"\\?\C:\ComfyUI\input\cats\a.png", r"C:\ComfyUI\input\cats\a.png"),
+        (r"\\?\UNC\server\share\input\a.png", r"\\server\share\input\a.png"),
+        (r"\\?\unc\server\share", r"\\server\share"),
+        (r"C:\ComfyUI\input", r"C:\ComfyUI\input"),
+        (r"\\server\share\input", r"\\server\share\input"),
+        (r"\\.\pipe\name", r"\\.\pipe\name"),
+        ("/home/me/ComfyUI/input", "/home/me/ComfyUI/input"),
+        ("", ""),
+    ],
+)
+def test_without_long_path_prefix(path, expected):
+    """Windows' realpath adds \\\\?\\ to a long path, so a file in the input folder compares
+    as inside it."""
+    assert submit.without_long_path_prefix(path) == expected
+
+
+def test_a_long_path_in_the_input_folder_leads_inside_it(tmp_path, monkeypatch):
+    image = tmp_path / "input" / "cats" / "a.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"x")
+    root = submit.real_path(tmp_path / "input")
+    realpath = os.path.realpath
+
+    def long_realpath(path, *args, **kwargs):
+        # As Windows' realpath returns a path past MAX_PATH, while the root's is short.
+        return "\\\\?\\" + realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", long_realpath)
+    assert submit.leads_inside(image, root)
+    listed = submit.list_input_folders({"1": _folder("cats")}, tmp_path / "input")
+    assert listed[tmp_path / "input" / "cats"] == submit.FolderFiles([image])
 
 
 def test_plan_task_lists_for_folder_loaders(tmp_path):

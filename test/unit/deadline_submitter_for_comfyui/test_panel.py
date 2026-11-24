@@ -421,6 +421,75 @@ def test_both_views_show_what_the_job_attaches_next_to_submit(run_scenario):
     }
 
 
+FOLDER = "/input/cats"
+FOLDER_FILES = [f"{FOLDER}/cat-{index}.png" for index in range(5000)]
+LOOSE_FILES = ["/input/fox.png", "/input/mask.png", "/input/owl.png"]
+
+
+def test_a_folder_loaders_folder_is_one_row_until_it_is_opened(run_scenario):
+    """A dataset folder of thousands of files doesn't render a row for each until it's opened."""
+    result = run_scenario("attachment-folders")
+    collapsed = result["collapsed"]
+    assert collapsed["listed"] == [*LOOSE_FILES, FOLDER]
+    assert collapsed["folder"] == f"▸ {FOLDER} (5,000 files)✕"
+    assert collapsed["expanded"] == "false"
+    assert collapsed["title"] == "Attachments (4)"
+    opened = result["opened"]
+    assert opened["rows"] == 4 + 5000
+    assert opened["folder"].startswith(f"▾ {FOLDER} (5,000 files)")
+    assert opened["expanded"] == "true"
+    # Each file is listed by its path in the folder.
+    assert (opened["first"], opened["firstClass"]) == ("cat-0.png✕", "dl-nested")
+    assert result["closed"]["rows"] == 4
+    assert result["closed"]["expanded"] == "false"
+
+
+def test_one_click_removes_a_folder_and_add_back_restores_every_file(run_scenario):
+    result = run_scenario("attachment-folders")
+    removed = result["folderRemoved"]
+    assert removed["sent"] == {"filenames": LOOSE_FILES, "directories": []}
+    assert removed["folder"] == f"▸ {FOLDER} (5,000 files)Add back"
+    assert removed["folderClass"] == "dl-folder dl-removed"
+    assert removed["title"] == "Attachments (3)"
+    assert removed["rows"] == 4
+    restored = result["folderRestored"]
+    assert restored["sent"] == {"filenames": [*LOOSE_FILES, *FOLDER_FILES], "directories": []}
+    assert restored["folderClass"] == "dl-folder"
+    assert restored["title"] == "Attachments (4)"
+
+
+def test_a_file_removed_from_an_open_folder_leaves_the_rest_attached(run_scenario):
+    result = run_scenario("attachment-folders")
+    removed = result["fileRemoved"]
+    kept = [path for path in FOLDER_FILES if path != f"{FOLDER}/cat-42.png"]
+    assert removed["sent"] == {"filenames": [*LOOSE_FILES, *kept], "directories": []}
+    assert removed["folder"] == f"▾ {FOLDER} (4,999 of 5,000 files)✕"
+    assert removed["fileRow"] == "cat-42.pngAdd back"
+    assert removed["fileClass"] == "dl-nested dl-removed"
+    # The list stays where the artist scrolled it.
+    assert removed["scroll"] == 900
+    # The folder's ✕ removes the rest, and Add back restores every file, with the one removed on
+    # its own.
+    assert result["removedWhileOpen"]["sent"] == {"filenames": LOOSE_FILES, "directories": []}
+    assert result["removedWhileOpen"]["scroll"] == 900
+    assert result["restoredWhileOpen"]["sent"] == {
+        "filenames": [*LOOSE_FILES, *FOLDER_FILES],
+        "directories": [],
+    }
+
+
+def test_the_summary_counts_a_folder_loaders_folder_as_one_folder(run_scenario):
+    result = run_scenario("attachment-folders")
+    summary = "Attaches 3 files and 1 folder (5,000 files)."
+    assert result["collapsed"]["summary"] == summary
+    assert result["shownSummary"] == summary
+    assert result["fileRemoved"]["summary"] == "Attaches 3 files and 1 folder (4,999 files)."
+    assert result["folderRemoved"]["summary"] == "Attaches 3 files."
+    assert result["summaryWithAddedFolder"] == (
+        "Attaches 3 files and 2 folders (5,000 files in 1 of them). You added /outside/frames."
+    )
+
+
 def test_the_sidebar_lists_the_attachments_before_submit(run_scenario):
     sections = run_scenario("panel-sections")["sections"]
     assert sections.index("attachments") < sections.index("submit")

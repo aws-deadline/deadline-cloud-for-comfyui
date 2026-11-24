@@ -726,6 +726,67 @@ if (scenario === "attachment-summary") {
     excludedNodes: sent.excludedNodes,
   };
 }
+if (scenario === "attachment-folders") {
+  // A folder loader's folder of 5,000 files, and three files the workflow loads on their own.
+  installDom();
+  const container = new NodeStub("div");
+  const rows = () => descendants(container).filter((node) => node.tag === "li");
+  const row = (path) => rows().find((node) => node.attributes.title === path);
+  const buttons = (path) => row(path).children.filter((child) => child.tag === "button");
+  const click = (path, label) => buttons(path).find((button) => text(button) === label).listeners.click();
+  const list = () => container.querySelectorAll("[data-dl-scroll]")
+    .find((node) => node.getAttribute("data-dl-scroll") === "inputs");
+  const folder = "/input/cats";
+  const files = Array.from({ length: 5000 }, (_, index) => `${folder}/cat-${index}.png`);
+  const loose = ["/input/fox.png", "/input/mask.png", "/input/owl.png"];
+  state.plan.attachments = {
+    filenames: [...loose, ...files],
+    directories: [],
+    folders: [{ path: folder, files }],
+  };
+  ui.__createView(container, ["attachments", "submit"]);
+  const shown = () => ({
+    rows: rows().length,
+    folder: text(row(folder)),
+    folderClass: row(folder).className,
+    expanded: buttons(folder)[0].getAttribute("aria-expanded"),
+    title: text(container.querySelectorAll("details")[0].children[0]),
+    summary: ui.attachmentSummary(),
+  });
+  const sent = async () => (await submitAgain()).attachments;
+  result.collapsed = { ...shown(), listed: rows().map((node) => node.attributes.title) };
+  result.shownSummary = shownText(container, "attachment-summary");
+  click(folder, "✕");
+  result.folderRemoved = { ...shown(), sent: await sent() };
+  click(folder, "Add back");
+  result.folderRestored = { ...shown(), sent: await sent() };
+  // Opening the folder lists its files by their paths in it.
+  buttons(folder)[0].listeners.click();
+  result.opened = {
+    ...shown(),
+    first: text(rows()[4]),
+    firstClass: rows()[4].className,
+  };
+  list().scrollTop = 900;
+  click(`${folder}/cat-42.png`, "✕");
+  result.fileRemoved = {
+    ...shown(),
+    fileRow: text(row(`${folder}/cat-42.png`)),
+    fileClass: row(`${folder}/cat-42.png`).className,
+    scroll: list().scrollTop,
+    sent: await sent(),
+  };
+  // Removing the folder and adding it back restores the file removed on its own too.
+  click(folder, "✕");
+  result.removedWhileOpen = { ...shown(), scroll: list().scrollTop, sent: await sent() };
+  click(folder, "Add back");
+  result.restoredWhileOpen = { ...shown(), sent: await sent() };
+  buttons(folder)[0].listeners.click();
+  result.closed = shown();
+  // A folder the artist adds is attached whole, so the summary can't count its files.
+  ui.__attachmentEdits().added.directories.push("/outside/frames");
+  result.summaryWithAddedFolder = ui.attachmentSummary();
+}
 if (scenario === "late-queue-details") {
   // Each queue's details come from their own request. Queue 2's answer comes before queue 1's.
   const answers = { "queue-1": deferred(), "queue-2": deferred() };
@@ -810,5 +871,6 @@ if (scenario === "item-range-contract") {
     ui.taskCount([{ ...list, values: [], count: items, range: `1-${items}` }], () => value)
   );
 }
-console.log(JSON.stringify(result));
-process.exit(0);
+// Exits once the result is written. Node writes to a pipe asynchronously on macOS, so exiting
+// straight away would cut off a long result, such as a request with 5,000 files.
+process.stdout.write(`${JSON.stringify(result)}\n`, () => process.exit(0));

@@ -21,10 +21,13 @@ GPU workers, with the models, input files and custom nodes it uses attached to t
     workers, how workers read attachments, and whether every input path has to exist
   - [host requirements](#host-requirements), starting from the job template's
   - the job template's parameters, such as Workflow Timeout, and the queue's, such as Conda Channels
-  - the input files and folders, models and custom nodes to attach. You can remove files, folders,
-    models and custom node packs, or add more with a file dialog on the ComfyUI machine. Each
-    workflow tab keeps its own changes. Next to **Submit**, a summary counts what the job attaches
-    and names the files and folders you added
+  - the input files and folders, models and custom nodes to attach. A folder loader's folder is
+    one row with its number of files. Open it to list the files, and remove single files from it.
+    Its **✕** removes every file in it, and **Add back** restores them all. You can remove files,
+    folders, models and custom node packs, or add more with a file dialog on the ComfyUI machine.
+    Each workflow tab keeps its own changes. Next to **Submit**, a summary counts what the job
+    attaches, with a folder loader's folder as one folder of its files, and names the files and
+    folders you added
   - upload progress, the status of your recent jobs, and **Download** for their outputs, which
     go back into the output directory they were submitted with. Each job shows that directory.
   - **Save job bundle**, which creates the job bundle without submitting it, to submit later with

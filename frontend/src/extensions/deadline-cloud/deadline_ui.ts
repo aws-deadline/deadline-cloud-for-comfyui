@@ -54,6 +54,17 @@ interface PathLists {
   directories: string[];
 }
 
+// A folder loader's folder, and the files attached from it, which the plan's filenames lists too.
+interface FolderFiles {
+  path: string;
+  files: string[];
+}
+
+// The input files and folders the workflow loads. The panel lists each folder's files under it.
+interface PlannedAttachments extends PathLists {
+  folders?: FolderFiles[];
+}
+
 interface AttributeRequirement {
   name: string;
   anyOf?: string[];
@@ -101,7 +112,7 @@ interface Plan {
   parameters: Parameter[];
   values?: Record<string, ParameterValue>;
   queueValues?: Record<string, string>;
-  attachments?: PathLists;
+  attachments?: PlannedAttachments;
   hostRequirements?: HostRequirements;
   // id is the model's folder and name, such as checkpoints/sd.safetensors. Two models can share a
   // name in different folders.
@@ -300,6 +311,8 @@ interface State {
   settings: Settings;
   // Each workflow tab's attachment changes, so files added for one workflow never go with another.
   attachmentEdits: Map<string, AttachmentEdits>;
+  // The folders whose files the attachments list shows, by path. The rest show as one row each.
+  openFolders: Set<string>;
   submission: Submission | null;
   jobs: Job[];
   jobStatus: Record<string, JobStatus>;
@@ -333,6 +346,7 @@ const state: State = {
   hostForm: null,
   settings: { ...DEFAULT_SETTINGS, ...readStorage<Settings>(SETTINGS_KEY, {}) },
   attachmentEdits: new Map(),
+  openFolders: new Set(),
   submission: null,
   jobs: readStorage<Job[]>(JOBS_KEY, []),
   jobStatus: {},
@@ -1028,16 +1042,22 @@ function attachmentEdits(): AttachmentEdits {
   return edits;
 }
 
-// The input files and folders the job attaches: the planned ones, less those removed, and the
-// ones added, each once.
+// The folder loaders' folders that attach files, each with the files attached from it.
+function plannedFolders(): FolderFiles[] {
+  return (state.plan?.attachments?.folders ?? []).filter((folder) => folder.files.length);
+}
+
+// The input files and folders the job attaches: the planned ones, with every file in a folder
+// loader's folder, less those removed, and the ones added, each once.
 function attachments(): PathLists {
   const listed = state.plan?.attachments ?? { filenames: [], directories: [] };
   const { removed, added } = attachmentEdits();
   const keep = (...lists: string[][]) => [
     ...new Set(lists.flat().filter((path) => !removed.has(path))),
   ];
+  const folderFiles = plannedFolders().map((folder) => folder.files);
   return {
-    filenames: keep(listed.filenames, added.filenames),
+    filenames: keep(listed.filenames, ...folderFiles, added.filenames),
     directories: keep(listed.directories, added.directories),
   };
 }
@@ -2494,26 +2514,48 @@ function listText(parts: string[]): string {
 // How many added paths the summary names before it says how many more there are.
 const SUMMARY_PATHS = 5;
 
+// A number of files, such as 5,000 files.
+function fileCount(count: number): string {
+  return `${count.toLocaleString("en-US")} file${count === 1 ? "" : "s"}`;
+}
+
+// "1 folder (5,000 files)" for the folder loaders' folders that attach files, and with whole
+// folders the artist added, "3 folders (5,000 files in 1 of them)".
+function foldersText(groups: number, groupedFiles: number, directories: number): string | null {
+  const folders = groups + directories;
+  if (!groups) {
+    return folders ? plural(folders, "folder") : null;
+  }
+  const within = directories ? ` in ${groups} of them` : "";
+  return `${plural(folders, "folder")} (${fileCount(groupedFiles)}${within})`;
+}
+
 // What the job attaches: the planned input files less those removed, plus those added, and the
-// models and custom node packs. Both views show it next to Submit, so the artist sees what this
-// workflow's job uploads, including what they added, wherever they submit from.
+// models and custom node packs. A folder loader's folder counts as one folder of the files it
+// attaches. Both views show it next to Submit, so the artist sees what this workflow's job
+// uploads, including what they added, wherever they submit from.
 export function attachmentSummary(): string | null {
   if (!state.plan) {
     return null;
   }
   const { filenames, directories } = attachments();
+  const attached = new Set(filenames);
+  const folders = plannedFolders();
+  const inFolders = new Set(folders.flatMap((folder) => folder.files));
+  const groups = folders.filter((folder) => folder.files.some((path) => attached.has(path))).length;
+  const groupedFiles = filenames.filter((path) => inFolders.has(path)).length;
   const models = (state.plan.localModels ?? []).length - excludedModels().length;
   const packs = attachedNodes().length;
-  const counts = [
-    [filenames.length, "file"],
-    [directories.length, "folder"],
-    [models, "model"],
-    [packs, "custom node pack"],
-  ] as const;
-  const parts = counts.filter(([count]) => count > 0).map(([count, noun]) => plural(count, noun));
+  const files = filenames.length - groupedFiles;
+  const parts = [
+    files ? plural(files, "file") : null,
+    foldersText(groups, groupedFiles, directories.length),
+    models ? plural(models, "model") : null,
+    packs ? plural(packs, "custom node pack") : null,
+  ].filter((part): part is string => part !== null);
   // The paths the artist added that the workflow doesn't load, and so only go because of them.
   const listed = state.plan.attachments ?? { filenames: [], directories: [] };
-  const planned = new Set([...listed.filenames, ...listed.directories]);
+  const planned = new Set([...listed.filenames, ...inFolders, ...listed.directories]);
   const { added, removed } = attachmentEdits();
   const extra = [...new Set([...added.filenames, ...added.directories])].filter(
     (path) => !removed.has(path) && !planned.has(path)
@@ -2563,12 +2605,15 @@ function attachmentItem(
   path: string,
   prefix: string | null,
   onRemove: () => void,
-  onRestore: () => void
+  onRestore: () => void,
+  // A file listed under its folder.
+  nested = false
 ) {
   const removed = attachmentEdits().removed.has(path);
+  const className = [nested ? "dl-nested" : null, removed ? "dl-removed" : null].filter(Boolean);
   return h(
     "li",
-    { title: path, className: removed ? "dl-removed" : null },
+    { title: path, className: className.join(" ") || null },
     prefix ? h("span", { className: "dl-muted" }, prefix) : null,
     h("span", { className: "dl-path" }, text),
     removed
@@ -2577,12 +2622,58 @@ function attachmentItem(
   );
 }
 
+// A folder loader's folder as one row, which opens to list its files. Its ✕ removes every file
+// in it, and Add back restores them all.
+function folderItem(
+  folder: FolderFiles,
+  open: boolean,
+  onToggle: () => void,
+  onRemove: () => void,
+  onRestore: () => void
+) {
+  const { removed } = attachmentEdits();
+  const attached = folder.files.filter((path) => !removed.has(path)).length;
+  // A removed folder is struck through, like a removed file. One that's partly removed says how
+  // many of its files are attached.
+  const total = fileCount(folder.files.length);
+  const partly = attached > 0 && attached < folder.files.length;
+  const count = partly ? `${attached.toLocaleString("en-US")} of ${total}` : total;
+  return h(
+    "li",
+    { title: folder.path, className: attached ? "dl-folder" : "dl-folder dl-removed" },
+    h(
+      "button",
+      {
+        className: "dl-link dl-folder-toggle",
+        "aria-expanded": open ? "true" : "false",
+        onClick: onToggle,
+      },
+      h("span", { className: "dl-muted" }, open ? "▾ " : "▸ "),
+      h("span", { className: "dl-path" }, `${folder.path} (${count})`)
+    ),
+    attached
+      ? h("button", { className: "dl-link", title: "Don't attach the folder", onClick: onRemove }, "✕")
+      : h("button", { className: "dl-link", onClick: onRestore }, "Add back")
+  );
+}
+
+// A file's path in its folder, such as sub/a.png for /input/cats/sub/a.png in /input/cats.
+function pathInFolder(path: string, folder: string): string {
+  const separator = path.charAt(folder.length);
+  return path.startsWith(folder) && (separator === "/" || separator === "\\")
+    ? path.slice(folder.length + 1)
+    : path;
+}
+
 function renderAttachments() {
   if (!state.plan) {
     return null;
   }
   // The files the workflow loads stay listed after you remove them, so you can add them back.
   const planned = state.plan.attachments ?? { filenames: [], directories: [] };
+  // A folder loader's files are listed under their folder, which shows as one row until opened.
+  const folders = plannedFolders();
+  const inFolders = new Set(folders.flatMap((folder) => folder.files));
   // This workflow's own changes. Another workflow tab has its own.
   const { added, removed } = attachmentEdits();
   interface Row {
@@ -2601,7 +2692,7 @@ function renderAttachments() {
   ];
   for (const [paths, kind, manual] of lists) {
     for (const path of paths) {
-      if (!rows.has(path)) {
+      if (!rows.has(path) && !(kind === "file" && inFolders.has(path))) {
         rows.set(path, { path, kind, manual, key: kind === "file" ? "filenames" : "directories" });
       }
     }
@@ -2610,6 +2701,7 @@ function renderAttachments() {
   const localNodes = attachesNodes() ? state.plan.localNodes ?? [] : [];
   const attachedCount =
     [...rows.keys()].filter((path) => !removed.has(path)).length +
+    folders.filter((folder) => folder.files.some((path) => !removed.has(path))).length +
     localModels.length -
     excludedModels().length +
     attachedNodes().length;
@@ -2626,6 +2718,49 @@ function renderAttachments() {
     removed.delete(row.path);
     refresh("attachments", "submit");
   };
+  // A folder's ✕ and Add back change every file in it.
+  const changeFolder = (folder: FolderFiles, remove: boolean) => () => {
+    for (const path of folder.files) {
+      if (remove) {
+        removed.add(path);
+      } else {
+        removed.delete(path);
+      }
+    }
+    refresh("attachments", "submit");
+  };
+  const toggleFolder = (folder: FolderFiles) => () => {
+    if (!state.openFolders.delete(folder.path)) {
+      state.openFolders.add(folder.path);
+    }
+    refresh("attachments");
+  };
+  const rowItem = (row: Row) =>
+    attachmentItem(row.path, row.path, row.kind === "folder" ? "▸ " : "", remove(row), restore(row));
+  // A folder's row, and its files only while it's open, so a folder of thousands of files is one
+  // row until the artist opens it.
+  const folderItems = (folder: FolderFiles) => {
+    const open = state.openFolders.has(folder.path);
+    const row = folderItem(
+      folder,
+      open,
+      toggleFolder(folder),
+      changeFolder(folder, true),
+      changeFolder(folder, false)
+    );
+    if (!open) {
+      return [row];
+    }
+    const files = folder.files.map((path) => {
+      const file: Row = { path, kind: "file", manual: false, key: "filenames" };
+      const text = pathInFolder(path, folder.path);
+      return attachmentItem(text, path, null, remove(file), restore(file), true);
+    });
+    return [row, ...files];
+  };
+  // The workflow's own files, then its folders, then the paths the artist added.
+  const rowList = [...rows.values()];
+  const plannedFiles = rowList.filter((row) => row.kind === "file" && !row.manual).length;
   // Removing a model or a custom node pack can make the job fail. The status warns about it.
   const toggleFound = (found: { path: string }, remove: boolean) => () => {
     if (remove) {
@@ -2680,19 +2815,13 @@ function renderAttachments() {
           ),
         ]
       : null,
-    rows.size
+    rows.size || folders.length
       ? h(
           "ul",
           { className: "dl-files", "data-dl-scroll": "inputs" },
-          [...rows.values()].map((row) =>
-            attachmentItem(
-              row.path,
-              row.path,
-              row.kind === "folder" ? "▸ " : "",
-              remove(row),
-              restore(row)
-            )
-          )
+          rowList.slice(0, plannedFiles).map(rowItem),
+          folders.map(folderItems),
+          rowList.slice(plannedFiles).map(rowItem)
         )
       : h("div", { className: "dl-muted" }, "The workflow loads no input files."),
     h(
@@ -3154,6 +3283,9 @@ textarea.dl-input { resize: vertical; }
 .dl-files li { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
 .dl-removed .dl-path { text-decoration: line-through; color: var(--dl-muted); }
 .dl-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.dl-folder-toggle { display: flex; align-items: center; gap: 4px; flex: 1; min-width: 0; padding: 0;
+  color: inherit; text-align: left; }
+.dl-files li.dl-nested { padding-left: 16px; }
 .dl-jobs li { border-bottom: 1px solid var(--dl-border); padding-bottom: 4px; }
 .dl-destination { font-size: 12px; }
 .dl-jobs .dl-row { justify-content: space-between; font-size: 12px; }

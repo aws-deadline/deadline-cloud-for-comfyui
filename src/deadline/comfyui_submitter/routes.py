@@ -814,6 +814,14 @@ def _plan(body: dict[str, Any], workflow: dict[str, Any], template: Path) -> dic
         "attachments": {
             "filenames": [str(path) for path in assets.filenames],
             "directories": [str(path) for path in assets.directories],
+            # Each folder loader's folder with the files attached from it, which filenames lists
+            # too, so the panel shows a folder as one row.
+            "folders": [
+                {"path": str(folder), "files": [str(path) for path in files]}
+                for folder, files in sorted(
+                    getattr(assets, "folders", {}).items(), key=lambda item: str(item[0])
+                )
+            ],
         },
         # Attached when submitting.
         "localModels": [

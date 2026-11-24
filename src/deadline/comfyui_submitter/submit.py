@@ -369,9 +369,20 @@ def _quoted(value: Any) -> str:
 # Core nodes that load every image in a folder of the input directory as a list.
 FOLDER_LOADERS = ("LoadImageDataSetFromFolder",)
 # Nodes whose folder input names a folder of the input directory, which is sent with the job.
-FOLDER_INPUT_NODES = (*FOLDER_LOADERS, "LoadImageTextDataSetFromFolder")
+FOLDER_INPUT_NODES = (
+    *FOLDER_LOADERS,
+    "LoadImageTextDataSetFromFolder",
+    "LoadVideoDataSetFromFolder",
+    "LoadVideoTextDataSetFromFolder",
+)
 # The images that LoadImageDataSetFromFolder loads.
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
+# The most files a folder loader's folder attaches, so the plan stays quick to make and to show.
+# The artist can add a bigger folder in the panel.
+MAX_FOLDER_FILES = 10_000
+# The most entries read in all the folders of one workflow's folder loaders: files, folders, and
+# links that lead out. A folder of empty folders or of links has no files to count.
+MAX_FOLDER_ENTRIES = 50_000
 # The _meta key that marks the nodes the task script splits, with the task parameter of each.
 ITEM_META = "deadline_item"
 # The images of a folder, as paths in the input directory, in the order its items are numbered.
@@ -427,9 +438,25 @@ def input_path(input_dir: Path | str, name: Any) -> Path | None:
     return path if path != base and path.is_relative_to(base) else None
 
 
+def without_long_path_prefix(path: str) -> str:
+    r"""
+    path without the \\?\ prefix that Windows' realpath adds to a path that's too long to have
+    none, so it compares with a path that doesn't have it. \\?\UNC\server\share becomes
+    \\server\share. Comparing is all it's for: Windows may need the prefix to open a long path.
+    """
+    if path[:8].upper() == "\\\\?\\UNC\\":
+        return "\\\\" + path[8:]
+    if path.startswith("\\\\?\\"):
+        return path[4:]
+    return path
+
+
 def real_path(path: Path | str) -> Path:
-    """path with every link resolved, so a folder that's a link can still be a root."""
-    return Path(os.path.realpath(path))
+    """
+    path with every link resolved, so a folder that's a link can still be a root, for comparing
+    with another real path.
+    """
+    return Path(without_long_path_prefix(os.fspath(os.path.realpath(path))))
 
 
 def leads_inside(path: Path | str, root: Path) -> bool:
@@ -444,24 +471,6 @@ def leads_inside(path: Path | str, root: Path) -> bool:
     except (OSError, ValueError):
         return False
     return real != root and real.is_relative_to(root)
-
-
-def image_files(directory: Path, root: Path) -> list[str]:
-    """
-    The images in a folder that LoadImageDataSetFromFolder loads, in name order. root is the real
-    path of ComfyUI's input folder. An image that leads out of it isn't attached, so it's left out
-    here too: a task couldn't load it.
-    """
-    try:
-        return sorted(
-            entry.name
-            for entry in directory.iterdir()
-            if entry.is_file()
-            and entry.name.lower().endswith(IMAGE_EXTENSIONS)
-            and leads_inside(entry, root)
-        )
-    except OSError:
-        return []
 
 
 def input_folders(
@@ -491,6 +500,99 @@ def input_folders(
                 "if the job needs it."
             )
     return sorted(folders)
+
+
+@dataclass
+class FolderFiles:
+    """What list_input_folders found in a folder loader's folder."""
+
+    # The files that are attached, sorted.
+    files: list[Path] = field(default_factory=list)
+    # The entries that lead out of ComfyUI's input folder, which aren't attached, sorted.
+    outside: list[Path] = field(default_factory=list)
+    # Why nothing in the folder is attached when it's too big to list, to follow "The folder
+    # 'cats' ", such as "has more than 10,000 files". None when it's listed in full.
+    too_big: str | None = None
+
+
+class _Budget:
+    """The entries left to read in one workflow's folders."""
+
+    def __init__(self, entries: int):
+        self.left = entries
+
+
+def list_input_folders(
+    workflow: Mapping[str, Any], input_dir: Path, warnings: list[str] | None = None
+) -> dict[Path, FolderFiles]:
+    """
+    The files in each folder that input_folders finds, by folder, as attachments and task lists
+    both see them, so a folder whose files aren't attached is never split into tasks. The folders
+    share MAX_FOLDER_ENTRIES, and each attaches at most MAX_FOLDER_FILES files. A folder that
+    goes past either attaches nothing.
+    """
+    root = real_path(input_dir)
+    budget = _Budget(MAX_FOLDER_ENTRIES)
+    return {
+        folder: _list_folder(folder, root, budget)
+        for folder in input_folders(workflow, input_dir, warnings)
+    }
+
+
+def _list_folder(folder: Path, root: Path, budget: _Budget) -> FolderFiles:
+    """
+    The files in a folder and its subfolders, and the entries that lead out of root, the real
+    path of ComfyUI's input folder. Every entry is resolved, not only symbolic links, since Python
+    doesn't count a Windows directory junction as one. A link to a folder in the input folder
+    isn't followed, so walking can't loop. A link to a file in it is attached under its own name.
+    """
+    files: list[Path] = []
+    outside: list[Path] = []
+    pending = [folder]
+    while pending:
+        directory = pending.pop()
+        names = []
+        try:
+            real_directory = str(real_path(directory))
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    budget.left -= 1
+                    if budget.left < 0:
+                        return FolderFiles(
+                            too_big=f"takes the workflow's folders past {MAX_FOLDER_ENTRIES:,} "
+                            "entries"
+                        )
+                    names.append(entry.name)
+        except (OSError, ValueError):
+            continue
+        for name in sorted(names):
+            path = directory / name
+            try:
+                real = real_path(path)
+            except (OSError, ValueError):
+                continue
+            if not real.is_relative_to(root):
+                outside.append(path)
+            elif path.is_dir():
+                if str(real) == os.path.join(real_directory, name):
+                    pending.append(path)
+            elif path.is_file():
+                files.append(path)
+                if len(files) > MAX_FOLDER_FILES:
+                    return FolderFiles(too_big=f"has more than {MAX_FOLDER_FILES:,} files")
+    return FolderFiles(sorted(files), sorted(outside))
+
+
+def folder_images(folder: Path, files: Iterable[Path]) -> list[str]:
+    """
+    The names of the images in folder itself, of its attached files, that
+    LoadImageDataSetFromFolder loads, in name order. Only attached images can be a task's item.
+    """
+    return sorted(
+        path.name
+        for path in files
+        if path.parent == folder and path.name.lower().endswith(IMAGE_EXTENSIONS)
+    )
 
 
 @dataclass
@@ -740,9 +842,12 @@ def plan_task_lists(
     plan = TaskLists(workflow)
     consumers = _consumers(workflow)
     base = Path(os.path.abspath(input_dir)) if input_dir else None
-    # An image that links outside the input directory, or is in a folder that does, isn't
-    # attached, so it can't be one of a task's items.
-    root = real_path(base) if base else None
+    # Each folder's items are its attached images, as get_local_assets lists them. An image that
+    # links outside the input directory, or is in a folder that does or that's too big to attach,
+    # isn't attached, so it can't be one of a task's items. Folders are only listed when a folder
+    # loader could be split.
+    listed: dict[Path, FolderFiles] | None = None
+    too_big: list[tuple[str, str]] = []
     unplanned = 0
     for node_id, node in workflow.items():
         class_type = node.get("class_type")
@@ -764,7 +869,14 @@ def plan_task_lists(
         elif class_type in FOLDER_LOADERS:
             folder = inputs.get("folder")
             directory = input_path(base, folder) if base else None
-            files = image_files(directory, root) if directory and root else []
+            if directory and base and listed is None:
+                listed = list_input_folders(workflow, base)
+            listing = listed.get(directory) if directory and listed else None
+            files: list[str] = []
+            if listing and listing.too_big:
+                too_big.append((f"Folder {_quoted(folder)} (#{_quoted(node_id)})", listing.too_big))
+            elif directory and listing:
+                files = folder_images(directory, listing.files)
             if directory and base and len(files) > 1:
                 # Relative to the input directory, which the job maps, whatever the workflow's
                 # folder says, such as an absolute path on this machine or one with "..".
@@ -786,6 +898,14 @@ def plan_task_lists(
         plan.warnings.append(
             f"Deadline Cloud reads up to {MAX_PLANNED_SOURCES} lists and folders in a workflow, so "
             f"{unplanned} more run whole in each task."
+        )
+    if len(too_big) == 1:
+        label, reason = too_big[0]
+        plan.warnings.append(f"{label} {reason}, so it isn't attached or split into tasks.")
+    elif too_big:
+        plan.warnings.append(
+            "These folders are too big to attach, so they aren't split into tasks: "
+            f"{_some([label for label, _ in too_big])}."
         )
     # Two lists the artist gave the same title keep it, with their node IDs, and a number when that's
     # taken too.

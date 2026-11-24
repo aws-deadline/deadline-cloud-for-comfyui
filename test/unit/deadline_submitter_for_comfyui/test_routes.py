@@ -590,7 +590,11 @@ def test_plan_lists_parameters_task_lists_and_attachments(comfy, monkeypatch):
             "range": "1-4",
         }
     ]
-    assert body["attachments"] == {"filenames": [str(input_dir / "fox.png")], "directories": []}
+    assert body["attachments"] == {
+        "filenames": [str(input_dir / "fox.png")],
+        "directories": [],
+        "folders": [],
+    }
     # Planning doesn't create a job bundle.
     assert not (comfy.tmp_path / "user" / "deadline_submissions").exists()
 
@@ -602,7 +606,7 @@ def test_plan_and_jobs_warn_about_inputs_that_arent_attached(comfy, monkeypatch)
     workflow = {**WORKFLOW, "5": {"class_type": "LoadImage", "inputs": {"image": str(elsewhere)}}}
     status, plan = run(call(comfy, "/deadline/plan", {"workflow": workflow}))
     assert status == 200
-    assert plan["attachments"] == {"filenames": [], "directories": []}
+    assert plan["attachments"] == {"filenames": [], "directories": [], "folders": []}
     # A long path is shortened to its end in the message.
     [warning] = [warning for warning in plan["warnings"] if "elsewhere.png" in warning]
     assert "isn't attached" in warning
@@ -619,6 +623,27 @@ def test_plan_and_jobs_warn_about_inputs_that_arent_attached(comfy, monkeypatch)
     )
     assert status == 202
     assert warning not in body["warnings"]
+
+
+def test_plan_groups_a_folder_loaders_files_under_its_folder(comfy, monkeypatch):
+    """The panel shows a folder loader's folder as one row, and filenames still has every file."""
+    input_dir = comfy.tmp_path / "input"
+    fox, cats, dogs = input_dir / "fox.png", input_dir / "cats", input_dir / "dogs"
+    folders = {dogs: [dogs / "a.png"], cats: [cats / "a.png", cats / "b.png"]}
+    assets = comfy.routes.LocalAssets(filenames=[fox, *folders[cats], *folders[dogs]])
+    assets.folders = folders
+    monkeypatch.setattr(comfy.routes, "_local_assets", lambda workflow: assets)
+    status, plan = run(call(comfy, "/deadline/plan", {"workflow": WORKFLOW}))
+    assert status == 200
+    assert plan["attachments"] == {
+        "filenames": [str(fox), str(cats / "a.png"), str(cats / "b.png"), str(dogs / "a.png")],
+        "directories": [],
+        # By folder path.
+        "folders": [
+            {"path": str(cats), "files": [str(cats / "a.png"), str(cats / "b.png")]},
+            {"path": str(dogs), "files": [str(dogs / "a.png")]},
+        ],
+    }
 
 
 def test_plan_reports_workflows_it_cant_submit(comfy):

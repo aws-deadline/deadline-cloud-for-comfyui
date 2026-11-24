@@ -2,10 +2,11 @@
 """
 Finds the local files an API-format ComfyUI workflow reads (input images, videos, audio and so on,
 but not custom nodes) and writes them to a job bundle's asset_references.yaml. Only the inputs
-that ComfyUI's node definitions mark as files are read, and only files in ComfyUI's input, output
-and temp folders are attached. Model files are not part of that scan. A model the workflow loads
-is staged into the job's model directory and attached from there. A custom node pack the workflow
-uses is staged into the job's custom nodes directory in the same way.
+that ComfyUI's node definitions mark as files, or offer files in, are read, and only files in
+ComfyUI's input, output and temp folders are attached. Model files are not part of that scan. A
+model the workflow loads is staged into the job's model directory and attached from there. A
+custom node pack the workflow uses is staged into the job's custom nodes directory in the same
+way.
 """
 
 from __future__ import annotations
@@ -19,37 +20,50 @@ import re
 import shutil
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path, PurePath
-from typing import Any
+from pathlib import Path, PurePath, PurePosixPath
+from typing import Any, Self
 
 from .submit import (
     MODEL_EXTENSIONS,
-    input_folders,
     leads_inside,
+    list_input_folders,
     real_path,
     workflow_models,
     write_private_text,
 )
 
-# Loaders for these file types look in ComfyUI's input directory.
+# The image, video, audio and 3D files that ComfyUI's loaders read, which it tells apart by their
+# MIME type. A text input that names one, rather than a file input, gets a warning, since its file
+# isn't attached.
 MEDIA_EXTENSIONS = frozenset(
     {
         # Images
-        ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".exr", ".hdr", ".avif",
+        ".png", ".jpg", ".jpeg", ".jpe", ".jfif", ".webp", ".bmp", ".gif", ".tif", ".tiff",
+        ".exr", ".hdr", ".avif", ".heic", ".heif", ".jxl", ".tga", ".ico", ".svg",
         # Videos
-        ".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v", ".flv", ".wmv",
+        ".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v", ".flv", ".wmv", ".mpg", ".mpeg", ".3gp",
+        ".3g2", ".ogv", ".mts", ".m2ts", ".qt",
         # Audio
-        ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus", ".aac",
-        # 3D
-        ".glb", ".gltf", ".obj", ".ply", ".stl", ".fbx",
+        ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus", ".aac", ".aif", ".aiff", ".aifc",
+        ".mp2", ".wma",
+        # 3D, with the Gaussian splats that Load3D lists
+        ".glb", ".gltf", ".obj", ".ply", ".stl", ".fbx", ".usd", ".usdz", ".spz", ".splat",
+        ".ksplat",
     }
 )  # fmt: skip
 
 # A value can name its directory with a suffix: "example.png [input]".
 _ANNOTATED = re.compile(r"(?P<name>.+) \[(?P<directory>input|output|temp)\]")
 _MAX_VALUE_LENGTH = 1024
-# A path that starts with two separators: a UNC or Windows device path.
-_NETWORK_PATH = re.compile(r"[\\/]{2}")
+# An absolute path on any system: one that starts with a separator, including a UNC or Windows
+# device path, which starts with two, or with a drive, such as C:\.
+_ABSOLUTE_PATH = re.compile(r"[\\/]|[A-Za-z]:[\\/]")
+# A path that's clearly a path on its own: one on a drive, a UNC or device path, or one in the
+# home folder.
+_PATH_START = re.compile(r"(?:[A-Za-z]:|~)[\\/]|[\\/]{2}")
+_SEPARATORS = re.compile(r"[\\/]+")
+# The most inputs that a warning about file paths that aren't attached names.
+_MAX_NAMED_INPUTS = 5
 
 # The options a ComfyUI node definition sets on an input whose widget uploads a file into
 # ComfyUI's input folder, such as LoadImage's image. The input's value names the file to load.
@@ -70,10 +84,6 @@ CORE_FILE_INPUTS: dict[str, frozenset[str]] = {
     "Load3D": frozenset({"model_file"}),
     "WebcamCapture": frozenset({"image"}),
 }
-# The most files a folder loader's folder attaches, so the plan stays quick to make and to show.
-# The artist can add a bigger folder in the panel.
-MAX_FOLDER_FILES = 10_000
-
 # folder_paths.folder_names_and_paths maps a folder type to (directories, extensions).
 ModelFolders = Mapping[str, Sequence[Any]]
 
@@ -86,9 +96,31 @@ class LocalAssets:
     directories: list[Path] = field(default_factory=list)
     # What the workflow names but isn't attached, and why, for the panel to show.
     warnings: list[str] = field(default_factory=list)
+    # The files attached from each folder that a folder loader reads, by the folder's path as
+    # ComfyUI joins it onto its input folder, links unresolved. They're in filenames too. A folder
+    # that's too big, or that links outside the input folder, isn't attached, so it isn't here.
+    folders: dict[Path, list[Path]] = field(default_factory=dict)
 
     def __bool__(self) -> bool:
         return bool(self.filenames or self.directories)
+
+
+class FileInputs(frozenset[str]):
+    """
+    A node type's file inputs, as node_file_inputs reads them: the names of the inputs its
+    definition marks as files, which compare as a frozenset. choices holds its other combo
+    inputs whose choices are strings, by name, with their choices. A combo's value names a file
+    only when it's one of them, as ComfyUI checks it.
+    """
+
+    choices: Mapping[str, frozenset[str]]
+
+    def __new__(
+        cls, names: Iterable[str] = (), choices: Mapping[str, frozenset[str]] | None = None
+    ) -> Self:
+        inputs = super().__new__(cls, names)
+        inputs.choices = dict(choices or {})
+        return inputs
 
 
 def workflow_file_inputs(
@@ -96,8 +128,9 @@ def workflow_file_inputs(
 ) -> dict[str, frozenset[str]]:
     """
     The file inputs of each node type in the workflow, by node type, as its ComfyUI node
-    definition marks them. node_classes is ComfyUI's nodes.NODE_CLASS_MAPPINGS. Node types
-    without file inputs, or whose definition can't be read, are left out.
+    definition marks them or offers files in them. Each is a FileInputs. node_classes is
+    ComfyUI's nodes.NODE_CLASS_MAPPINGS. Node types with neither, or whose definition can't be
+    read, are left out. Only the workflow's own node types are read.
     """
     class_types = {
         node.get("class_type") for node in workflow.values() if isinstance(node, Mapping)
@@ -105,34 +138,41 @@ def workflow_file_inputs(
     found: dict[str, frozenset[str]] = {}
     for class_type in sorted(name for name in class_types if isinstance(name, str)):
         names = node_file_inputs(node_classes.get(class_type))
-        if names:
+        if names or names.choices:
             found[class_type] = names
     return found
 
 
-def node_file_inputs(node_class: Any) -> frozenset[str]:
+def node_file_inputs(node_class: Any) -> FileInputs:
     """
     The inputs that a node class's INPUT_TYPES marks as files: an upload widget, such as
-    LoadImage's image, or a capture widget, such as WebcamCapture's. Each input is (type,
-    options), in its "required" or "optional" inputs. A definition that can't be read has none.
+    LoadImage's image, or a capture widget, such as WebcamCapture's. Its other combo inputs whose
+    choices are strings are in choices, such as a custom video loader that lists the input
+    folder's videos and adds its upload button in JavaScript. Each input is (type, options), in
+    its "required" or "optional" inputs. A definition that can't be read has none.
     """
     if node_class is None:
-        return frozenset()
+        return FileInputs()
     try:
         definition = node_class.INPUT_TYPES()
         names = set()
+        choices = {}
         for group in ("required", "optional"):
             inputs = definition.get(group) if isinstance(definition, Mapping) else None
             for name, spec in inputs.items() if isinstance(inputs, Mapping) else ():
-                if isinstance(name, str) and _is_file_input(spec):
+                if not isinstance(name, str):
+                    continue
+                if _is_file_input(spec):
                     names.add(name)
+                elif (listed := _combo_choices(spec)) is not None:
+                    choices[name] = listed
     except Exception as e:  # noqa: BLE001 - one node's definition mustn't stop the plan.
         # Any node's definition can fail, such as a custom node's that lists a missing folder.
         # Its inputs then aren't attached, which the job's own error makes clear.
         label = getattr(node_class, "__name__", type(node_class).__name__)
         logger.warning("Couldn't read the inputs of node %s: %s", _shown(label), _shown(e))
-        return frozenset()
-    return frozenset(names)
+        return FileInputs()
+    return FileInputs(names, choices)
 
 
 def _is_file_input(spec: Any) -> bool:
@@ -142,6 +182,29 @@ def _is_file_input(spec: Any) -> bool:
         return True
     options = spec[1] if len(spec) > 1 else None
     return isinstance(options, Mapping) and any(options.get(key) is True for key in UPLOAD_OPTIONS)
+
+
+def _combo_choices(spec: Any) -> frozenset[str] | None:
+    """
+    A combo input's choices, when they're all strings, in the forms ComfyUI checks a value
+    against: ([choices], options) in a V1 definition, or ("COMBO", {"options": [choices]}) in a
+    V3 one.
+    """
+    if not isinstance(spec, (tuple, list)) or not spec:
+        return None
+    options = spec[1] if len(spec) > 1 else None
+    listed: Any
+    if isinstance(spec[0], list):
+        listed = spec[0]
+    elif spec[0] == "COMBO" and isinstance(options, Mapping):
+        listed = options.get("options")
+    else:
+        return None
+    if not isinstance(listed, list) or not listed:
+        return None
+    if not all(isinstance(choice, str) for choice in listed):
+        return None
+    return frozenset(listed)
 
 
 def get_local_assets(
@@ -159,11 +222,12 @@ def get_local_assets(
     loaders in CORE_FILE_INPUTS are read.
 
     No other input is read, so a prompt, or any other text in a shared workflow, can't attach a
-    file by naming it. A file input names a media file in ComfyUI's input folder, such as
-    "fox.png" or "cats/fox.png", or with "[input]", "[output]" or "[temp]", any file in that
-    folder. An absolute path isn't attached: the artist can add files from anywhere in the panel.
-    Neither is a file or a folder's entry that leads out of its folder through a link. Each of
-    those adds a warning. Model files are left out of this scan.
+    file by naming it. A file input, or a combo input whose value is one of its choices, names a
+    file in ComfyUI's input folder, such as "fox.png" or "cats/fox.mpg", or with "[input]",
+    "[output]" or "[temp]", a file in that folder. An absolute path isn't attached: the artist
+    can add files from anywhere in the panel. Neither is a file or a folder's entry that leads
+    out of its folder through a link. Each of those adds a warning, as do text inputs that hold
+    file paths. Model files are left out of this scan.
     """
     base = Path(os.path.abspath(input_dir))
     resolver = _Resolver(
@@ -177,15 +241,22 @@ def get_local_assets(
 
     filenames: set[Path] = set()
     warnings: list[str] = []
+    # The inputs that hold a file path but aren't file inputs, as (node ID, input name).
+    paths: list[tuple[Any, str]] = []
     for node_id, node in workflow.items():
         inputs = node.get("inputs") if isinstance(node, Mapping) else None
         class_type = node.get("class_type") if isinstance(node, Mapping) else None
         if not isinstance(inputs, Mapping) or not isinstance(class_type, str):
             continue
-        for name in sorted(file_inputs.get(class_type, ())):
-            value = inputs.get(name)
+        marked = file_inputs.get(class_type, ())
+        choices = marked.choices if isinstance(marked, FileInputs) else {}
+        for name, value in inputs.items():
             # A link to another node's output is a list.
             if not isinstance(value, str):
+                continue
+            if name not in marked and value not in choices.get(name, ()):
+                if isinstance(name, str) and _holds_a_path(value):
+                    paths.append((node_id, name))
                 continue
             try:
                 path, problem = resolver.resolve(value)
@@ -196,69 +267,75 @@ def get_local_assets(
                 filenames.add(path)
             elif problem:
                 warnings.append(
-                    f"Node {_shown(node_id)} loads {_shown(value)!r}, which {problem}, so it "
-                    "isn't attached. Add it with Add files… if the job needs it."
+                    f"Node {_shown(node_id)} loads {_shown(value)!r}, which {problem}. Add it "
+                    "with Add files… if the job needs it."
                 )
+    if paths:
+        warnings.append(_paths_warning(paths))
 
     # Job attachments would upload what every link in a folder points to, so a folder is
     # attached as the files in it that stay in the input folder.
-    root = real_path(base)
-    for folder in input_folders(workflow, base, warnings):
+    folders: dict[Path, list[Path]] = {}
+    for folder, listing in list_input_folders(workflow, base, warnings).items():
         shown = _shown(folder.relative_to(base).as_posix())
-        files, outside = _folder_files(folder, root)
-        if files is None:
+        if listing.too_big:
             warnings.append(
-                f"The folder {shown!r} has more than {MAX_FOLDER_FILES:,} files, so it isn't "
-                "attached. Add it with Add folder… if the job needs it."
+                f"The folder {shown!r} {listing.too_big}, so it isn't attached. Add it with Add "
+                "folder… if the job needs it."
             )
             continue
-        filenames.update(files)
-        if outside:
-            names = [_shown(path.relative_to(folder).as_posix()) for path in outside]
+        filenames.update(listing.files)
+        folders[folder] = listing.files
+        if listing.outside:
+            names = [_shown(path.relative_to(folder).as_posix()) for path in listing.outside]
             more = f", and {len(names) - 5} more" if len(names) > 5 else ""
             warnings.append(
                 f"Entries in the folder {shown!r} that link outside ComfyUI's input folder "
                 f"aren't attached: {', '.join(names[:5])}{more}."
             )
 
-    return LocalAssets(sorted(filenames), [], list(dict.fromkeys(warnings)))
+    return LocalAssets(sorted(filenames), [], list(dict.fromkeys(warnings)), folders)
 
 
-def _folder_files(folder: Path, root: Path) -> tuple[list[Path] | None, list[Path]]:
+def _holds_a_path(value: str) -> bool:
     """
-    The files in a folder loader's folder and its subfolders, and the entries that lead out of
-    root, the real path of ComfyUI's input folder. The files are None when there are more than
-    MAX_FOLDER_FILES. Every entry is resolved, not only symbolic links, since Python doesn't
-    count a Windows directory junction as one. A link to a folder in the input folder isn't
-    followed, so walking can't loop. A link to a file in it is attached under its own name.
+    Whether a text input's value looks like the path of a media file or folder for a node to
+    load, without checking the disk: a name with an image, video, audio or 3D extension, a path
+    on a drive, a UNC path, a path in the home folder, or an absolute path of two parts or more,
+    such as /data/frames. A relative path without such an extension isn't one, since output
+    prefixes such as renders/shot look like that, and nor is "/imagine". Model names are left to
+    model discovery, and URLs to the nodes that download them.
     """
-    files: list[Path] = []
-    outside: list[Path] = []
-    pending = [folder]
-    while pending:
-        directory = pending.pop()
-        try:
-            real_directory = os.path.realpath(directory)
-            with os.scandir(directory) as entries:
-                names = sorted(entry.name for entry in entries)
-        except (OSError, ValueError):
-            continue
-        for name in names:
-            path = directory / name
-            try:
-                real = real_path(path)
-            except (OSError, ValueError):
-                continue
-            if not real.is_relative_to(root):
-                outside.append(path)
-            elif real.is_dir():
-                if str(real) == os.path.join(real_directory, name):
-                    pending.append(path)
-            elif real.is_file():
-                files.append(path)
-                if len(files) > MAX_FOLDER_FILES:
-                    return None, outside
-    return sorted(files), sorted(outside)
+    if len(value) > _MAX_VALUE_LENGTH or "://" in value or any(c in value for c in "\n\r\0"):
+        return False
+    annotated = _ANNOTATED.fullmatch(value)
+    name = (annotated["name"] if annotated else value).strip()
+    if not name or name.lower().endswith(MODEL_EXTENSIONS):
+        return False
+    if PurePosixPath(name.replace("\\", "/")).suffix.lower() in MEDIA_EXTENSIONS:
+        return True
+    if _PATH_START.match(name):
+        return True
+    return name.startswith(("/", "\\")) and len(_SEPARATORS.split(name.strip("\\/"))) > 1
+
+
+def _paths_warning(paths: Sequence[tuple[Any, str]]) -> str:
+    """A warning about text inputs that hold file paths, which names the first few."""
+    if len(paths) == 1:
+        [(node_id, name)] = paths
+        return (
+            f"Node {_shown(node_id, 20)}'s {_shown(name, 40)} input holds a file path, which "
+            "isn't attached. Add it with Add files… if the job needs it."
+        )
+    named = [
+        f"node {_shown(node_id, 20)}'s {_shown(name, 40)}"
+        for node_id, name in paths[:_MAX_NAMED_INPUTS]
+    ]
+    more = f", and {len(paths) - len(named):,} more" if len(paths) > len(named) else ""
+    return (
+        f"These inputs hold file paths, which aren't attached: {', '.join(named)}{more}. Add the "
+        "files with Add files… if the job needs them."
+    )
 
 
 def write_asset_references(assets: LocalAssets, path: Path) -> Path:
@@ -460,22 +537,22 @@ def _is_secret_node_file(name: str) -> bool:
 
 def _ignore_node_files(root: Path, directory: str, names: list[str], log: bool = True) -> set[str]:
     """
-    The entries of a pack's folder to leave out of the job. root is the pack's folder, resolved.
-    copytree follows links, so an entry is attached only when it resolves inside the pack, and is
-    checked as its target as well as by its own name. A link to a folder in the pack is left out:
-    the folder is attached under its own name, and following it could loop. Every entry is
-    resolved, not only symbolic links, since Python doesn't count a Windows directory junction as
-    one.
+    The entries of a pack's folder to leave out of the job. root is the pack's folder's
+    real_path. copytree follows links, so an entry is attached only when it resolves inside the
+    pack, and is checked as its target as well as by its own name. A link to a folder in the pack
+    is left out: the folder is attached under its own name, and following it could loop. Every
+    entry is resolved, not only symbolic links, since Python doesn't count a Windows directory
+    junction as one.
     """
     warn = logger.warning if log else _quiet
     ignored = set()
-    real_directory = os.path.realpath(directory)
+    real_directory = str(real_path(directory))
     for name in names:
         path = Path(directory, name)
         if _skipped_node_entry(name, path):
             ignored.add(name)
             continue
-        target = path.resolve()
+        target = real_path(path)
         is_link = str(target) != os.path.join(real_directory, name)
         if not target.is_relative_to(root):
             warn("Leaving %s out of the job: it links outside the pack", path)
@@ -555,7 +632,7 @@ def node_pack_size(source: Path) -> NodePackSize:
     if not source.is_dir():
         size.bytes, size.files = _file_size(source), 1
         return size
-    root = source.resolve()
+    root = real_path(source)
     # Following links is bounded: the ignore rules leave out every link to a folder in the pack.
     for directory, folders, files in os.walk(source, followlinks=True):
         ignored = _ignore_node_files(root, directory, folders + files, log=False)
@@ -610,7 +687,7 @@ def stage_local_node_packs(packs: Mapping[str, Path], dest: Path) -> dict[str, P
                 shutil.copytree(
                     source,
                     target,
-                    ignore=functools.partial(_ignore_node_files, source.resolve()),
+                    ignore=functools.partial(_ignore_node_files, real_path(source)),
                     copy_function=functools.partial(_link_or_copy, copied=copied),
                     dirs_exist_ok=True,
                 )
@@ -950,6 +1027,8 @@ class _Resolver:
     def __init__(self, roots: Mapping[str, Path | None]):
         self._roots = roots
         self._real_roots: dict[str, Path] = {}
+        # Each value is resolved once, such as a sampler's name that a thousand nodes share.
+        self._resolved: dict[str, tuple[Path | None, str | None]] = {}
 
     def _real_root(self, kind: str, root: Path) -> Path:
         # Resolved, so a ComfyUI whose input folder is itself a link, such as to another disk,
@@ -960,9 +1039,16 @@ class _Resolver:
 
     def resolve(self, value: str) -> tuple[Path | None, str | None]:
         """
-        The file a value names, or None, with why it isn't attached when the artist should know.
+        The file a file input's value names, or None, with why it isn't attached when the artist
+        should know. The input is known to name a file, so its extension isn't checked: ComfyUI
+        lists files by MIME type, such as .mpg videos and .splat 3D files.
         """
-        if len(value) > _MAX_VALUE_LENGTH or "\n" in value or "\0" in value:
+        if value not in self._resolved:
+            self._resolved[value] = self._resolve(value)
+        return self._resolved[value]
+
+    def _resolve(self, value: str) -> tuple[Path | None, str | None]:
+        if len(value) > _MAX_VALUE_LENGTH or any(c in value for c in "\n\r\0"):
             return None, None
 
         annotated = _ANNOTATED.fullmatch(value)
@@ -972,10 +1058,10 @@ class _Resolver:
         # (\\server\share) or device (\\?\, \\.\) path contacts that server or device, which can
         # send the user's credentials to a host that a downloaded workflow names. An absolute
         # path can name any file on the disk: the artist adds those in the panel.
-        if _NETWORK_PATH.match(name) or PurePath(name).is_absolute():
-            return None, "isn't in ComfyUI's input, output or temp folder"
-        # ComfyUI's loaders only list media files in the input folder.
-        if not annotated and PurePath(name).suffix.lower() not in MEDIA_EXTENSIONS:
+        if _ABSOLUTE_PATH.match(name) or PurePath(name).is_absolute():
+            return None, "is an absolute path, so it isn't attached automatically"
+        # Such as "" or ".", which name a folder, and a model, which model discovery attaches.
+        if not PurePath(name).name or name.lower().endswith(MODEL_EXTENSIONS):
             return None, None
 
         root = self._roots.get(kind)
@@ -983,11 +1069,11 @@ class _Resolver:
             return None, None
         path = self._contained(root, name)
         if path is None:
-            return None, f"isn't in ComfyUI's {kind} folder"
+            return None, f"isn't in ComfyUI's {kind} folder, so it isn't attached"
         if not path.is_file():
             return None, None
         if not leads_inside(path, self._real_root(kind, root)):
-            return None, f"links outside ComfyUI's {kind} folder"
+            return None, f"links outside ComfyUI's {kind} folder, so it isn't attached"
         return path, None
 
     @staticmethod
