@@ -543,7 +543,7 @@ async def wait_for_prompt(comfy, number=1):
         if len(prompts) >= number:
             return prompts[number - 1]
         await asyncio.sleep(0.05)
-    pytest.fail(f"Prompt {number} never arrived.")
+    raise AssertionError(f"Prompt {number} never arrived.")
 
 
 def running_submission(comfy, monkeypatch, process, **fields):
