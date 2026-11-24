@@ -2329,6 +2329,18 @@ def test_download_runs_the_bridge_and_reports_progress(comfy, monkeypatch):
     ]
 
 
+def test_download_runs_the_bridge_with_the_installed_dependencies(comfy, monkeypatch):
+    """An installer's installation downloads without the Deadline Cloud CLI, like it submits."""
+    dependencies, requests = installed_dependencies(
+        comfy, monkeypatch, {"download": [DOWNLOAD_PROGRESS, DOWNLOADED]}
+    )
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
+    status, response = run(call(comfy, "/deadline/jobs/download", body))
+    assert (status, response) == (202, {"jobId": JOB_ID})
+    [request] = bridge_requests(requests)
+    assert request["argv"][-3:] == ["--dependencies", str(dependencies), "download"]
+
+
 @pytest.mark.parametrize("directory", [None, 5, ["/comfy/output"]])
 def test_download_leaves_out_a_folder_it_cant_tell(comfy, monkeypatch, directory):
     data = {"fileCount": 1, "message": "Downloaded 1 file"}

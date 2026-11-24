@@ -1647,7 +1647,8 @@ async def download_outputs(request: web.Request) -> web.Response:
         config = load_config()
     except SubmitError as e:
         return _error(400, str(e))
-    cli = await _checked_cli(config)
+    # The installer's dependencies download without the Deadline Cloud CLI.
+    cli = await _bridge_cli(config)
     if isinstance(cli, web.Response):
         return cli
     # The bridge downloads with the library, so it can check every file's destination against
@@ -1658,7 +1659,7 @@ async def download_outputs(request: web.Request) -> web.Response:
         return _error(500, str(e))
     if not await _write_line(process, {"farmId": farm_id, "queueId": queue_id, "jobId": job_id}):
         await _stop(process)
-        return _error(500, "The Deadline Cloud CLI's Python exited before it could download.")
+        return _error(500, "The Deadline Cloud bridge exited before it could download.")
     _start(_watch_download(process, job_id, client_id))
     return web.json_response({"jobId": job_id}, status=202)
 

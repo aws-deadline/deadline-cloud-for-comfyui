@@ -110,8 +110,9 @@ To install without prompts, pass `--mode unattended --comfyui-directory /path/to
 The installer puts the extension in `custom_nodes/deadline-cloud-for-comfyui`, with the Deadline
 Cloud library and its dependencies in the extension's `dependencies` folder. ComfyUI's own Python,
 3.13 or 3.14, runs them in a separate process, so nothing is installed into ComfyUI's environment,
-and the panel submits without the Deadline Cloud CLI. **Download** still runs the Deadline Cloud
-CLI on the `PATH`, or the one `COMFYUI_DEADLINE_CLI` names.
+and the panel submits and downloads without the Deadline Cloud CLI. When ComfyUI runs another Python
+version, or on a CPU the installer wasn't built for, the panel uses the Deadline Cloud CLI instead,
+as a source installation does.
 
 Restart ComfyUI after installing. To upgrade, run a newer installer with the same ComfyUI folder.
 To uninstall, run `uninstall` in the installation folder. It removes the whole extension folder,

@@ -24,9 +24,10 @@ SUPPORTED_PLATFORMS = ["Windows", "Darwin"]
 # in the base environment it lands built for a single interpreter, and pyyaml hides that by
 # falling back to its pure-Python parser on the other.
 #
-# pywin32 isn't here: its modules have the same names for every Python version, so only one
-# copy could ship. Job attachments imports it only to set permissions on downloaded files, and
-# the panel downloads with the Deadline Cloud CLI, not the bundle.
+# pywin32 isn't here: its modules have the same names for every Python version, so only the build
+# Python's copy ships. Job attachments imports it only to set permissions on files that workers
+# download, which the panel's output downloads don't do. Deadline's config uses it to set the
+# permissions of ~/.deadline when it first creates that folder.
 NATIVE_DEPENDENCIES = ["xxhash", "psutil", "awscrt", "pyyaml"]
 # Which Pythons and CPU the bundle's compiled modules are for. routes.py reads it, and runs the
 # bridge with ComfyUI's Python only when they match.
