@@ -951,6 +951,12 @@ async def call_deadline_cloud(request: web.Request) -> web.Response:
     body = await _read_body(request)
     if isinstance(body, web.Response):
         return body
+    if command == "set-defaults":
+        try:
+            # Only the checked IDs reach the CLI config, which the IDs also name sections of.
+            body = _default_ids(body)
+        except SubmitError as e:
+            return _error(400, str(e))
     try:
         result = await _run_bridge(
             command, body, LOGIN_TIMEOUT if command == "login" else BRIDGE_TIMEOUT
@@ -958,6 +964,32 @@ async def call_deadline_cloud(request: web.Request) -> web.Response:
     except SubmitError as e:
         return _error(502, str(e))
     return web.json_response(result)
+
+
+# The defaults the panel saves to the Deadline Cloud CLI config, by request key: each one's
+# resource type and ID. The config names sections after the farm ID, so an ID with "]" or a line
+# break would add sections or keys of its own.
+_DEFAULT_IDS = {
+    "farmId": ("farm", re.compile(r"farm-[0-9a-f]{32}")),
+    "queueId": ("queue", re.compile(r"queue-[0-9a-f]{32}")),
+    "storageProfileId": ("storage profile", re.compile(r"sp-[0-9a-f]{32}")),
+}
+
+
+def _default_ids(body: dict[str, Any]) -> dict[str, str]:
+    """
+    The farm, queue and storage profile IDs to save as the defaults, each checked before any is
+    saved. An empty string clears that default. Raises SubmitError.
+    """
+    ids: dict[str, str] = {}
+    for key, (kind, pattern) in _DEFAULT_IDS.items():
+        if key not in body:
+            continue
+        value = body[key]
+        if not isinstance(value, str) or (value and not pattern.fullmatch(value)):
+            raise SubmitError(f"{key} must be a Deadline Cloud {kind} ID, or empty to clear it.")
+        ids[key] = value
+    return ids
 
 
 def _model_ids(value: Any) -> set[str]:

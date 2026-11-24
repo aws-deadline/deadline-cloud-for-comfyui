@@ -690,6 +690,43 @@ def test_cloud_only_runs_known_commands(comfy, monkeypatch):
     assert status == 403
 
 
+DEFAULTS = {
+    "farmId": "farm-" + "a" * 32,
+    "queueId": "queue-" + "b" * 32,
+    "storageProfileId": "sp-" + "c" * 32,
+}
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"farmId": "farm-x]\n[other"},
+        {"queueId": "farm-" + "a" * 32},
+        {"storageProfileId": "sp-1"},
+        {"storageProfileId": None},
+        {"farmId": 7},
+    ],
+)
+def test_set_defaults_refuses_malformed_ids_before_saving_any(comfy, monkeypatch, change):
+    """The CLI config names sections after the farm ID, so an ID can't add sections or keys."""
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, {"set-defaults": [result({})]})
+    status, body = run(call(comfy, "/deadline/cloud/set-defaults", {**DEFAULTS, **change}))
+    assert status == 400
+    assert "must be a Deadline Cloud" in body["error"]
+    assert not requests.exists()
+
+
+def test_set_defaults_saves_only_checked_ids_and_empty_resets(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, {"set-defaults": [result({})]})
+    body = {**DEFAULTS, "storageProfileId": "", "extra": "ignored"}
+    status, _ = run(call(comfy, "/deadline/cloud/set-defaults", body))
+    assert status == 200
+    [request] = bridge_requests(requests)
+    assert request["request"] == {**DEFAULTS, "storageProfileId": ""}
+
+
 def test_cloud_needs_the_cli_python(comfy, monkeypatch):
     monkeypatch.setenv(submit.PYTHON_ENV_VAR, str(comfy.tmp_path / "missing"))
     fake_cli(monkeypatch, comfy.tmp_path, "")

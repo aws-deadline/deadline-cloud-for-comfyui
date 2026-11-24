@@ -195,14 +195,43 @@ def test_queue(deadline_api, monkeypatch, capsys):
     }
 
 
+FARM_ID, QUEUE_ID, PROFILE_ID = "farm-" + "a" * 32, "queue-" + "b" * 32, "sp-" + "c" * 32
+
+
 def test_set_defaults_saves_the_farm_queue_and_storage_profile(deadline_api, monkeypatch, capsys):
-    request = {"farmId": "farm-2", "queueId": "queue-2", "storageProfileId": "sp-1"}
+    request = {"farmId": FARM_ID, "queueId": QUEUE_ID, "storageProfileId": PROFILE_ID}
     code, _ = run(monkeypatch, capsys, "set-defaults", request)
     assert code == 0
     written = deadline_api.config_file.written
-    assert written["defaults.farm_id"] == "farm-2"
-    assert written["defaults.queue_id"] == "queue-2"
-    assert written["settings.storage_profile_id"] == "sp-1"
+    assert written["defaults.farm_id"] == FARM_ID
+    assert written["defaults.queue_id"] == QUEUE_ID
+    assert written["settings.storage_profile_id"] == PROFILE_ID
+
+
+def test_set_defaults_clears_a_default_set_to_an_empty_string(deadline_api, monkeypatch, capsys):
+    request = {"farmId": FARM_ID, "queueId": QUEUE_ID, "storageProfileId": ""}
+    code, _ = run(monkeypatch, capsys, "set-defaults", request)
+    assert code == 0
+    assert deadline_api.config_file.written["settings.storage_profile_id"] == ""
+
+
+@pytest.mark.parametrize(
+    "request_ids",
+    [
+        {"farmId": "farm-x]\n[other", "queueId": QUEUE_ID},
+        {"farmId": FARM_ID, "queueId": "queue-2"},
+        {"farmId": FARM_ID, "queueId": QUEUE_ID, "storageProfileId": "sp-1"},
+        {"farmId": QUEUE_ID},
+        {"farmId": 7},
+    ],
+)
+def test_set_defaults_saves_nothing_when_an_id_is_malformed(
+    deadline_api, monkeypatch, capsys, request_ids
+):
+    code, events = run(monkeypatch, capsys, "set-defaults", request_ids)
+    assert code == 1
+    assert events[-1]["event"] == "error"
+    assert deadline_api.config_file.written is None
 
 
 SUBMISSION = {

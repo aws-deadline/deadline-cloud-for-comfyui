@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import sys
 import time
 from collections.abc import Callable
@@ -142,11 +143,26 @@ def queue(request: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# What each saved default's ID looks like. An empty string clears it.
+DEFAULT_IDS = {
+    "farmId": re.compile(r"farm-[0-9a-f]{32}"),
+    "queueId": re.compile(r"queue-[0-9a-f]{32}"),
+    "storageProfileId": re.compile(r"sp-[0-9a-f]{32}"),
+}
+
+
 def set_defaults(request: dict[str, Any]) -> dict[str, Any]:
-    """Saves the farm, queue and storage profile as the defaults."""
+    """
+    Saves the farm, queue and storage profile as the defaults. Every ID is checked before
+    anything is saved: the config names sections after the farm ID.
+    """
     from deadline.client.config import config_file
 
-    config_file.write_config(_config(request))
+    for key, pattern in DEFAULT_IDS.items():
+        value = request.get(key, "")
+        if not isinstance(value, str) or (value and not pattern.fullmatch(value)):
+            raise ValueError(f"{key} isn't a Deadline Cloud ID.")
+    config_file.write_config(_config({key: request[key] for key in DEFAULT_IDS if key in request}))
     return {}
 
 
