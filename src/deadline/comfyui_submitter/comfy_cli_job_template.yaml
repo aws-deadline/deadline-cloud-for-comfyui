@@ -116,8 +116,9 @@ parameterDefinitions:
     Use quotes to group arguments that contain spaces. Shell commands, variable
     expansion and command substitution are not supported. The template's listen
     address, port and input, output and base directories take precedence. Options
-    that enable CORS or TLS, serve another front end, move the user or temp
-    directory or the database, or enable ComfyUI-Manager are refused.
+    that enable CORS or TLS, serve or download another front end, move the user or
+    temp directory or the database, add an extra model paths file, or enable
+    ComfyUI-Manager are refused. Use Extra Model Paths Config for a model paths file.
 - name: ServerStartTimeout
   type: INT
   userInterface:
@@ -345,9 +346,12 @@ jobEnvironments:
         # Options that would open the worker's ComfyUI server to other origins or serve other
         # files, read or write outside the session, or install packages without the
         # requirements check. argparse also takes a unique prefix of an option.
+        # An extra model paths file can add custom_nodes folders, which load code even with
+        # Attach Custom Nodes off. Studios set one with the Extra Model Paths Config parameter.
         REFUSED = (
             "--enable-cors-header", "--tls-keyfile", "--tls-certfile", "--front-end-root",
-            "--user-directory", "--temp-directory", "--database-url", "--enable-manager",
+            "--front-end-version", "--user-directory", "--temp-directory", "--database-url",
+            "--enable-manager", "--extra-model-paths-config",
         )
         try:
             extra_args = shlex.split(os.environ["COMFYUI_ARGS"])

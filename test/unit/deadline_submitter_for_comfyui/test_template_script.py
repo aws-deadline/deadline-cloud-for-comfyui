@@ -516,6 +516,11 @@ def test_enter_keeps_the_required_server_arguments_authoritative(tmp_path, extra
         "--temp-dir=/shared",
         "--database-url sqlite:////shared/comfy.db",
         "--enable-manager",
+        # A model paths file with a custom_nodes key loads code from any worker path.
+        "--extra-model-paths-config /shared/nodes.yaml",
+        "--extra-model-paths=/shared/nodes.yaml",
+        # Downloads a front end from GitHub and serves it.
+        "--front-end-version org/frontend@latest",
     ],
 )
 def test_enter_refuses_arguments_that_widen_access_before_launching(tmp_path, extra_args):
