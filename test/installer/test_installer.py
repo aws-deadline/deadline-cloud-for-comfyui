@@ -130,6 +130,15 @@ def _validate_files(installation: Installation) -> None:
     assert "awscrt" in dependency_names
     # The panel is a web page, so the bundle doesn't need Qt.
     assert "PySide6" not in dependency_names
+    # Every bundled package's license ships with the extension.
+    licenses = (installation.extension / "THIRD_PARTY_LICENSES").read_text(encoding="utf-8")
+    for dist_info in dependencies.glob("*.dist-info"):
+        fields = dict(
+            line.split(": ", 1)
+            for line in (dist_info / "METADATA").read_text(encoding="utf-8").splitlines()
+            if line.startswith(("Name: ", "Version: "))
+        )
+        assert f"{fields['Name']} {fields['Version']}" in licenses, f"{dist_info.name} isn't listed"
     # routes.py runs the bridge with ComfyUI's Python only when it's one the bundle is for.
     description = json.loads((dependencies / "bundle.json").read_text())
     assert description == {

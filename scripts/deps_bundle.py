@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+from importlib import metadata
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -32,6 +33,9 @@ NATIVE_DEPENDENCIES = ["xxhash", "psutil", "awscrt", "pyyaml"]
 # Which Pythons and CPU the bundle's compiled modules are for. routes.py reads it, and runs the
 # bridge with ComfyUI's Python only when they match.
 BUNDLE_DESCRIPTION = "bundle.json"
+# The licenses of the bundled packages, which the installer puts in the extension's folder.
+THIRD_PARTY_LICENSES = "THIRD_PARTY_LICENSES"
+RULE = "=" * 80
 
 
 def _get_package_version_regex(package: str) -> re.Pattern:
@@ -160,6 +164,37 @@ def _describe_bundle(base_env: Path) -> None:
     (base_env / BUNDLE_DESCRIPTION).write_text(json.dumps(description, indent=2) + "\n")
 
 
+def _third_party_licenses(base_env: Path) -> str:
+    """Each bundled package's license, from the license files its wheel lists in License-File."""
+    sections = [
+        (
+            "The Windows and macOS installers include these packages in the extension's "
+            "dependencies folder.\n"
+        )
+    ]
+    distributions = metadata.distributions(path=[str(base_env)])
+    for distribution in sorted(distributions, key=lambda d: d.metadata["Name"].lower()):
+        name, version = distribution.metadata["Name"], distribution.version
+        license_name = (
+            distribution.metadata.get("License-Expression")
+            or distribution.metadata.get("License")
+            or "See the license files below"
+        )
+        texts = []
+        for license_file in distribution.metadata.get_all("License-File") or []:
+            # Wheels with core metadata 2.4 keep them in licenses/, older wheels next to METADATA.
+            text = distribution.read_text(f"licenses/{license_file}")
+            if text is None:
+                text = distribution.read_text(license_file)
+            if text is not None:
+                texts.append(f"{license_file}\n\n{text.strip()}\n")
+        if not texts:
+            raise RuntimeError(f"{name} {version} doesn't include its license files.")
+        sections.append(f"{RULE}\n{name} {version}\nLicense: {license_name}\n{RULE}\n")
+        sections.extend(texts)
+    return "\n".join(sections)
+
+
 def _get_zip_path(working_directory: Path, project_dict: dict[str, Any]) -> Path:
     if "project" not in project_dict:
         raise ValueError("pyproject.toml is missing project section")
@@ -173,6 +208,13 @@ def _get_zip_path(working_directory: Path, project_dict: dict[str, Any]) -> Path
 
 def _zip_bundle(base_env: Path, zip_path: Path) -> None:
     shutil.make_archive(str(zip_path.with_suffix("")), "zip", str(base_env))
+
+
+def _write_third_party_licenses(base_env: Path) -> Path:
+    destination = get_git_root() / "dependency_bundle" / THIRD_PARTY_LICENSES
+    destination.parent.mkdir(exist_ok=True)
+    destination.write_text(_third_party_licenses(base_env), encoding="utf-8")
+    return destination
 
 
 def _copy_zip_to_destination(zip_path: Path) -> Path:
@@ -196,6 +238,7 @@ def build_deps_bundle() -> None:
         native_dependency_paths = _download_native_dependencies(working_directory, base_env)
         _copy_native_to_base_env(base_env, native_dependency_paths)
         _describe_bundle(base_env)
+        _write_third_party_licenses(base_env)
         zip_path = _get_zip_path(working_directory, project_dict)
         _zip_bundle(base_env, zip_path)
         print(list(working_directory.glob("*")))

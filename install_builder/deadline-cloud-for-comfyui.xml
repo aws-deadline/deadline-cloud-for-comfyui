@@ -22,6 +22,10 @@
                 <distributionFile>
                     <origin>../NOTICE</origin>
                 </distributionFile>
+                <!-- Written by scripts/deps_bundle.py with the dependency bundle. -->
+                <distributionFile>
+                    <origin>../dependency_bundle/THIRD_PARTY_LICENSES</origin>
+                </distributionFile>
             </distributionFileList>
         </folder>
         <folder>
