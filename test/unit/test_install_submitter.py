@@ -111,6 +111,17 @@ def test_runtime_files_include_every_tracked_package_file():
     assert Path("src", "deadline", "__init__.py") not in tracked
 
 
+def test_panel_files_are_every_module_the_build_compiles():
+    """A new panel module isn't installed until it's added to PANEL_FILES."""
+    source = REPO_ROOT / "frontend" / "src" / "extensions" / "deadline-cloud"
+    modules = {
+        path.relative_to(source).with_suffix(".js").as_posix()
+        for path in source.rglob("*.ts")
+        if not path.name.endswith(".d.ts")
+    }
+    assert modules == set(install.PANEL_FILES)
+
+
 def test_install_extension_copies_only_the_runtime_files(comfyui, checkout):
     """A checkout's local settings, credentials, logs, old builds and experiments stay out."""
     for name in (".npmrc", ".netrc", ".pypirc", ".env", "credentials.json", "key.pem"):
