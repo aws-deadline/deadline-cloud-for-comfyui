@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import platform
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -25,6 +28,9 @@ SUPPORTED_PLATFORMS = ["Windows", "Darwin"]
 # copy could ship. Job attachments imports it only to set permissions on downloaded files, and
 # the panel downloads with the Deadline Cloud CLI, not the bundle.
 NATIVE_DEPENDENCIES = ["xxhash", "psutil", "awscrt", "pyyaml"]
+# Which Pythons and CPU the bundle's compiled modules are for. routes.py reads it, and runs the
+# bridge with ComfyUI's Python only when they match.
+BUNDLE_DESCRIPTION = "bundle.json"
 
 
 def _get_package_version_regex(package: str) -> re.Pattern:
@@ -144,6 +150,15 @@ def _copy_native_to_base_env(base_env: Path, native_dependency_paths: list[Path]
                 copied.add(relative)
 
 
+def _describe_bundle(base_env: Path) -> None:
+    description = {
+        "python_versions": SUPPORTED_PYTHON_VERSIONS,
+        "platform": sys.platform,
+        "machine": platform.machine(),
+    }
+    (base_env / BUNDLE_DESCRIPTION).write_text(json.dumps(description, indent=2) + "\n")
+
+
 def _get_zip_path(working_directory: Path, project_dict: dict[str, Any]) -> Path:
     if "project" not in project_dict:
         raise ValueError("pyproject.toml is missing project section")
@@ -179,6 +194,7 @@ def build_deps_bundle() -> None:
         base_env = _build_base_environment(working_directory, dependencies)
         native_dependency_paths = _download_native_dependencies(working_directory, base_env)
         _copy_native_to_base_env(base_env, native_dependency_paths)
+        _describe_bundle(base_env)
         zip_path = _get_zip_path(working_directory, project_dict)
         _zip_bundle(base_env, zip_path)
         print(list(working_directory.glob("*")))

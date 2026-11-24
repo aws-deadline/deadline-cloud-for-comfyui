@@ -130,6 +130,13 @@ def _validate_files(installation: Installation) -> None:
     assert "awscrt" in dependency_names
     # The panel is a web page, so the bundle doesn't need Qt.
     assert "PySide6" not in dependency_names
+    # routes.py runs the bridge with ComfyUI's Python only when it's one the bundle is for.
+    description = json.loads((dependencies / "bundle.json").read_text())
+    assert description == {
+        "python_versions": SUPPORTED_PYTHON_VERSIONS,
+        "platform": sys.platform,
+        "machine": platform.machine(),
+    }
 
     # A compiled module built for one Python version only imports under that version, and
     # pyyaml hides a missing one by falling back to its pure-Python parser. So every module named
