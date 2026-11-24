@@ -11,7 +11,7 @@ import os
 import re
 import shutil
 import sys
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -215,19 +215,69 @@ def check_cli_version(cli: str, version_output: str) -> None:
         )
 
 
-def _describe_missing_node(node_id: str, ui_workflow: Any) -> str:
-    # A node inside a subgraph has an API ID like "12:137"; its UI ID is the last part.
-    ui_id = node_id.rsplit(":", 1)[-1]
-    for node in _workflow_nodes(ui_workflow):
-        if str(node.get("id")) != ui_id:
-            continue
-        description = f"{node_id} ({node.get('type')}"
-        properties = node.get("properties")
-        pack = properties.get("cnr_id") if isinstance(properties, dict) else None
-        if isinstance(pack, str):
-            description += f", from the {pack} node pack"
-        return description + ")"
-    return node_id
+class _UiNodes:
+    """
+    A UI-format workflow's nodes, indexed once: the top-level nodes and each subgraph's nodes, by
+    ID. A node inside a subgraph has an API ID like "12:137": node 137 of the subgraph that
+    top-level node 12 is an instance of.
+    """
+
+    def __init__(self, ui_workflow: Any):
+        self.top: dict[str, dict[str, Any]] = {}
+        self.subgraphs: dict[str, dict[str, dict[str, Any]]] = {}
+        # Any subgraph's node, by its own ID, for an API ID whose path can't be followed.
+        self.anywhere: dict[str, dict[str, Any]] = {}
+        if isinstance(ui_workflow, dict):
+            self.top = self._index(ui_workflow.get("nodes"))
+            self._add_subgraphs(ui_workflow, depth=0)
+
+    @staticmethod
+    def _index(nodes: Any) -> dict[str, dict[str, Any]]:
+        index: dict[str, dict[str, Any]] = {}
+        for node in nodes if isinstance(nodes, list) else []:
+            if isinstance(node, dict):
+                index.setdefault(str(node.get("id")), node)
+        return index
+
+    def _add_subgraphs(self, value: dict[str, Any], depth: int) -> None:
+        definitions = value.get("definitions")
+        subgraphs = definitions.get("subgraphs") if isinstance(definitions, dict) else None
+        # ComfyUI keeps every subgraph's definition at the top. The depth limit is for nesting.
+        if not isinstance(subgraphs, list) or depth > 32:
+            return
+        for subgraph in subgraphs:
+            if not isinstance(subgraph, dict):
+                continue
+            nodes = self._index(subgraph.get("nodes"))
+            self.subgraphs.setdefault(str(subgraph.get("id")), nodes)
+            for node_id, node in nodes.items():
+                self.anywhere.setdefault(node_id, node)
+            self._add_subgraphs(subgraph, depth + 1)
+
+    def find(self, api_id: str) -> dict[str, Any] | None:
+        *path, last = api_id.split(":")
+        scope: dict[str, dict[str, Any]] | None = self.top
+        for part in path:
+            instance = scope.get(part) if scope is not None else None
+            scope = self.subgraphs.get(str(instance.get("type"))) if instance else None
+        node = scope.get(last) if scope is not None else None
+        return node or (self.anywhere.get(last) if path else None)
+
+
+def _describe_missing_node(node_id: str, ui_nodes: _UiNodes) -> str:
+    node = ui_nodes.find(node_id)
+    if node is None:
+        return node_id
+    description = f"{node_id} ({node.get('type')}"
+    properties = node.get("properties")
+    pack = properties.get("cnr_id") if isinstance(properties, dict) else None
+    if isinstance(pack, str):
+        description += f", from the {pack} node pack"
+    return description + ")"
+
+
+# The most missing nodes an error describes. A workflow can have thousands.
+_MAX_DESCRIBED_NODES = 20
 
 
 # Job bundles hold the artist's workflow, prompts and file paths, so only the user that runs
@@ -263,12 +313,19 @@ def validate_api_workflow(workflow: Any, ui_workflow: Any = None) -> dict[str, A
         raise SubmitError("The workflow is in UI format. The submitter needs the API format.")
     # ComfyUI leaves out class_type for a node type it has no definition for, so the node can't
     # be turned into the API format.
-    missing = [
-        _describe_missing_node(str(node_id), ui_workflow)
+    missing_ids = [
+        str(node_id)
         for node_id, node in workflow.items()
         if not isinstance(node, dict) or "class_type" not in node
     ]
-    if missing:
+    if missing_ids:
+        ui_nodes = _UiNodes(ui_workflow)
+        missing = [
+            _describe_missing_node(node_id, ui_nodes)
+            for node_id in missing_ids[:_MAX_DESCRIBED_NODES]
+        ]
+        if len(missing_ids) > _MAX_DESCRIBED_NODES:
+            missing.append(f"and {len(missing_ids) - _MAX_DESCRIBED_NODES} more")
         raise SubmitError(
             f"This ComfyUI can't convert node {', '.join(missing)} because its node type isn't "
             "installed. Install the missing node packs and restart ComfyUI. Manager > Install "
@@ -312,15 +369,34 @@ def _quoted(value: Any) -> str:
 # Core nodes that load every image in a folder of the input directory as a list.
 FOLDER_LOADERS = ("LoadImageDataSetFromFolder",)
 # Nodes whose folder input names a folder of the input directory, which is sent with the job.
-FOLDER_INPUT_NODES = (*FOLDER_LOADERS, "LoadImageTextDataSetFromFolder")
+FOLDER_INPUT_NODES = (
+    *FOLDER_LOADERS,
+    "LoadImageTextDataSetFromFolder",
+    "LoadVideoDataSetFromFolder",
+    "LoadVideoTextDataSetFromFolder",
+)
 # The images that LoadImageDataSetFromFolder loads.
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
+# The most files a folder loader's folder attaches, so the plan stays quick to make and to show.
+# The artist can add a bigger folder in the panel.
+MAX_FOLDER_FILES = 10_000
+# The most entries read in all the folders of one workflow's folder loaders: files, folders, and
+# links that lead out. A folder of empty folders or of links has no files to count.
+MAX_FOLDER_ENTRIES = 50_000
 # The _meta key that marks the nodes the task script splits, with the task parameter of each.
 ITEM_META = "deadline_item"
 # The images of a folder, as paths in the input directory, in the order its items are numbered.
 FILES_META = "deadline_files"
 # OpenJD allows 16 task parameters in a step.
 MAX_ITEM_SOURCES = 16
+# The most lists and folders a workflow's plan considers. Later ones run whole in each task. It
+# keeps planning a workflow with thousands of list nodes quick.
+MAX_PLANNED_SOURCES = 256
+# The most tasks a job can run: every combination of its lists' items. The panel has the same
+# limit.
+MAX_TASKS = 10_000
+# The longest range of a list's items, which is also the job parameter's maxLength.
+MAX_ITEM_RANGE_LENGTH = 1024
 # The line that marks the task script that selects each task's items, which it reads from its
 # NAME=NUMBER arguments. A job template without it runs whole lists.
 ITEMS_PLACEHOLDER = "ITEMS = {}"
@@ -355,36 +431,168 @@ def input_path(input_dir: Path | str, name: Any) -> Path | None:
         name = name[: -len(" [input]")]
     elif re.search(r" \[(output|temp)\]$", name):
         return None
-    # ComfyUI checks paths this way too, without resolving symbolic links.
+    # ComfyUI checks paths this way too, without resolving symbolic links. The submitter checks
+    # links as well, with leads_inside, before it attaches anything.
     base = Path(os.path.abspath(input_dir))
     path = Path(os.path.abspath(base / name))
     return path if path != base and path.is_relative_to(base) else None
 
 
-def image_files(directory: Path) -> list[str]:
-    """The images in a folder that LoadImageDataSetFromFolder loads, in name order."""
+def without_long_path_prefix(path: str) -> str:
+    r"""
+    path without the \\?\ prefix that Windows' realpath adds to a path that's too long to have
+    none, so it compares with a path that doesn't have it. \\?\UNC\server\share becomes
+    \\server\share. Comparing is all it's for: Windows may need the prefix to open a long path.
+    """
+    if path[:8].upper() == "\\\\?\\UNC\\":
+        return "\\\\" + path[8:]
+    if path.startswith("\\\\?\\"):
+        return path[4:]
+    return path
+
+
+def real_path(path: Path | str) -> Path:
+    """
+    path with every link resolved, so a folder that's a link can still be a root, for comparing
+    with another real path.
+    """
+    return Path(without_long_path_prefix(os.fspath(os.path.realpath(path))))
+
+
+def leads_inside(path: Path | str, root: Path) -> bool:
+    """
+    Whether path, with every link resolved, is inside root, whose links are resolved already.
+    Job attachments uploads what a link points to, so a link in ComfyUI's input folder could
+    otherwise attach any file on the disk. Every path is resolved, not only symbolic links, since
+    Python doesn't count a Windows directory junction as one.
+    """
     try:
-        return sorted(
-            entry.name
-            for entry in directory.iterdir()
-            if entry.is_file() and entry.name.lower().endswith(IMAGE_EXTENSIONS)
-        )
-    except OSError:
-        return []
+        real = real_path(path)
+    except (OSError, ValueError):
+        return False
+    return real != root and real.is_relative_to(root)
 
 
-def input_folders(workflow: dict[str, Any], input_dir: Path) -> list[Path]:
+def input_folders(
+    workflow: Mapping[str, Any], input_dir: Path, warnings: list[str] | None = None
+) -> list[Path]:
     """
-    Returns the folders in ComfyUI's input directory that the workflow's folder loaders read.
+    Returns the folders in ComfyUI's input directory that the workflow's folder loaders read. A
+    folder that leads out of the input directory through a link is left out, with a warning in
+    warnings. The folders aren't attached whole: get_local_assets attaches the files in them.
     """
+    root = real_path(input_dir)
     folders = set()
-    for node in workflow.values():
-        if node.get("class_type") not in FOLDER_INPUT_NODES:
+    for node_id, node in workflow.items():
+        if not isinstance(node, Mapping) or node.get("class_type") not in FOLDER_INPUT_NODES:
             continue
-        path = input_path(input_dir, node.get("inputs", {}).get("folder"))
-        if path is not None and path.is_dir():
+        inputs = node.get("inputs")
+        folder = inputs.get("folder") if isinstance(inputs, Mapping) else None
+        path = input_path(input_dir, folder)
+        if path is None or not path.is_dir():
+            continue
+        if leads_inside(path, root):
             folders.add(path)
+        elif warnings is not None:
+            warnings.append(
+                f"Node {_quoted(node_id)} loads the folder {_quoted(folder)!r}, which links "
+                "outside ComfyUI's input folder, so it isn't attached. Add it with Add folder… "
+                "if the job needs it."
+            )
     return sorted(folders)
+
+
+@dataclass
+class FolderFiles:
+    """What list_input_folders found in a folder loader's folder."""
+
+    # The files that are attached, sorted.
+    files: list[Path] = field(default_factory=list)
+    # The entries that lead out of ComfyUI's input folder, which aren't attached, sorted.
+    outside: list[Path] = field(default_factory=list)
+    # Why nothing in the folder is attached when it's too big to list, to follow "The folder
+    # 'cats' ", such as "has more than 10,000 files". None when it's listed in full.
+    too_big: str | None = None
+
+
+class _Budget:
+    """The entries left to read in one workflow's folders."""
+
+    def __init__(self, entries: int):
+        self.left = entries
+
+
+def list_input_folders(
+    workflow: Mapping[str, Any], input_dir: Path, warnings: list[str] | None = None
+) -> dict[Path, FolderFiles]:
+    """
+    The files in each folder that input_folders finds, by folder, as attachments and task lists
+    both see them, so a folder whose files aren't attached is never split into tasks. The folders
+    share MAX_FOLDER_ENTRIES, and each attaches at most MAX_FOLDER_FILES files. A folder that
+    goes past either attaches nothing.
+    """
+    root = real_path(input_dir)
+    budget = _Budget(MAX_FOLDER_ENTRIES)
+    return {
+        folder: _list_folder(folder, root, budget)
+        for folder in input_folders(workflow, input_dir, warnings)
+    }
+
+
+def _list_folder(folder: Path, root: Path, budget: _Budget) -> FolderFiles:
+    """
+    The files in a folder and its subfolders, and the entries that lead out of root, the real
+    path of ComfyUI's input folder. Every entry is resolved, not only symbolic links, since Python
+    doesn't count a Windows directory junction as one. A link to a folder in the input folder
+    isn't followed, so walking can't loop. A link to a file in it is attached under its own name.
+    """
+    files: list[Path] = []
+    outside: list[Path] = []
+    pending = [folder]
+    while pending:
+        directory = pending.pop()
+        names = []
+        try:
+            real_directory = str(real_path(directory))
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    budget.left -= 1
+                    if budget.left < 0:
+                        return FolderFiles(
+                            too_big=f"takes the workflow's folders past {MAX_FOLDER_ENTRIES:,} "
+                            "entries"
+                        )
+                    names.append(entry.name)
+        except (OSError, ValueError):
+            continue
+        for name in sorted(names):
+            path = directory / name
+            try:
+                real = real_path(path)
+            except (OSError, ValueError):
+                continue
+            if not real.is_relative_to(root):
+                outside.append(path)
+            elif path.is_dir():
+                if str(real) == os.path.join(real_directory, name):
+                    pending.append(path)
+            elif path.is_file():
+                files.append(path)
+                if len(files) > MAX_FOLDER_FILES:
+                    return FolderFiles(too_big=f"has more than {MAX_FOLDER_FILES:,} files")
+    return FolderFiles(sorted(files), sorted(outside))
+
+
+def folder_images(folder: Path, files: Iterable[Path]) -> list[str]:
+    """
+    The names of the images in folder itself, of its attached files, that
+    LoadImageDataSetFromFolder loads, in name order. Only attached images can be a task's item.
+    """
+    return sorted(
+        path.name
+        for path in files
+        if path.parent == folder and path.name.lower().endswith(IMAGE_EXTENSIONS)
+    )
 
 
 @dataclass
@@ -427,16 +635,24 @@ MAX_SOURCE_NAME = 64 - len("Items")
 _ITEM_RANGE_PART = re.compile(r"(\d{1,9})(?:\s*-\s*(\d{1,9})(?:\s*:\s*(\d{1,9}))?)?", re.ASCII)
 
 
-def check_item_range(source: ItemSource, value: Any) -> None:
+def check_item_range(source: ItemSource, value: Any) -> tuple[str, int]:
     """
     Checks the range of a list's items to run, as OpenJD and the task script take it: "0" on its
     own, or item numbers from 1 to the list's count, in parts that don't overlap. The panel checks
-    it against the plan it made, so this catches a list that changed since. Raises SubmitError.
+    it against the plan it made, so this catches a list that changed since. Returns the range as
+    it's submitted, without spaces, and how many items it runs, which is 1 for "0". Raises
+    SubmitError.
     """
     text = str(value).strip()
     if text == "0":
-        return
+        return "0", 1
+    if len(text) > MAX_ITEM_RANGE_LENGTH:
+        raise SubmitError(
+            f"{source.title}: a range of items can be at most {MAX_ITEM_RANGE_LENGTH} characters."
+        )
     spans: list[tuple[int, int]] = []
+    parts: list[str] = []
+    count = 0
     for part in text.split(","):
         match = _ITEM_RANGE_PART.fullmatch(part.strip())
         if match:
@@ -446,6 +662,10 @@ def check_item_range(source: ItemSource, value: Any) -> None:
                 f"{source.title}: use item numbers such as 1-{source.count} or 2,3, not {text!r}."
             )
         spans.append((start, start + (end - start) // step * step))
+        count += (end - start) // step + 1
+        parts.append(
+            str(start) if end == start else f"{start}-{end}" + (f":{step}" if step > 1 else "")
+        )
     spans.sort()
     if any(spans[i][1] >= spans[i + 1][0] for i in range(len(spans) - 1)):
         raise SubmitError(f"{source.title}: {text!r} lists an item more than once.")
@@ -454,6 +674,36 @@ def check_item_range(source: ItemSource, value: Any) -> None:
             f"{source.title} has {source.count} items, so it can't run {text!r}. Read the "
             "workflow again, then choose its items."
         )
+    return ",".join(parts), count
+
+
+def check_task_count(counts: Iterable[int]) -> int:
+    """
+    The number of tasks that the lists' item counts make, since tasks run every combination of
+    them. Raises SubmitError when it's over MAX_TASKS.
+    """
+    total = math.prod(counts)
+    if total > MAX_TASKS:
+        raise SubmitError(
+            f"The job would run {total:,} tasks, every combination of its lists' items, which is "
+            f"over the limit of {MAX_TASKS:,}. Choose fewer items, or run a list whole with 0."
+        )
+    return total
+
+
+def without_submitter_meta(workflow: dict[str, Any]) -> dict[str, Any]:
+    """
+    A copy of an API workflow without the _meta keys that the submitter writes for the task
+    script. A shared workflow's own could make the task script follow a list, or load files, that
+    the panel never showed.
+    """
+    workflow = copy.deepcopy(workflow)
+    for node in workflow.values():
+        meta = node.get("_meta") if isinstance(node, dict) else None
+        if isinstance(meta, dict):
+            for key in [key for key in meta if str(key).startswith(_SUBMITTER_META_PREFIX)]:
+                del meta[key]
+    return workflow
 
 
 @dataclass
@@ -503,17 +753,24 @@ def _source_name(kind: str, node_id: str, node: dict[str, Any]) -> str:
     return name or (kind.capitalize() + re.sub(r"[^A-Za-z0-9_]", "_", node_id))[:MAX_SOURCE_NAME]
 
 
-def _connection_title(node_id: str, workflow: dict[str, Any]) -> str | None:
+def _consumers(workflow: dict[str, Any]) -> dict[str, list[tuple[dict[str, Any], str]]]:
+    """
+    Each node's consumers: the (node, input name) pairs that its outputs connect to. It's built
+    once for the workflow, so naming every list doesn't read the whole workflow again for each.
+    """
+    consumers: dict[str, list[tuple[dict[str, Any], str]]] = {}
+    for other in workflow.values():
+        for key, value in (other.get("inputs") or {}).items():
+            if isinstance(value, list) and len(value) == 2 and isinstance(value[1], int):
+                consumers.setdefault(str(value[0]), []).append((other, key))
+    return consumers
+
+
+def _connection_title(
+    node_id: str, consumers: Mapping[str, list[tuple[dict[str, Any], str]]]
+) -> str | None:
     """What a node's output connects to, such as "Image Scale · width" or "Image Scale · width +1"."""
-    connections = [
-        (other, key)
-        for other in workflow.values()
-        for key, value in (other.get("inputs") or {}).items()
-        if isinstance(value, list)
-        and len(value) == 2
-        and isinstance(value[1], int)
-        and str(value[0]) == str(node_id)
-    ]
+    connections = consumers.get(str(node_id), [])
     if not connections:
         return None
     other, key = connections[0]
@@ -548,7 +805,11 @@ def _list_items(inputs: dict[str, Any], workflow: dict[str, Any]) -> list[str]:
     return items
 
 
-def _source_title(source: ItemSource, workflow: dict[str, Any]) -> str:
+def _source_title(
+    source: ItemSource,
+    workflow: dict[str, Any],
+    consumers: Mapping[str, list[tuple[dict[str, Any], str]]],
+) -> str:
     """
     Names a source for the panel by what it changes: its node's given title or what its output
     connects to, and otherwise its label. A folder's label names the folder.
@@ -557,7 +818,13 @@ def _source_title(source: ItemSource, workflow: dict[str, Any]) -> str:
     renamed = _renamed_title(node)
     if renamed or source.kind == "folder":
         return renamed or source.label
-    return _connection_title(source.node_id, workflow) or source.label
+    return _connection_title(source.node_id, consumers) or source.label
+
+
+def _some(labels: list[str], shown: int = 5) -> str:
+    """The first few labels, and how many more there are."""
+    more = f", and {len(labels) - shown} more" if len(labels) > shown else ""
+    return ", ".join(labels[:shown]) + more
 
 
 def plan_task_lists(
@@ -569,20 +836,31 @@ def plan_task_lists(
     items, and tasks run every combination of them. reserved lists the job template's parameter
     names, which the lists' job parameters steer clear of.
     """
-    workflow = copy.deepcopy(api_workflow)
+    # The task script follows the submitter's _meta keys, so a shared workflow's own could make a
+    # node follow another list's items, or load files the panel never showed.
+    workflow = without_submitter_meta(api_workflow)
     plan = TaskLists(workflow)
+    consumers = _consumers(workflow)
+    base = Path(os.path.abspath(input_dir)) if input_dir else None
+    # Each folder's items are its attached images, as get_local_assets lists them. An image that
+    # links outside the input directory, or is in a folder that does or that's too big to attach,
+    # isn't attached, so it can't be one of a task's items. Folders are only listed when a folder
+    # loader could be split.
+    listed: dict[Path, FolderFiles] | None = None
+    too_big: list[tuple[str, str]] = []
+    unplanned = 0
     for node_id, node in workflow.items():
         class_type = node.get("class_type")
         inputs = node.get("inputs", {})
         meta = node.get("_meta")
         if not isinstance(meta, dict):
             meta = node["_meta"] = {}
-        # The task script follows these keys, so a shared workflow's own could make a node follow
-        # another list's items, or load files the panel never showed.
-        for key in [key for key in meta if str(key).startswith(_SUBMITTER_META_PREFIX)]:
-            del meta[key]
         source: ItemSource | None = None
-        if class_type == "CreateList":
+        if class_type in ("CreateList", *FOLDER_LOADERS) and (
+            len(plan.sources) >= MAX_PLANNED_SOURCES
+        ):
+            unplanned += 1
+        elif class_type == "CreateList":
             values = _list_items(inputs, workflow)
             if len(values) > 1:
                 source = ItemSource(
@@ -590,10 +868,20 @@ def plan_task_lists(
                 )
         elif class_type in FOLDER_LOADERS:
             folder = inputs.get("folder")
-            directory = input_path(input_dir, folder) if input_dir else None
-            files = image_files(directory) if directory else []
-            if len(files) > 1:
-                meta[FILES_META] = [f"{folder}/{name}" for name in files]
+            directory = input_path(base, folder) if base else None
+            if directory and base and listed is None:
+                listed = list_input_folders(workflow, base)
+            listing = listed.get(directory) if directory and listed else None
+            files: list[str] = []
+            if listing and listing.too_big:
+                too_big.append((f"Folder {_quoted(folder)} (#{_quoted(node_id)})", listing.too_big))
+            elif directory and listing:
+                files = folder_images(directory, listing.files)
+            if directory and base and len(files) > 1:
+                # Relative to the input directory, which the job maps, whatever the workflow's
+                # folder says, such as an absolute path on this machine or one with "..".
+                relative = directory.relative_to(base).as_posix()
+                meta[FILES_META] = [f"{relative}/{name}" for name in files]
                 source = ItemSource(
                     "",
                     f"Folder {folder} (#{node_id})",
@@ -604,8 +892,21 @@ def plan_task_lists(
                 )
         if source:
             source.name = _source_name(source.kind, node_id, node)
-            source.title = _source_title(source, workflow)
+            source.title = _source_title(source, workflow, consumers)
             plan.sources.append(source)
+    if unplanned:
+        plan.warnings.append(
+            f"Deadline Cloud reads up to {MAX_PLANNED_SOURCES} lists and folders in a workflow, so "
+            f"{unplanned} more run whole in each task."
+        )
+    if len(too_big) == 1:
+        label, reason = too_big[0]
+        plan.warnings.append(f"{label} {reason}, so it isn't attached or split into tasks.")
+    elif too_big:
+        plan.warnings.append(
+            "These folders are too big to attach, so they aren't split into tasks: "
+            f"{_some([label for label, _ in too_big])}."
+        )
     # Two lists the artist gave the same title keep it, with their node IDs, and a number when that's
     # taken too.
     names: set[str] = set()
@@ -627,7 +928,7 @@ def plan_task_lists(
     if len(active) > MAX_ITEM_SOURCES:
         plan.warnings.append(
             f"Deadline Cloud splits up to {MAX_ITEM_SOURCES} fields into tasks, so these run "
-            f"whole in each task: {', '.join(s.label for s in active[MAX_ITEM_SOURCES:])}."
+            f"whole in each task: {_some([s.label for s in active[MAX_ITEM_SOURCES:]])}."
         )
     # Mark the nodes of the sources that run as separate tasks. The task script runs others whole.
     for source in plan.active:
@@ -662,6 +963,7 @@ def _item_parameters(source: ItemSource) -> dict[str, Any]:
     return {
         "name": source.parameter,
         "type": "STRING",
+        "maxLength": MAX_ITEM_RANGE_LENGTH,
         "userInterface": {
             "control": "LINE_EDIT",
             "label": _LABEL_CONTROL_CHARACTERS.sub(" ", source.label)[:64],
@@ -894,7 +1196,13 @@ def _host_amount(amount: Any) -> dict[str, Any]:
         value = amount.get(key)
         if value is None:
             continue
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        # JSON from the panel can hold NaN and Infinity, which OpenJD doesn't accept.
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
             raise SubmitError(f"The {key} of host requirement {name} must be a positive number.")
         result[key] = value
     if len(result) == 1:

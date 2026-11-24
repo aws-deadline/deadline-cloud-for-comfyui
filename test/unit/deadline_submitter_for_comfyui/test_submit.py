@@ -233,6 +233,41 @@ def test_validate_api_workflow_finds_missing_node_in_subgraph():
         validate_api_workflow({**API_WORKFLOW, "12:137": {"inputs": {}}}, ui_workflow)
 
 
+def test_validate_api_workflow_follows_a_subgraph_nodes_path():
+    """Subgraph node IDs often repeat top-level ones, so 12:137 is node 137 of 12's subgraph."""
+    ui_workflow = {
+        "nodes": [{"id": 137, "type": "KSampler"}, {"id": 12, "type": "subgraph-a"}],
+        "definitions": {
+            "subgraphs": [
+                {"id": "subgraph-b", "nodes": [{"id": 137, "type": "OtherNode"}]},
+                {"id": "subgraph-a", "nodes": [{"id": 137, "type": "MissingNode"}]},
+            ]
+        },
+    }
+    with pytest.raises(SubmitError, match=r"node 12:137 \(MissingNode\)"):
+        validate_api_workflow({**API_WORKFLOW, "12:137": {"inputs": {}}}, ui_workflow)
+
+
+def test_validate_api_workflow_describes_a_bounded_number_of_missing_nodes(monkeypatch):
+    """A workflow with thousands of missing nodes reads its UI workflow once."""
+    missing: dict[str, dict] = {str(n): {"inputs": {}} for n in range(100, 20100)}
+    ui_workflow = {"nodes": [{"id": n, "type": f"Missing{n}"} for n in range(100, 20100)]}
+    indexed: list[int] = []
+    ui_nodes = submit._UiNodes
+
+    def counted(value):
+        indexed.append(1)
+        return ui_nodes(value)
+
+    monkeypatch.setattr(submit, "_UiNodes", counted)
+    with pytest.raises(SubmitError) as error:
+        validate_api_workflow({**API_WORKFLOW, **missing}, ui_workflow)
+    assert indexed == [1]
+    assert "node 100 (Missing100), " in str(error.value)
+    assert "and 19980 more" in str(error.value)
+    assert len(str(error.value)) < 2000
+
+
 def test_workflow_models():
     workflow = {
         "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sdxl.safetensors"}},
@@ -388,6 +423,8 @@ def test_host_requirements_openjd_accepts(requirements, tmp_path):
         ({"amounts": [{"name": "amount.worker.gpu", "min": -1}]}, "positive number"),
         ({"amounts": [{"name": "amount.worker.gpu", "min": True}]}, "positive number"),
         ({"amounts": [{"name": "amount.worker.gpu", "min": "1"}]}, "positive number"),
+        ({"amounts": [{"name": "amount.worker.gpu", "min": float("nan")}]}, "positive number"),
+        ({"amounts": [{"name": "amount.worker.gpu", "max": float("inf")}]}, "positive number"),
         ({"amounts": [{"name": "amount.worker.gpu", "min": 2, "max": 1}]}, "more than its max"),
         ({"amounts": [{"name": "amount.worker.other", "min": 1}]}, "doesn't start with"),
         ({"amounts": [{"name": "amount.job.x", "min": 1}]}, "doesn't start with"),
@@ -537,6 +574,42 @@ def test_input_folders(tmp_path):
         "5": {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": "../outside"}},
         "6": {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": "missing"}},
     }
+    assert submit.input_folders(workflow, input_dir) == [input_dir / "cats"]
+
+
+def _symlink(link: Path, target: Path) -> None:
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(target, target_is_directory=target.is_dir())
+    except OSError:
+        pytest.skip("This system can't create symbolic links.")
+
+
+def test_input_folders_leave_out_a_folder_that_links_outside(tmp_path):
+    input_dir = _input_dir(tmp_path)
+    (tmp_path / "Documents").mkdir()
+    _symlink(input_dir / "documents", tmp_path / "Documents")
+    _symlink(input_dir / "kittens", input_dir / "cats")
+    workflow = {
+        "1": {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": "documents"}},
+        "2": {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": "kittens"}},
+    }
+    warnings: list[str] = []
+    # A link to another folder in the input directory is kept.
+    assert submit.input_folders(workflow, input_dir, warnings) == [input_dir / "kittens"]
+    assert warnings == [
+        (
+            "Node 1 loads the folder 'documents', which links outside ComfyUI's input folder, so "
+            "it isn't attached. Add it with Add folder… if the job needs it."
+        )
+    ]
+
+
+def test_input_folders_follow_an_input_directory_that_is_a_link(tmp_path):
+    disk = _input_dir(tmp_path / "disk")
+    input_dir = tmp_path / "ComfyUI" / "input"
+    _symlink(input_dir, disk)
+    workflow = {"1": {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": "cats"}}}
     assert submit.input_folders(workflow, input_dir) == [input_dir / "cats"]
 
 
@@ -847,12 +920,144 @@ def test_create_job_bundle_adds_task_lists_to_json_templates(tmp_path):
     assert written == submit.add_task_lists(json.loads(template.read_text()), SOURCES)
 
 
+def _folder(name: str) -> dict[str, Any]:
+    return {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": name}}
+
+
+def _images(input_dir: Path, name: str) -> list[str]:
+    """The images that a folder loader's folder splits into, as plan_task_lists finds them."""
+    listed = submit.list_input_folders({"1": _folder(name)}, input_dir)
+    return submit.folder_images(input_dir / name, listed[input_dir / name].files)
+
+
 def test_image_files(tmp_path):
-    for name in ("b.PNG", "a.webp", "c.txt"):
-        (tmp_path / name).write_text("x")
-    (tmp_path / "d.jpg").mkdir()
-    assert submit.image_files(tmp_path) == ["a.webp", "b.PNG"]
-    assert submit.image_files(tmp_path / "missing") == []
+    input_dir = tmp_path / "input"
+    for name in ("b.PNG", "a.webp", "c.txt", "sub/e.png"):
+        (input_dir / "cats" / name).parent.mkdir(parents=True, exist_ok=True)
+        (input_dir / "cats" / name).write_text("x")
+    (input_dir / "cats" / "d.jpg").mkdir()
+    # The images in the folder itself, though the files of its subfolders are attached too.
+    assert _images(input_dir, "cats") == ["a.webp", "b.PNG"]
+    assert submit.list_input_folders({"1": _folder("missing")}, input_dir) == {}
+
+
+def test_image_files_leave_out_images_that_link_outside_the_input_directory(tmp_path):
+    input_dir = _input_dir(tmp_path)
+    secret = tmp_path / "Documents" / "passport.jpg"
+    secret.parent.mkdir()
+    secret.write_bytes(b"x")
+    _symlink(input_dir / "cats" / "passport.jpg", secret)
+    _symlink(input_dir / "cats" / "fox.png", input_dir / "fox.png")
+    assert _images(input_dir, "cats") == ["a.png", "b.jpg", "fox.png"]
+
+
+def test_folder_loaders_include_the_video_dataset_loaders():
+    """Each loads its folder from ComfyUI's input folder, so the folder is attached."""
+    assert set(submit.FOLDER_INPUT_NODES) == {
+        "LoadImageDataSetFromFolder",
+        "LoadImageTextDataSetFromFolder",
+        "LoadVideoDataSetFromFolder",
+        "LoadVideoTextDataSetFromFolder",
+    }
+    # The task script splits only the images of LoadImageDataSetFromFolder.
+    assert submit.FOLDER_LOADERS == ("LoadImageDataSetFromFolder",)
+
+
+def test_a_folder_too_big_to_attach_isnt_split_into_tasks(tmp_path, monkeypatch):
+    """Its images aren't attached, so a task couldn't load them."""
+    monkeypatch.setattr(submit, "MAX_FOLDER_FILES", 3)
+    input_dir = _input_dir(tmp_path)
+    for name in ("a.png", "b.png", "c.png", "d.png"):
+        (input_dir / "dogs" / name).parent.mkdir(exist_ok=True)
+        (input_dir / "dogs" / name).write_bytes(b"x")
+    workflow = {"3": _folder("cats"), "4": _folder("dogs")}
+    plan = plan_task_lists(workflow, input_dir)
+    assert [source.node_id for source in plan.sources] == ["3"]
+    assert "_meta" not in plan.workflow["4"]
+    assert plan.warnings == [
+        "Folder dogs (#4) has more than 3 files, so it isn't attached or split into tasks."
+    ]
+    # Many are named in one short warning.
+    workflow = {str(n): _folder("dogs") for n in range(10, 20)}
+    [warning] = plan_task_lists(workflow, input_dir).warnings
+    assert warning == (
+        "These folders are too big to attach, so they aren't split into tasks: Folder dogs "
+        "(#10), Folder dogs (#11), Folder dogs (#12), Folder dogs (#13), Folder dogs (#14), and 5 "
+        "more."
+    )
+
+
+def test_folders_share_a_bounded_number_of_entries(tmp_path, monkeypatch):
+    """A folder of empty folders, or of links that lead out, has no files to count."""
+    monkeypatch.setattr(submit, "MAX_FOLDER_ENTRIES", 4)
+    input_dir = _input_dir(tmp_path)
+    for index in range(3):
+        (input_dir / "a_empty" / str(index)).mkdir(parents=True)
+    workflow = {
+        "1": {"class_type": "LoadImageTextDataSetFromFolder", "inputs": {"folder": "a_empty"}},
+        "3": _folder("cats"),
+    }
+    listed = submit.list_input_folders(workflow, input_dir)
+    assert listed[input_dir / "a_empty"] == submit.FolderFiles()
+    # cats is read second, in name order, with one entry left for its three.
+    assert listed[input_dir / "cats"] == submit.FolderFiles(
+        too_big="takes the workflow's folders past 4 entries"
+    )
+    # So the plan doesn't split what get_local_assets doesn't attach.
+    plan = plan_task_lists(workflow, input_dir)
+    assert plan.sources == []
+    assert plan.warnings == [
+        (
+            "Folder cats (#3) takes the workflow's folders past 4 entries, so it isn't attached or "
+            "split into tasks."
+        )
+    ]
+
+
+def test_folders_arent_listed_without_a_folder_loader_to_split(tmp_path, monkeypatch):
+    input_dir = _input_dir(tmp_path)
+    monkeypatch.setattr(submit, "list_input_folders", None)
+    workflow = {
+        "1": _create_list("2", "3"),
+        "4": {"class_type": "LoadImageTextDataSetFromFolder", "inputs": {"folder": "cats"}},
+    }
+    assert [source.node_id for source in plan_task_lists(workflow, input_dir).sources] == ["1"]
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        (r"\\?\C:\ComfyUI\input\cats\a.png", r"C:\ComfyUI\input\cats\a.png"),
+        (r"\\?\UNC\server\share\input\a.png", r"\\server\share\input\a.png"),
+        (r"\\?\unc\server\share", r"\\server\share"),
+        (r"C:\ComfyUI\input", r"C:\ComfyUI\input"),
+        (r"\\server\share\input", r"\\server\share\input"),
+        (r"\\.\pipe\name", r"\\.\pipe\name"),
+        ("/home/me/ComfyUI/input", "/home/me/ComfyUI/input"),
+        ("", ""),
+    ],
+)
+def test_without_long_path_prefix(path, expected):
+    """Windows' realpath adds \\\\?\\ to a long path, so a file in the input folder compares
+    as inside it."""
+    assert submit.without_long_path_prefix(path) == expected
+
+
+def test_a_long_path_in_the_input_folder_leads_inside_it(tmp_path, monkeypatch):
+    image = tmp_path / "input" / "cats" / "a.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"x")
+    root = submit.real_path(tmp_path / "input")
+    realpath = os.path.realpath
+
+    def long_realpath(path, *args, **kwargs):
+        # As Windows' realpath returns a path past MAX_PATH, while the root's is short.
+        return "\\\\?\\" + realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", long_realpath)
+    assert submit.leads_inside(image, root)
+    listed = submit.list_input_folders({"1": _folder("cats")}, tmp_path / "input")
+    assert listed[tmp_path / "input" / "cats"] == submit.FolderFiles([image])
 
 
 def test_plan_task_lists_for_folder_loaders(tmp_path):
@@ -867,6 +1072,34 @@ def test_plan_task_lists_for_folder_loaders(tmp_path):
     }
     # Without the input directory, such as in a test, folders aren't split.
     assert plan_task_lists(workflow).sources == []
+
+
+def test_folder_items_never_name_a_file_outside_the_input_directory(tmp_path):
+    """The task script loads each item, so one that links out can't be one, as it isn't attached."""
+    input_dir = _input_dir(tmp_path)
+    documents = tmp_path / "Documents"
+    documents.mkdir()
+    for name in ("passport.jpg", "visa.png"):
+        (documents / name).write_bytes(b"x")
+    _symlink(input_dir / "cats" / "passport.jpg", documents / "passport.jpg")
+    _symlink(input_dir / "documents", documents)
+    workflow = {
+        "3": {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": "cats"}},
+        "4": {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": "documents"}},
+    }
+    plan = plan_task_lists(workflow, input_dir)
+    assert [source.node_id for source in plan.sources] == ["3"]
+    assert _marked(plan, "3")[submit.FILES_META] == ["cats/a.png", "cats/b.jpg"]
+    assert submit.FILES_META not in plan.workflow["4"].get("_meta", {})
+
+
+def test_folder_items_in_an_input_directory_that_is_a_link(tmp_path):
+    disk = _input_dir(tmp_path / "disk")
+    input_dir = tmp_path / "ComfyUI" / "input"
+    _symlink(input_dir, disk)
+    workflow = {"3": {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": "cats"}}}
+    plan = plan_task_lists(workflow, input_dir)
+    assert _marked(plan, "3")[submit.FILES_META] == ["cats/a.png", "cats/b.jpg"]
 
 
 def test_plan_task_lists_drops_the_workflows_own_submitter_keys(tmp_path):
@@ -1034,12 +1267,101 @@ def test_check_item_range(value, valid):
         ("4", "Create List #5 has 3 items, so it can't run '4'. Read the workflow again"),
         ("1-3,2", "Create List #5: '1-3,2' lists an item more than once."),
         ("x", "Create List #5: use item numbers such as 1-3 or 2,3, not 'x'."),
-        ("9" * 5000, "Create List #5: use item numbers such as 1-3 or 2,3"),
+        ("9" * 5000, "Create List #5: a range of items can be at most 1024 characters."),
     ],
 )
 def test_check_item_range_says_what_is_wrong(value, message):
     with pytest.raises(SubmitError, match=re.escape(message)):
         submit.check_item_range(submit.ItemSource("List5", "Create List #5", 3), value)
+
+
+@pytest.mark.parametrize(
+    ("value", "checked"),
+    [
+        ("0", ("0", 1)),
+        (" 0 ", ("0", 1)),
+        ("1-3", ("1-3", 3)),
+        (" 1 - 3 ", ("1-3", 3)),
+        ("3, 1", ("3,1", 2)),
+        ("1-5:2", ("1-5:2", 3)),
+        ("1 - 6 : 2", ("1-6:2", 3)),
+        ("2-2", ("2", 1)),
+        ("1-1:3", ("1", 1)),
+    ],
+)
+def test_check_item_range_returns_the_range_to_submit_and_its_items(value, checked):
+    """What's submitted is the checked range, without the spaces or controls strip() removes."""
+    assert (
+        submit.check_item_range(submit.ItemSource("List5", "Create List #5", 6), value) == checked
+    )
+
+
+def test_check_task_count_refuses_more_tasks_than_the_limit():
+    assert submit.check_task_count([]) == 1
+    assert submit.check_task_count([100, 100]) == submit.MAX_TASKS
+    with pytest.raises(SubmitError, match="10,001 tasks.*over the limit of 10,000"):
+        submit.check_task_count([10_001])
+    with pytest.raises(SubmitError, match="over the limit"):
+        submit.check_task_count([1000] * 16)
+
+
+def test_list_ranges_have_a_maximum_length():
+    [parameter] = submit.add_task_lists(
+        {"parameterDefinitions": []}, [submit.ItemSource("List5", "Create List #5", 3)]
+    )["parameterDefinitions"]
+    assert parameter["maxLength"] == submit.MAX_ITEM_RANGE_LENGTH
+
+
+def test_without_submitter_meta_leaves_the_workflows_own_keys():
+    workflow = {
+        "1": {"class_type": "X", "inputs": {}, "_meta": {"title": "Fox", "deadline_files": []}},
+        "2": {"class_type": "Y", "inputs": {}, "_meta": {"deadline_item": "List2"}},
+    }
+    cleaned = submit.without_submitter_meta(workflow)
+    assert cleaned == {
+        "1": {"class_type": "X", "inputs": {}, "_meta": {"title": "Fox"}},
+        "2": {"class_type": "Y", "inputs": {}, "_meta": {}},
+    }
+    # The workflow itself is left as it was.
+    assert workflow["2"]["_meta"] == {"deadline_item": "List2"}
+
+
+@pytest.mark.parametrize("folder", ["absolute", "elsewhere/../cats", "cats/", "./cats"])
+def test_folder_items_are_paths_in_the_input_directory(tmp_path, folder):
+    """The worker loads each image from the mapped input directory, not a path on this machine."""
+    input_dir = _input_dir(tmp_path)
+    folder = str(input_dir / "cats") if folder == "absolute" else folder
+    workflow = {"3": {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": folder}}}
+    plan = plan_task_lists(workflow, input_dir)
+    assert _marked(plan, "3")[submit.FILES_META] == ["cats/a.png", "cats/b.jpg"]
+
+
+def test_plan_task_lists_reads_the_workflow_once_however_many_lists_it_has(monkeypatch):
+    """Naming each list used to read the whole workflow again, which slowed down large ones."""
+    workflow = {str(n): _create_list("a", "b") for n in range(1, 2001)}
+    calls = []
+    consumers = submit._consumers
+
+    def counted(workflow):
+        calls.append(1)
+        return consumers(workflow)
+
+    monkeypatch.setattr(submit, "_consumers", counted)
+    plan = plan_task_lists(workflow)
+    assert calls == [1]
+    assert len(plan.sources) == submit.MAX_PLANNED_SOURCES
+    assert len(plan.active) == submit.MAX_ITEM_SOURCES
+    # The warnings stay short, however many lists there are.
+    assert all(len(warning) < 500 for warning in plan.warnings)
+    assert plan.warnings[0] == (
+        f"Deadline Cloud reads up to {submit.MAX_PLANNED_SOURCES} lists and folders in a "
+        f"workflow, so {2000 - submit.MAX_PLANNED_SOURCES} more run whole in each task."
+    )
+    assert plan.warnings[1].endswith(
+        f"Create List #21, and {submit.MAX_PLANNED_SOURCES - submit.MAX_ITEM_SOURCES - 5} more."
+    )
+    # Lists past the ones read aren't marked, so they run whole.
+    assert "_meta" not in plan.workflow["2000"]
 
 
 def test_list_names_fit_openjd_even_with_a_node_id_added():

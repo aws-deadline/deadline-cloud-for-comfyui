@@ -115,7 +115,10 @@ parameterDefinitions:
     Extra command line arguments for the ComfyUI server, for example "--lowvram".
     Use quotes to group arguments that contain spaces. Shell commands, variable
     expansion and command substitution are not supported. The template's listen
-    address, port and input, output and base directories take precedence.
+    address, port and input, output and base directories take precedence. Options
+    that enable CORS or TLS, serve or download another front end, move the user or
+    temp directory or the database, add an extra model paths file, or enable
+    ComfyUI-Manager are refused. Use Extra Model Paths Config for a model paths file.
 - name: ServerStartTimeout
   type: INT
   userInterface:
@@ -210,10 +213,15 @@ jobEnvironments:
         # Param.ModelDirectory has already had OpenJD's path mapping applied.
         model_directory = os.environ["COMFYUI_MODEL_DIRECTORY"]
         if model_directory and Path(model_directory).is_dir():
+            # ComfyUI reads these keys as settings, and custom_nodes as code to load, so a model
+            # folder with one of their names isn't listed. Attach Custom Nodes controls code.
+            reserved = {"base_path", "is_default", "custom_nodes"}
             folders = {
                 folder.name: folder.name + "/"
                 for folder in sorted(Path(model_directory).iterdir())
-                if folder.is_dir() and re.fullmatch(r"[A-Za-z0-9_]+", folder.name)
+                if folder.is_dir()
+                and re.fullmatch(r"[A-Za-z0-9_]+", folder.name)
+                and folder.name not in reserved
             }
             paths["model_directory"] = {"base_path": model_directory, **folders}
         # Param.CustomNodesDirectory is the folder where the custom node packs were attached.
@@ -251,9 +259,13 @@ jobEnvironments:
         if [ -n "$COMFYUI_EXTRA_MODEL_PATHS_CONFIG" ]; then
             MODEL_PATH_FILES+=("$COMFYUI_EXTRA_MODEL_PATHS_CONFIG")
         fi
+        # Each file is attached to its own option with "=". The option takes several values, so
+        # a separate value such as "--enable-cors-header" would otherwise be read as an option.
         MODEL_PATH_ARGS=()
         if [ ${#MODEL_PATH_FILES[@]} -gt 0 ]; then
-            MODEL_PATH_ARGS=(--extra-model-paths-config "${MODEL_PATH_FILES[@]}")
+            for MODEL_PATH_FILE in "${MODEL_PATH_FILES[@]}"; do
+                MODEL_PATH_ARGS+=("--extra-model-paths-config=$MODEL_PATH_FILE")
+            done
         fi
 
         # Keep ComfyUI's data out of the shared conda environment: use a base directory
@@ -287,18 +299,33 @@ jobEnvironments:
             export PIP_CONSTRAINT="$COMFYUI_SESSION_DIR/constraints.txt"
             "$VENV/bin/python" -m pip list --format=freeze 2>&1 > "$PIP_CONSTRAINT" | diagnostics \
                 || { echo "openjd_fail: Couldn't list the conda environment's packages"; exit 1; }
+            # "===" compares the whole version: "==2.5.1" also matches a local build, 2.5.1+any.
+            "$VENV/bin/python" -I -c 'import sys; p = sys.argv[1]; lines = open(p).read().splitlines(); open(p, "w").write("".join(l.replace("==", "===", 1) + "\n" for l in lines))' "$PIP_CONSTRAINT"
+            # Every pack's requirements are checked before pip installs any of them, since
+            # installing one can run its packages' build code. pip installs the checked copies,
+            # never a pack's own file, so a pack's requirements.txt can't choose where pip
+            # installs from. $1 is the CheckRequirements script.
+            CHECKED_DIR="$COMFYUI_SESSION_DIR/node-requirements"
+            mkdir -p -- "$CHECKED_DIR"
+            CHECKED=()
+            CHECKED_NAMES=()
             for NODE_DIR in "${ATTACHED_NODES[@]}"; do
                 if [ -f "$NODE_DIR/requirements.txt" ]; then
                     # A folder name can hold line breaks, which would start a new OpenJD line.
                     NAME="${NODE_DIR##*/}"
                     NAME="${NAME//[$'\r\n']/ }"
-                    # A pack's requirements.txt can't choose where pip installs from. $1 is the
-                    # CheckRequirements script.
-                    "$VENV/bin/python" "$1" "$NODE_DIR/requirements.txt" 2>&1 | diagnostics \
+                    COPY="$CHECKED_DIR/${#CHECKED[@]}.txt"
+                    "$VENV/bin/python" -I "$1" "$NODE_DIR/requirements.txt" "$COPY" 2>&1 | diagnostics \
                         || { echo "openjd_fail: The requirements of $NAME use pip options, paths or URLs that jobs don't install"; exit 1; }
-                    echo "openjd_status: Installing the requirements of $NAME"
-                    "$VENV/bin/python" -m pip install -r "$NODE_DIR/requirements.txt" 2>&1 | diagnostics \
-                        || { echo "openjd_fail: Couldn't install the requirements of $NAME"; exit 1; }
+                    CHECKED+=("$COPY")
+                    CHECKED_NAMES+=("$NAME")
+                fi
+            done
+            for (( i = 0; i < ${#CHECKED[@]}; i++ )); do
+                if [ -s "${CHECKED[$i]}" ]; then
+                    echo "openjd_status: Installing the requirements of ${CHECKED_NAMES[$i]}"
+                    "$VENV/bin/python" -m pip install -r "${CHECKED[$i]}" 2>&1 | diagnostics \
+                        || { echo "openjd_fail: Couldn't install the requirements of ${CHECKED_NAMES[$i]}"; exit 1; }
                 fi
             done
             "$VENV/bin/python" -m pip check 2>&1 | diagnostics \
@@ -320,10 +347,26 @@ jobEnvironments:
                 for offset in range(0, max(1, len(line)), 4088):
                     print("comfy: " + line[offset:offset + 4088], flush=True)
 
+        # Options that would open the worker's ComfyUI server to other origins or serve other
+        # files, read or write outside the session, or install packages without the
+        # requirements check. argparse also takes a unique prefix of an option.
+        # An extra model paths file can add custom_nodes folders, which load code even with
+        # Attach Custom Nodes off. Studios set one with the Extra Model Paths Config parameter.
+        REFUSED = (
+            "--enable-cors-header", "--tls-keyfile", "--tls-certfile", "--front-end-root",
+            "--front-end-version", "--user-directory", "--temp-directory", "--database-url",
+            "--enable-manager", "--extra-model-paths-config",
+        )
         try:
             extra_args = shlex.split(os.environ["COMFYUI_ARGS"])
             if "--" in extra_args:
                 raise ValueError("the argument terminator '--' is not supported")
+            for word in extra_args:
+                option = word.split("=", 1)[0]
+                if len(option) > 2 and option.startswith("--"):
+                    refused = [name for name in REFUSED if name.startswith(option)]
+                    if refused:
+                        raise ValueError(f"{refused[0]} is not supported")
         except ValueError as e:
             print(f"openjd_fail: Invalid Extra ComfyUI Arguments: {e}", flush=True)
             sys.exit(1)
@@ -376,47 +419,178 @@ jobEnvironments:
       type: TEXT
       data: |
         """
-        Checks a custom node pack's requirements.txt before pip installs it. pip also reads options
-        from the file, such as --index-url, --extra-index-url and --trusted-host, as well as nested
-        files, editable installs, local paths and URLs, and it expands environment variables in
-        them. The worker runs pip with the queue role's credentials, so a pack can't point it at
-        another package index. Package names and https URLs, such as git+https, are installed.
-        Prints each line that isn't, and exits with 1.
+        Checks a custom node pack's requirements.txt, and writes the copy that pip installs. pip reads
+        more than requirements from the file: options such as --index-url, --extra-index-url and -r,
+        editable installs, local paths, URLs of any scheme, ${NAME} environment variables, and text in
+        an encoding that a byte order mark or a "# coding:" line names. The worker runs pip with the
+        queue role's credentials, so a pack can't choose where pip installs from.
+
+        Each line is parsed as a PEP 508 requirement, and kept only when it's a package name with
+        optional extras, version specifiers, markers and --hash options, or "name @ URL" for an https
+        or git+https URL with a host. The copy has one requirement per line, as packaging writes it,
+        so pip never reads the pack's own file. Prints each refused line, and exits with 1.
+
+        Usage: check-requirements.py REQUIREMENTS COPY
         """
+        import codecs
         import re
         import sys
+        import urllib.parse
+
+        try:
+            # The packaging that pip parses requirements with.
+            from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
+        except ImportError:
+            from packaging.requirements import InvalidRequirement, Requirement
 
         ALLOWED_SCHEMES = {"https", "git+https"}
+        HASH_LENGTHS = {"sha256": 64, "sha384": 96, "sha512": 128}
+        # pip installs a requirement whose name ends like this from a local file.
+        ARCHIVE_SUFFIXES = (
+            ".zip", ".whl", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz",
+            ".tar.xz", ".txz", ".tar.lz", ".tlz", ".tar.lzma",
+        )
+        # A comment starts with "#" at the start of a line or after whitespace, as pip reads it.
+        COMMENT = re.compile(r"(?<!\S)#.*$")
+        TEXT = re.compile(r"[\x20-\x7e\t]*")
+        # A host name and an optional port: no user name, password or IPv6 address.
+        HOST = re.compile(r"[A-Za-z0-9.-]+(:[0-9]+)?")
+        # URL characters, without ones these URLs don't need, such as quotes, braces, ";", "$" and "\".
+        URL = re.compile(r"[A-Za-z0-9._~:/?#@!&()*+,=%-]+")
+        DIGEST = re.compile(r"[0-9a-fA-F]+")
 
-        with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
-            # pip joins a line that ends with a backslash to the next one.
-            text = re.sub(r"\\\r?\n", "", f.read())
-        refused = []
-        # pip splits the file with splitlines().
-        for number, line in enumerate(text.splitlines(), start=1):
-            requirement = re.sub(r"(^|\s)#.*", "", line).strip()
-            if not requirement:
-                continue
-            words = requirement.split()
-            schemes = {
-                scheme.lower() for scheme in re.findall(r"([A-Za-z][A-Za-z0-9+.-]*)://", requirement)
-            }
-            if requirement.startswith("-"):
-                reason = "it's a pip option"
-            elif any(word.startswith("-") and not word.startswith("--hash") for word in words[1:]):
-                reason = "it has a pip option"
-            elif "${" in requirement:
-                reason = "it reads an environment variable"
-            elif schemes - ALLOWED_SCHEMES:
-                reason = "only https URLs are installed"
-            elif re.match(r"[./~\\]|file:|[A-Za-z]:[/\\]", requirement):
-                reason = "it's a local path"
-            else:
-                continue
-            refused.append(f"Line {number}, {requirement!r}: {reason}")
-        for message in refused:
-            print(message)
-        sys.exit(1 if refused else 0)
+
+        class Refused(Exception):
+            pass
+
+
+        def logical_lines(text):
+            """
+            Yields (line number, text, whether it ends with a backslash) for each line as pip joins
+            them. pip splits the file with splitlines(), and joins a line that ends with a backslash to
+            the next one, unless it's a comment line.
+            """
+            joined, first = [], None
+            for number, line in enumerate(text.splitlines(), start=1):
+                first = first or number
+                if line.endswith("\\") and not COMMENT.search(line):
+                    joined.append(line[:-1])
+                    continue
+                joined.append(line)
+                yield first, "".join(joined), line.endswith("\\")
+                joined, first = [], None
+            if joined:
+                yield first, "".join(joined), False
+
+
+        def check_url(url):
+            if not URL.fullmatch(url):
+                raise Refused("its URL has characters that package URLs don't need")
+            parts = urllib.parse.urlsplit(url)
+            if parts.scheme.lower() not in ALLOWED_SCHEMES:
+                raise Refused("only https and git+https URLs are installed")
+            if not HOST.fullmatch(parts.netloc):
+                raise Refused("its URL needs a host, without a user name or password")
+
+
+        def requirement(line):
+            """The requirement to write for a line without its comment. Raises Refused."""
+            if not TEXT.fullmatch(line):
+                raise Refused("it has characters other than printable ASCII")
+            if "\\" in line:
+                raise Refused("it has a backslash, such as in a Windows path")
+            if "${" in line:
+                raise Refused("pip would put an environment variable in it")
+            words = line.split()
+            if words[0].startswith("-"):
+                raise Refused("it's a pip option")
+            # Like pip, read the words from the first one that starts with "-" as options.
+            end = next((i for i, word in enumerate(words) if word.startswith("-")), len(words))
+            options, hashes = words[end:], []
+            while options:
+                option = options.pop(0)
+                if option == "--hash" and options:
+                    option += "=" + options.pop(0)
+                algorithm, _, digest = option.partition("=")[2].partition(":")
+                if (
+                    not option.startswith("--hash=")
+                    or len(digest) != HASH_LENGTHS.get(algorithm)
+                    or not DIGEST.fullmatch(digest)
+                ):
+                    raise Refused("its only pip option can be --hash=sha256:<digest>")
+                hashes.append(option)
+            try:
+                parsed = Requirement(" ".join(words[:end]))
+            except InvalidRequirement:
+                raise Refused(
+                    "it isn't a package name, or a name @ URL requirement, such as "
+                    "'pkg @ git+https://github.com/org/pkg.git'"
+                ) from None
+            if parsed.name.lower().endswith(ARCHIVE_SUFFIXES):
+                raise Refused("pip would install it from a local file")
+            if parsed.url is not None:
+                check_url(parsed.url)
+            written = " ".join([str(parsed), *hashes])
+            # What's written is one requirement for pip too: no comment, option or variable in it.
+            if (
+                not TEXT.fullmatch(written)
+                or "${" in written
+                or COMMENT.search(written)
+                or any(word.startswith("-") for word in str(parsed).split())
+            ):
+                raise Refused("it can't be written as one requirement")
+            return written
+
+
+        def declares_encoding(line):
+            """Whether a line names an encoding other than UTF-8, as in "# coding: latin-1"."""
+            declared = re.search(rb"coding[:=]\s*([-\w.]+)", line)
+            if not line.startswith(b"#") or not declared:
+                return False
+            try:
+                return codecs.lookup(declared[1].decode("ascii")).name != "utf-8"
+            except LookupError:
+                return True
+
+
+        def check(data):
+            """Returns the requirements to write, and a message for each refused line."""
+            try:
+                text = data.decode("utf-8").removeprefix("\ufeff")
+            except UnicodeDecodeError:
+                return [], ["The file isn't UTF-8 text"]
+            # pip decodes the file in an encoding that one of its first two lines names.
+            if any(declares_encoding(line) for line in data.split(b"\n")[:2]):
+                return [], ["The file names an encoding other than UTF-8"]
+            written, refused = [], []
+            for number, line, continued in logical_lines(text):
+                try:
+                    if continued:
+                        # pip doesn't join a comment line, but joins "pkg  # note \" to the next one,
+                        # which the comment then takes in.
+                        raise Refused("a line with a comment ends with a backslash")
+                    line = COMMENT.sub("", line).strip()
+                    if line:
+                        written.append(requirement(line))
+                except Refused as e:
+                    refused.append(f"Line {number}, {line!r}: {e}")
+            return written, refused
+
+
+        def main(source, copy):
+            with open(source, "rb") as f:
+                written, refused = check(f.read())
+            for message in refused:
+                print(message)
+            if refused:
+                return 1
+            with open(copy, "w", encoding="ascii", newline="\n") as f:
+                f.writelines(line + "\n" for line in written)
+            return 0
+
+
+        if __name__ == "__main__":
+            sys.exit(main(*sys.argv[1:]))
     - name: Exit
       filename: exit-comfyui-server.sh
       type: TEXT
@@ -575,7 +749,14 @@ steps:
                 files = meta["deadline_files"]
                 index = item(name, len(files), f"The folder of node {node_id}")
                 if index:
-                    node.update(class_type="LoadImage", inputs={"image": files[index - 1]})
+                    # A path in the input directory, which the job maps. Load Image would read an
+                    # absolute path, or one with "..", from elsewhere on the worker.
+                    image = files[index - 1]
+                    parts = re.split(r"[\\/]", image) if isinstance(image, str) else []
+                    # An empty part is a leading, trailing or doubled separator: "/x", "x/" or "//x".
+                    if not parts or not all(parts) or ".." in parts or re.match(r"[A-Za-z]:", image):
+                        fail(f"The folder of node {node_id} names a file outside the input directory.")
+                    node.update(class_type="LoadImage", inputs={"image": image})
             elif class_type == "CreateList" and name:
                 # The node takes its items from inputs named input0, input1 and so on, in order.
                 # ASCII digits alone, as the submitter counts them: \d also matches other scripts'.

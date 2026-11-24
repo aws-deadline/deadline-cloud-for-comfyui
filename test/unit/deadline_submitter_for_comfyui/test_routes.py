@@ -218,6 +218,12 @@ def test_jobs_rejects_remote_clients(comfy, monkeypatch):
         ("127.0.0.1", {"X-Forwarded-For": "10.0.0.5"}, 403),
         ("127.0.0.1", {"Forwarded": "for=10.0.0.5"}, 403),
         ("127.0.0.1", {"X-Real-IP": "10.0.0.5"}, 403),
+        ("127.0.0.1", {"X-Forwarded-Host": "comfy.example"}, 403),
+        ("127.0.0.1", {"X-Forwarded-Proto": "https"}, 403),
+        ("127.0.0.1", {"Via": "1.1 proxy"}, 403),
+        ("127.0.0.1", {"CF-Connecting-IP": "10.0.0.5"}, 403),
+        ("127.0.0.1", {"True-Client-IP": "10.0.0.5"}, 403),
+        ("127.0.0.1", {"X-Client-IP": "10.0.0.5"}, 403),
         # Another website's page, in a browser on this machine, when CORS is turned on.
         ("127.0.0.1", {"Sec-Fetch-Site": "cross-site"}, 403),
         ("127.0.0.1", {"Sec-Fetch-Site": "same-origin"}, 200),
@@ -234,6 +240,10 @@ def test_jobs_rejects_remote_clients(comfy, monkeypatch):
             403,
         ),
         ("127.0.0.1", {"Host": "attacker.example:8188"}, 403),
+        # These can be resolved through DNS, so a website can point them at this machine.
+        ("127.0.0.1", {"Host": "comfy.localhost:8188"}, 403),
+        ("127.0.0.1", {"Host": "localhost.:8188"}, 403),
+        ("127.0.0.1", {"Host": "LOCALHOST:8188"}, 200),
         ("127.0.0.1", {"Host": "[invalid]:8188"}, 403),
         ("127.0.0.1", {"Host": "user@localhost:8188"}, 403),
         ("127.0.0.1", {"Host": "localhost:invalid"}, 403),
@@ -444,9 +454,11 @@ def test_jobs_rejects_a_body_that_isnt_an_object(comfy, monkeypatch):
 
 
 def test_jobs_attaches_the_folders_the_workflow_loads(comfy, monkeypatch):
+    """A folder loader's folder is attached as the images in it, not as the whole folder."""
     cats = comfy.tmp_path / "input" / "cats"
     cats.mkdir(parents=True)
-    (cats / "a.png").write_text("png")
+    for name in ("a.png", "b.png"):
+        (cats / name).write_text("png")
     workflow = {
         **WORKFLOW,
         "2": {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": "cats"}},
@@ -454,7 +466,9 @@ def test_jobs_attaches_the_folders_the_workflow_loads(comfy, monkeypatch):
     fake_tools(monkeypatch, comfy.tmp_path)
     _, body = run(post(comfy, {"workflow": workflow}))
     references = yaml.safe_load((Path(body["job_bundle"]) / "asset_references.yaml").read_text())
-    assert references["assetReferences"]["inputs"]["directories"] == [str(cats)]
+    inputs = references["assetReferences"]["inputs"]
+    assert {str(cats / "a.png"), str(cats / "b.png")} <= set(inputs["filenames"])
+    assert inputs["directories"] == []
 
 
 def fake_bridge(monkeypatch, tmp_path: Path, responses: dict) -> Path:
@@ -522,6 +536,23 @@ def result(data):
     return {"event": "result", "data": data}
 
 
+async def wait_for_prompt(comfy, number=1):
+    """Waits for the submission's confirmation prompt `number`, and returns what was sent for it."""
+    for _ in range(200):
+        prompts = [data for event, data in comfy.server.events if event == "deadline.confirm"]
+        if len(prompts) >= number:
+            return prompts[number - 1]
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"Prompt {number} never arrived.")
+
+
+def running_submission(comfy, monkeypatch, process, **fields):
+    """Adds a running submission from the tab tab-1, as /deadline/jobs does."""
+    submission = comfy.routes._Submission("fox", process, client_id="tab-1", **fields)
+    monkeypatch.setitem(comfy.routes._submissions, "a" * 32, submission)
+    return submission
+
+
 def test_plan_lists_parameters_task_lists_and_attachments(comfy, monkeypatch):
     input_dir = comfy.tmp_path / "input"
     input_dir.mkdir()
@@ -559,9 +590,60 @@ def test_plan_lists_parameters_task_lists_and_attachments(comfy, monkeypatch):
             "range": "1-4",
         }
     ]
-    assert body["attachments"] == {"filenames": [str(input_dir / "fox.png")], "directories": []}
+    assert body["attachments"] == {
+        "filenames": [str(input_dir / "fox.png")],
+        "directories": [],
+        "folders": [],
+    }
     # Planning doesn't create a job bundle.
     assert not (comfy.tmp_path / "user" / "deadline_submissions").exists()
+
+
+def test_plan_and_jobs_warn_about_inputs_that_arent_attached(comfy, monkeypatch):
+    """An absolute path in a file input isn't attached, and the panel and the job say so."""
+    elsewhere = comfy.tmp_path / "elsewhere.png"
+    elsewhere.write_text("png")
+    workflow = {**WORKFLOW, "5": {"class_type": "LoadImage", "inputs": {"image": str(elsewhere)}}}
+    status, plan = run(call(comfy, "/deadline/plan", {"workflow": workflow}))
+    assert status == 200
+    assert plan["attachments"] == {"filenames": [], "directories": [], "folders": []}
+    # A long path is shortened to its end in the message.
+    [warning] = [warning for warning in plan["warnings"] if "elsewhere.png" in warning]
+    assert "isn't attached" in warning
+
+    fake_tools(monkeypatch, comfy.tmp_path)
+    # A request without the panel's list finds the workflow's inputs itself, and warns too.
+    status, body = run(call(comfy, "/deadline/jobs", {**JOB, "workflow": workflow}))
+    assert status == 202
+    assert warning in body["warnings"]
+    # The panel sends the list it showed, with the warning, so the job doesn't repeat it.
+    attachments: dict[str, list[str]] = {"filenames": [], "directories": []}
+    status, body = run(
+        call(comfy, "/deadline/jobs", {**JOB, "workflow": workflow, "attachments": attachments})
+    )
+    assert status == 202
+    assert warning not in body["warnings"]
+
+
+def test_plan_groups_a_folder_loaders_files_under_its_folder(comfy, monkeypatch):
+    """The panel shows a folder loader's folder as one row, and filenames still has every file."""
+    input_dir = comfy.tmp_path / "input"
+    fox, cats, dogs = input_dir / "fox.png", input_dir / "cats", input_dir / "dogs"
+    folders = {dogs: [dogs / "a.png"], cats: [cats / "a.png", cats / "b.png"]}
+    assets = comfy.routes.LocalAssets(filenames=[fox, *folders[cats], *folders[dogs]])
+    assets.folders = folders
+    monkeypatch.setattr(comfy.routes, "_local_assets", lambda workflow: assets)
+    status, plan = run(call(comfy, "/deadline/plan", {"workflow": WORKFLOW}))
+    assert status == 200
+    assert plan["attachments"] == {
+        "filenames": [str(fox), str(cats / "a.png"), str(cats / "b.png"), str(dogs / "a.png")],
+        "directories": [],
+        # By folder path.
+        "folders": [
+            {"path": str(cats), "files": [str(cats / "a.png"), str(cats / "b.png")]},
+            {"path": str(dogs), "files": [str(dogs / "a.png")]},
+        ],
+    }
 
 
 def test_plan_reports_workflows_it_cant_submit(comfy):
@@ -680,6 +762,43 @@ def test_cloud_only_runs_known_commands(comfy, monkeypatch):
     assert status == 403
 
 
+DEFAULTS = {
+    "farmId": "farm-" + "a" * 32,
+    "queueId": "queue-" + "b" * 32,
+    "storageProfileId": "sp-" + "c" * 32,
+}
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"farmId": "farm-x]\n[other"},
+        {"queueId": "farm-" + "a" * 32},
+        {"storageProfileId": "sp-1"},
+        {"storageProfileId": None},
+        {"farmId": 7},
+    ],
+)
+def test_set_defaults_refuses_malformed_ids_before_saving_any(comfy, monkeypatch, change):
+    """The CLI config names sections after the farm ID, so an ID can't add sections or keys."""
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, {"set-defaults": [result({})]})
+    status, body = run(call(comfy, "/deadline/cloud/set-defaults", {**DEFAULTS, **change}))
+    assert status == 400
+    assert "must be a Deadline Cloud" in body["error"]
+    assert not requests.exists()
+
+
+def test_set_defaults_saves_only_checked_ids_and_empty_resets(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, {"set-defaults": [result({})]})
+    body = {**DEFAULTS, "storageProfileId": "", "extra": "ignored"}
+    status, _ = run(call(comfy, "/deadline/cloud/set-defaults", body))
+    assert status == 200
+    [request] = bridge_requests(requests)
+    assert request["request"] == {**DEFAULTS, "storageProfileId": ""}
+
+
 def test_cloud_needs_the_cli_python(comfy, monkeypatch):
     monkeypatch.setenv(submit.PYTHON_ENV_VAR, str(comfy.tmp_path / "missing"))
     fake_cli(monkeypatch, comfy.tmp_path, "")
@@ -701,25 +820,20 @@ JOB = {
 
 
 async def submit_and_confirm(comfy, body, accept=True):
-    """Submits through /deadline/jobs and answers the confirmation when it comes."""
+    """Submits through /deadline/jobs and answers the confirmation, by its ID, when it comes."""
     app = web.Application()
     app.add_routes(comfy.server.routes)
     async with TestClient(TestServer(app)) as client:
         response = await client.post("/deadline/jobs", json=body)
         status, result = response.status, await response.json()
         if status == 202:
-            for _ in range(200):
-                prompts = [
-                    data for event, data in comfy.server.events if event == "deadline.confirm"
-                ]
-                if prompts:
-                    break
-                await asyncio.sleep(0.05)
+            prompt = await wait_for_prompt(comfy)
             answer = await client.post(
                 "/deadline/jobs/confirm",
                 json={
                     "submissionId": result["submissionId"],
                     "clientId": body.get("clientId"),
+                    "promptId": prompt["promptId"],
                     "accept": accept,
                 },
             )
@@ -776,9 +890,12 @@ def test_jobs_submits_with_the_library(comfy, monkeypatch):
             "kind": "progress",
         },
     )
+    # Each prompt has its own random ID, which the answer has to name.
+    prompt_id = events[1][1]["promptId"]
+    assert re.fullmatch(r"[0-9a-f]{32}", prompt_id)
     assert events[1] == (
         "deadline.confirm",
-        {**submission, "message": "Upload?", "default": True},
+        {**submission, "message": "Upload?", "default": True, "promptId": prompt_id},
     )
     # The panel shows each job's output directory, where Download puts its outputs.
     assert events[2] == (
@@ -1000,6 +1117,79 @@ def test_jobs_can_be_canceled(comfy, monkeypatch):
     assert (event, data["status"]) == ("deadline.submitted", "CANCELED")
 
 
+def created_event() -> dict:
+    return {"event": "created", "jobId": JOB_ID, "farmId": FARM, "queueId": QUEUE}
+
+
+def test_jobs_cant_be_canceled_once_the_job_is_being_created(comfy, monkeypatch):
+    """Killing the bridge after CreateJob would hide a job that runs."""
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    fake_bridge(
+        monkeypatch, comfy.tmp_path, {"submit": [{"event": "creating"}, created_event(), "hang"]}
+    )
+
+    async def submit_and_cancel():
+        app = web.Application()
+        app.add_routes(comfy.server.routes)
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post("/deadline/jobs", json=JOB)
+            submission_id = (await response.json())["submissionId"]
+            for _ in range(200):
+                if comfy.routes._submissions[submission_id].creating:
+                    break
+                await asyncio.sleep(0.05)
+            canceled = await client.post(
+                "/deadline/jobs/cancel",
+                json={"submissionId": submission_id, "clientId": JOB["clientId"]},
+            )
+            body = await canceled.json()
+            # Stop the stand-in, as the library finishing would.
+            comfy.routes._submissions[submission_id].process.kill()
+            await asyncio.gather(*comfy.routes._watchers)
+            return canceled.status, body
+
+    status, body = run(submit_and_cancel())
+    assert status == 409
+    assert "already being created" in body["error"]
+    event, data = comfy.server.events[-1]
+    assert (event, data["status"], data["jobId"]) == ("deadline.submitted", "SUBMITTED", JOB_ID)
+
+
+def test_jobs_report_a_created_job_when_a_later_step_fails(comfy, monkeypatch):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    failed = {"event": "error", "message": "Timed out waiting for the job"}
+    fake_bridge(
+        monkeypatch, comfy.tmp_path, {"submit": [{"event": "creating"}, created_event(), failed]}
+    )
+    status, _ = run(call(comfy, "/deadline/jobs", JOB))
+    assert status == 202
+    event, data = comfy.server.events[-1]
+    assert event == "deadline.submitted"
+    assert {key: data[key] for key in ("status", "jobId", "farmId", "queueId")} == {
+        "status": "SUBMITTED",
+        "jobId": JOB_ID,
+        "farmId": FARM,
+        "queueId": QUEUE,
+    }
+    assert "Timed out waiting for the job" in data["warning"]
+
+
+@pytest.mark.parametrize(
+    "created",
+    [
+        {"event": "created", "jobId": "job-1", "farmId": "farm-" + "1" * 32},
+        {"event": "created", "jobId": "job-" + "3" * 32, "farmId": "farm\nx"},
+        {"event": "created", "jobId": 7},
+    ],
+)
+def test_jobs_ignore_a_created_event_without_deadline_ids(comfy, monkeypatch, created):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    failed = {"event": "error", "message": "Boom"}
+    fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [created, failed]})
+    run(call(comfy, "/deadline/jobs", JOB))
+    assert comfy.server.events[-1][1]["status"] == "FAILED"
+
+
 def test_resolve_cli_python_reads_the_shebang(tmp_path, monkeypatch):
     monkeypatch.delenv(submit.PYTHON_ENV_VAR, raising=False)
     python = tmp_path / "env" / "python3.11"
@@ -1215,29 +1405,29 @@ def test_jobs_accept_answers_to_successive_prompts(comfy, monkeypatch):
             response = await client.post("/deadline/jobs", json=JOB)
             assert response.status == 202
             submission_id = (await response.json())["submissionId"]
-            for number in (1, 2):
-                for _ in range(200):
-                    prompts = [
-                        data for event, data in comfy.server.events if event == "deadline.confirm"
-                    ]
-                    if len(prompts) == number:
-                        break
-                    await asyncio.sleep(0.05)
-                else:
-                    pytest.fail(f"Prompt {number} never arrived.")
-                answer = {
+
+            async def answer(prompt, accept=True):
+                body = {
                     "submissionId": submission_id,
                     "clientId": JOB["clientId"],
-                    "accept": True,
+                    "promptId": prompt["promptId"],
+                    "accept": accept,
                 }
-                accepted = await client.post("/deadline/jobs/confirm", json=answer)
-                assert accepted.status == 200
-            await asyncio.gather(*comfy.routes._watchers)
+                return (await client.post("/deadline/jobs/confirm", json=body)).status
 
-    run(confirm_both_prompts())
+            first = await wait_for_prompt(comfy, 1)
+            # A repeated answer to the first prompt is refused.
+            statuses = [await answer(first), await answer(first)]
+            second = await wait_for_prompt(comfy, 2)
+            # So is a delayed one while the second is pending, which it doesn't answer.
+            statuses += [await answer(first, accept=False), await answer(second)]
+            await asyncio.gather(*comfy.routes._watchers)
+            return statuses
+
+    assert run(confirm_both_prompts()) == [200, 409, 409, 200]
     prompts = [data for event, data in comfy.server.events if event == "deadline.confirm"]
     assert len(prompts) == 2
-    assert all(sid == JOB["clientId"] for sid in comfy.server.sids)
+    assert prompts[0]["promptId"] != prompts[1]["promptId"]
     assert comfy.server.events[-1][1]["status"] == "SUBMITTED"
 
 
@@ -1259,53 +1449,95 @@ class _RecordingProcess:
         self.killed = True
 
 
+def confirmation(prompt_id="p" * 32, accept=True, **change):
+    """An answer to the prompt of running_submission's submission, from its tab."""
+    return {
+        "submissionId": "a" * 32,
+        "clientId": "tab-1",
+        "promptId": prompt_id,
+        "accept": accept,
+        **change,
+    }
+
+
 @pytest.mark.parametrize("canceled", [False, True])
 def test_confirmation_timeouts_only_decline_the_current_pending_prompt(
     comfy, monkeypatch, canceled
 ):
     process = _RecordingProcess()
-    submission = comfy.routes._Submission(
-        "fox", process, client_id="tab-1", confirms=2, canceled=canceled
+    submission = running_submission(
+        comfy, monkeypatch, process, prompt_id="second", canceled=canceled
     )
-    monkeypatch.setitem(comfy.routes._submissions, "a" * 32, submission)
     monkeypatch.setattr(comfy.routes, "CONFIRM_TIMEOUT", 0)
     # A timer for an earlier prompt must not send an answer to the current one.
-    run(comfy.routes._decline_unanswered("a" * 32, submission, 1))
+    run(comfy.routes._decline_unanswered("a" * 32, submission, "first"))
     assert process.answers == []
-    assert submission.answered == 0
-    run(comfy.routes._decline_unanswered("a" * 32, submission, 2))
+    assert submission.prompt_id == "second"
+    run(comfy.routes._decline_unanswered("a" * 32, submission, "second"))
     assert process.answers == ([] if canceled else [{"accept": False}])
-    assert submission.answered == (0 if canceled else 2)
+    assert submission.prompt_id == ("second" if canceled else None)
 
 
-@pytest.mark.parametrize(("confirms", "answered"), [(0, 0), (1, 1), (2, 2), (1, 2)])
-def test_confirm_rejects_answers_without_a_pending_prompt(comfy, monkeypatch, confirms, answered):
+def test_a_late_answer_to_a_declined_prompt_is_refused(comfy, monkeypatch):
     process = _RecordingProcess()
-    submission = comfy.routes._Submission(
-        "fox", process, client_id="tab-1", confirms=confirms, answered=answered
-    )
-    monkeypatch.setitem(comfy.routes._submissions, "a" * 32, submission)
-    status, response = run(
-        call(
-            comfy,
-            "/deadline/jobs/confirm",
-            {
-                "submissionId": "a" * 32,
-                "clientId": "tab-1",
-                "accept": True,
-            },
-        )
-    )
+    submission = running_submission(comfy, monkeypatch, process, prompt_id="p" * 32)
+    monkeypatch.setattr(comfy.routes, "CONFIRM_TIMEOUT", 0)
+    run(comfy.routes._decline_unanswered("a" * 32, submission, "p" * 32))
+    status, response = run(call(comfy, "/deadline/jobs/confirm", confirmation()))
+    assert status == 409
+    assert "no pending confirmation" in response["error"]
+    assert process.answers == [{"accept": False}]
+
+
+@pytest.mark.parametrize(
+    ("pending", "answered"),
+    [
+        # No prompt is waiting, or an earlier prompt's ID, or none, answers another.
+        (None, "p" * 32),
+        ("q" * 32, "p" * 32),
+        ("q" * 32, None),
+        ("q" * 32, ""),
+        ("q" * 32, 5),
+        ("q" * 32, ["q" * 32]),
+        ("q" * 32, "q" * 31),
+    ],
+)
+def test_confirm_rejects_answers_without_their_pending_prompt(
+    comfy, monkeypatch, pending, answered
+):
+    process = _RecordingProcess()
+    submission = running_submission(comfy, monkeypatch, process, prompt_id=pending)
+    status, response = run(call(comfy, "/deadline/jobs/confirm", confirmation(prompt_id=answered)))
     assert status == 409
     assert "no pending confirmation" in response["error"]
     assert process.answers == []
-    assert submission.answered == answered
+    assert submission.prompt_id == pending
+
+
+@pytest.mark.parametrize("accept", ["yes", 1, 0, "true", None, [], {}])
+def test_confirm_only_takes_true_or_false(comfy, monkeypatch, accept):
+    """A truthy value isn't a yes, and a falsy one isn't a no. The prompt stays pending."""
+    process = _RecordingProcess()
+    submission = running_submission(comfy, monkeypatch, process, prompt_id="p" * 32)
+    status, response = run(call(comfy, "/deadline/jobs/confirm", confirmation(accept=accept)))
+    assert (status, response) == (400, {"error": "accept must be true or false."})
+    assert process.answers == []
+    assert submission.prompt_id == "p" * 32
+
+
+def test_confirm_needs_accept(comfy, monkeypatch):
+    process = _RecordingProcess()
+    running_submission(comfy, monkeypatch, process, prompt_id="p" * 32)
+    body = confirmation()
+    del body["accept"]
+    status, _ = run(call(comfy, "/deadline/jobs/confirm", body))
+    assert status == 400
+    assert process.answers == []
 
 
 @pytest.mark.parametrize(
     "client",
     [
-        {},
         {"clientId": "tab-2"},
         {"clientId": None},
         {"clientId": ""},
@@ -1321,71 +1553,59 @@ def test_confirm_rejects_answers_without_a_pending_prompt(comfy, monkeypatch, co
 @pytest.mark.parametrize("path", ["/deadline/jobs/confirm", "/deadline/jobs/cancel"])
 def test_submission_controls_reject_other_or_invalid_clients(comfy, monkeypatch, client, path):
     process = _RecordingProcess()
-    submission = comfy.routes._Submission("fox", process, client_id="tab-1", confirms=1)
-    monkeypatch.setitem(comfy.routes._submissions, "a" * 32, submission)
-    status, _ = run(
-        call(
-            comfy,
-            path,
-            {"submissionId": "a" * 32, "accept": True, **client},
-        )
-    )
+    submission = running_submission(comfy, monkeypatch, process, prompt_id="p" * 32)
+    status, _ = run(call(comfy, path, confirmation(**client)))
     assert status == 403
     assert process.answers == []
-    assert submission.answered == 0
+    assert submission.prompt_id == "p" * 32
     assert submission.canceled is False
+    assert process.killed is False
+
+
+@pytest.mark.parametrize("path", ["/deadline/jobs/confirm", "/deadline/jobs/cancel"])
+def test_submission_controls_reject_a_missing_client(comfy, monkeypatch, path):
+    process = _RecordingProcess()
+    submission = running_submission(comfy, monkeypatch, process, prompt_id="p" * 32)
+    body = confirmation()
+    del body["clientId"]
+    status, _ = run(call(comfy, path, body))
+    assert status == 403
+    assert process.answers == []
+    assert submission.prompt_id == "p" * 32
     assert process.killed is False
 
 
 def test_confirm_only_answers_each_pending_prompt_once(comfy, monkeypatch):
     process = _RecordingProcess()
-    submission = comfy.routes._Submission("fox", process, client_id="tab-1")
-    monkeypatch.setitem(comfy.routes._submissions, "a" * 32, submission)
+    submission = running_submission(comfy, monkeypatch, process)
 
-    async def answer(accept=True):
-        return await call(
-            comfy,
-            "/deadline/jobs/confirm",
-            {
-                "submissionId": "a" * 32,
-                "clientId": "tab-1",
-                "accept": accept,
-            },
-        )
+    async def answer(prompt_id, accept=True):
+        return await call(comfy, "/deadline/jobs/confirm", confirmation(prompt_id, accept))
 
     async def confirm_prompts():
         # An early answer is not saved for the first prompt.
-        assert (await answer())[0] == 409
-        submission.confirms = 1
-        responses = await asyncio.gather(answer(), answer())
+        assert (await answer("first"))[0] == 409
+        submission.prompt_id = "first"
+        responses = await asyncio.gather(answer("first"), answer("first"))
         assert sorted(status for status, _ in responses) == [200, 409]
-        assert (await answer())[0] == 409
-        submission.confirms = 2
-        assert (await answer(accept=False))[0] == 200
-        assert (await answer())[0] == 409
+        # A repeated answer to an answered prompt.
+        assert (await answer("first"))[0] == 409
+        submission.prompt_id = "second"
+        # A delayed answer to the first prompt doesn't answer the second.
+        assert (await answer("first"))[0] == 409
+        assert submission.prompt_id == "second"
+        assert (await answer("second", accept=False))[0] == 200
+        assert (await answer("second"))[0] == 409
 
     run(confirm_prompts())
     assert process.answers == [{"accept": True}, {"accept": False}]
-    assert submission.answered == 2
+    assert submission.prompt_id is None
 
 
 def test_confirm_rejects_a_canceled_submission(comfy, monkeypatch):
     process = _RecordingProcess()
-    submission = comfy.routes._Submission(
-        "fox", process, client_id="tab-1", canceled=True, confirms=1
-    )
-    monkeypatch.setitem(comfy.routes._submissions, "a" * 32, submission)
-    status, _ = run(
-        call(
-            comfy,
-            "/deadline/jobs/confirm",
-            {
-                "submissionId": "a" * 32,
-                "clientId": "tab-1",
-                "accept": True,
-            },
-        )
-    )
+    running_submission(comfy, monkeypatch, process, prompt_id="p" * 32, canceled=True)
+    status, _ = run(call(comfy, "/deadline/jobs/confirm", confirmation()))
     assert status == 409
     assert process.answers == []
 
@@ -1407,24 +1627,11 @@ class _ExitedProcess:
 
 
 @pytest.mark.parametrize(
-    ("path", "body", "status"),
-    [
-        ("/deadline/jobs/confirm", {"accept": True}, 404),
-        ("/deadline/jobs/cancel", {}, 200),
-    ],
+    ("path", "status"), [("/deadline/jobs/confirm", 404), ("/deadline/jobs/cancel", 200)]
 )
-def test_confirm_and_cancel_handle_a_bridge_that_already_exited(
-    comfy, monkeypatch, path, body, status
-):
-    submission_id = "b" * 32
-    monkeypatch.setitem(
-        comfy.routes._submissions,
-        submission_id,
-        comfy.routes._Submission("fox", _ExitedProcess(), client_id="tab-1", confirms=1),
-    )
-    got, response = run(
-        call(comfy, path, {**body, "submissionId": submission_id, "clientId": "tab-1"})
-    )
+def test_confirm_and_cancel_handle_a_bridge_that_already_exited(comfy, monkeypatch, path, status):
+    running_submission(comfy, monkeypatch, _ExitedProcess(), prompt_id="p" * 32)
+    got, response = run(call(comfy, path, confirmation()))
     assert got == status
     if status == 404:
         assert "isn't running" in response["error"]
@@ -1637,7 +1844,8 @@ def test_jobs_doesnt_attach_a_local_model_the_artist_removed(comfy, monkeypatch)
     assert not (bundle / "local_models").exists()
     references = yaml.safe_load((bundle / "asset_references.yaml").read_text())
     assert not references["assetReferences"]["inputs"]["filenames"]
-    assert bridge_requests(requests)[0]["request"]["parameters"]["ModelDirectory"] == ""
+    # Nothing is staged, so the job keeps the template's empty Model Directory.
+    assert bridge_requests(requests)[0]["request"]["parameters"].get("ModelDirectory", "") == ""
 
 
 def test_jobs_attaches_the_local_models_the_artist_kept(comfy, monkeypatch):
@@ -1664,6 +1872,14 @@ def test_jobs_rejects_bad_excluded_models(comfy, monkeypatch, excluded):
 
 
 def test_jobs_keeps_the_artists_model_directory_when_nothing_is_attached(comfy, monkeypatch):
+    """A studio template that shows Model Directory lets the artist choose it."""
+    template = yaml.safe_load(submit.JOB_TEMPLATE.read_text())
+    for definition in template["parameterDefinitions"]:
+        if definition["name"] == "ModelDirectory":
+            definition["userInterface"] = {"control": "CHOOSE_DIRECTORY"}
+    studio = comfy.tmp_path / "studio.yaml"
+    studio.write_text(yaml.safe_dump(template, sort_keys=False))
+    monkeypatch.setenv(submit.TEMPLATE_ENV_VAR, str(studio))
     fake_cli(monkeypatch, comfy.tmp_path, "")
     requests = fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
     body = {**JOB, "parameters": {"ModelDirectory": "/shared/models"}}
@@ -1671,6 +1887,20 @@ def test_jobs_keeps_the_artists_model_directory_when_nothing_is_attached(comfy, 
     assert status == 202
     sent = bridge_requests(requests)[0]["request"]["parameters"]
     assert sent["ModelDirectory"] == "/shared/models"
+
+
+def test_jobs_ignore_hidden_paths_from_the_request(comfy, monkeypatch):
+    """The panel doesn't show them, and a custom nodes folder of any path would load as code."""
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
+    parameters = {"CustomNodesDirectory": "/tmp", "ModelDirectory": "/", "ComfyUIArgs": "--lowvram"}
+    status, _ = run(call(comfy, "/deadline/jobs", {**JOB, "parameters": parameters}))
+    assert status == 202
+    sent = bridge_requests(requests)[0]["request"]["parameters"]
+    assert "CustomNodesDirectory" not in sent
+    assert "ModelDirectory" not in sent
+    # Parameters the panel shows are still the artist's.
+    assert sent["ComfyUIArgs"] == "--lowvram"
 
 
 def test_jobs_warns_when_a_planned_local_model_cant_be_staged(comfy, monkeypatch):
@@ -1966,35 +2196,35 @@ def test_download_requires_a_valid_client_before_starting_tools(comfy, monkeypat
     assert comfy.server.sids == []
 
 
+DOWNLOAD_PROGRESS = {"event": "progress", "stage": "downloading", "progress": 50.0, "message": ""}
+DOWNLOADED = result({"fileCount": 2, "directory": "/comfy/output", "message": "Downloaded 2 files"})
+
+
 @pytest.mark.parametrize("client_id", ["tab-1", "tab_A-9", "a" * 128])
 def test_download_sends_events_only_to_the_tab_that_asked(comfy, monkeypatch, client_id):
-    lines = [
-        {"messageType": "progress", "value": "50"},
-        {"messageType": "summary", "value": "Downloaded 2 files", "fileCount": 2},
-    ]
-    fake_cli(monkeypatch, comfy.tmp_path, "\n".join(map(json.dumps, lines)))
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    fake_bridge(monkeypatch, comfy.tmp_path, {"download": [DOWNLOAD_PROGRESS, DOWNLOADED]})
     body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": client_id}
     status, _ = run(call(comfy, "/deadline/jobs/download", body))
     assert status == 202
     assert comfy.server.sids == [client_id, client_id]
 
 
-def test_download_runs_the_cli_and_reports_progress(comfy, monkeypatch):
-    lines = [
-        {"messageType": "title", "value": "fox"},
-        {"messageType": "progress", "value": "50"},
-        {"messageType": "summary", "value": "Downloaded 2 files", "fileCount": 2},
-    ]
-    args_file = fake_cli(monkeypatch, comfy.tmp_path, "\n".join(map(json.dumps, lines)))
+def test_download_runs_the_bridge_and_reports_progress(comfy, monkeypatch):
+    args_file = fake_cli(monkeypatch, comfy.tmp_path, "")
+    requests = fake_bridge(
+        monkeypatch, comfy.tmp_path, {"download": [DOWNLOAD_PROGRESS, DOWNLOADED]}
+    )
     body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
-    status, result = run(call(comfy, "/deadline/jobs/download", body))
-    assert (status, result) == (202, {"jobId": JOB_ID})
-    args = json.loads(args_file.read_text())
-    assert args[:2] == ["job", "download-output"]
-    assert args[args.index("--job-id") + 1] == JOB_ID
-    assert {"--yes", "json", "create_copy"} <= set(args)
+    status, response = run(call(comfy, "/deadline/jobs/download", body))
+    assert (status, response) == (202, {"jobId": JOB_ID})
+    [request] = bridge_requests(requests)
+    assert request["argv"][-1] == "download"
+    assert request["request"] == {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID}
+    # The bridge downloads, rather than the CLI, so it can check where each file goes.
+    assert not args_file.exists()
     assert comfy.server.events == [
-        ("deadline.download", {"jobId": JOB_ID, "status": "DOWNLOADING", "progress": "50"}),
+        ("deadline.download", {"jobId": JOB_ID, "status": "DOWNLOADING", "progress": 50.0}),
         (
             "deadline.download",
             {
@@ -2002,78 +2232,63 @@ def test_download_runs_the_cli_and_reports_progress(comfy, monkeypatch):
                 "status": "DOWNLOADED",
                 "message": "Downloaded 2 files",
                 "fileCount": 2,
+                "directory": "/comfy/output",
             },
         ),
     ]
 
 
-def test_download_says_which_folder_it_downloaded_into(comfy, monkeypatch):
-    output = comfy.tmp_path / "output"
-    files = [str(output / "fox" / "fox_00001_.png"), str(output / "fox_00002_.png")]
-    summary = {"messageType": "summary", "value": "Downloaded 2 files", "fileCount": 2}
-    fake_cli(monkeypatch, comfy.tmp_path, json.dumps({**summary, "files": files}))
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
-    run(call(comfy, "/deadline/jobs/download", body))
-    assert comfy.server.events[-1][1]["directory"] == str(output)
-
-
-@pytest.mark.parametrize("files", [None, [], ["a.png", 5], "a.png"])
-def test_download_leaves_out_a_folder_it_cant_tell(comfy, monkeypatch, files):
-    summary = {"messageType": "summary", "value": "Downloaded 1 file", "fileCount": 1}
-    if files is not None:
-        summary["files"] = files
-    fake_cli(monkeypatch, comfy.tmp_path, json.dumps(summary))
+@pytest.mark.parametrize("directory", [None, 5, ["/comfy/output"]])
+def test_download_leaves_out_a_folder_it_cant_tell(comfy, monkeypatch, directory):
+    data = {"fileCount": 1, "message": "Downloaded 1 file"}
+    if directory is not None:
+        data["directory"] = directory
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    fake_bridge(monkeypatch, comfy.tmp_path, {"download": [result(data)]})
     body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
     run(call(comfy, "/deadline/jobs/download", body))
     assert comfy.server.events[-1][1]["status"] == "DOWNLOADED"
     assert "directory" not in comfy.server.events[-1][1]
 
 
-def test_download_reads_stderr_while_waiting_for_the_summary(comfy, monkeypatch):
-    """A CLI that fills its stderr pipe before printing its summary still finishes."""
-    summary = {"messageType": "summary", "value": "Downloaded 1 file", "fileCount": 1}
-    fake_cli(monkeypatch, comfy.tmp_path, json.dumps(summary), stderr_noise=600_000)
+def test_download_reads_stderr_while_waiting_for_the_result(comfy, monkeypatch):
+    """A bridge that fills its stderr pipe before printing its result still finishes."""
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    fake_bridge(monkeypatch, comfy.tmp_path, {"download": ["noisy", DOWNLOADED]})
     body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
     run(asyncio.wait_for(call(comfy, "/deadline/jobs/download", body), 30))
     assert comfy.server.events[-1][1]["status"] == "DOWNLOADED"
-
-
-def _long_summary() -> dict:
-    """A summary line well over asyncio's default 64 KiB line limit, as for a long frame range."""
-    files = [
-        f"/renders/shot_010/very_long_output_directory_name/fox_{i:05}.png" for i in range(3000)
-    ]
-    return {
-        "messageType": "summary",
-        "value": "Downloaded 3000 files",
-        "fileCount": 3000,
-        "files": files,
-    }
-
-
-def test_download_reports_a_summary_longer_than_the_default_line_limit(comfy, monkeypatch):
-    summary = _long_summary()
-    assert len(json.dumps(summary)) > 64 * 1024
-    fake_cli(monkeypatch, comfy.tmp_path, json.dumps(summary))
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
-    run(asyncio.wait_for(call(comfy, "/deadline/jobs/download", body), 30))
-    assert comfy.server.events[-1][1]["status"] == "DOWNLOADED"
-    assert comfy.server.events[-1][1]["fileCount"] == 3000
 
 
 def test_download_reports_output_it_cant_read(comfy, monkeypatch):
     """The panel stops showing the download as running, whatever went wrong reading it."""
-    monkeypatch.setattr(comfy.routes, "DOWNLOAD_LINE_LIMIT", 1024)
-    fake_cli(monkeypatch, comfy.tmp_path, json.dumps(_long_summary()))
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    long_line = {"event": "progress", "message": "x" * (1 << 17)}
+    fake_bridge(monkeypatch, comfy.tmp_path, {"download": [long_line, "hang"]})
     body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
     run(asyncio.wait_for(call(comfy, "/deadline/jobs/download", body), 30))
     [(event, data)] = comfy.server.events
     assert (event, data["status"]) == ("deadline.download", "FAILED")
-    assert "Couldn't read the CLI's output" in data["error"]
+    assert "Couldn't read the Deadline Cloud library's output" in data["error"]
+
+
+def test_a_submission_whose_output_cant_be_read_is_stopped_and_reported(comfy, monkeypatch):
+    """A line over asyncio's 64 KiB limit stops the bridge, and the panel sees the failure."""
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    long_message = {"event": "message", "message": "x" * (1 << 17)}
+    fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [long_message, "hang"]})
+    status, _ = run(asyncio.wait_for(call(comfy, "/deadline/jobs", JOB), 30))
+    assert status == 202
+    event, data = comfy.server.events[-1]
+    assert (event, data["status"]) == ("deadline.submitted", "FAILED")
+    assert "Couldn't read the Deadline Cloud library's output" in data["error"]
+    assert comfy.routes._submissions == {}
 
 
 def test_download_reports_failures(comfy, monkeypatch):
-    fake_cli(monkeypatch, comfy.tmp_path, "", exit_code=1, stderr="Credentials are expired")
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    error = {"event": "error", "message": "Credentials are expired"}
+    fake_bridge(monkeypatch, comfy.tmp_path, {"download": [error]})
     body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
     run(call(comfy, "/deadline/jobs/download", body))
     assert comfy.server.events[-1] == (
@@ -2083,9 +2298,24 @@ def test_download_reports_failures(comfy, monkeypatch):
     assert comfy.server.sids == ["tab-1"]
 
 
-def test_download_failures_log_stderr_indented(comfy, monkeypatch, caplog):
-    stderr = "Credentials are expired\nERROR forged entry"
-    fake_cli(monkeypatch, comfy.tmp_path, "", exit_code=1, stderr=stderr)
+def test_download_reports_a_bridge_that_crashed(comfy, monkeypatch, caplog):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    fake_bridge(monkeypatch, comfy.tmp_path, {"download": ["crash"]})
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
+    with caplog.at_level("ERROR", logger=comfy.routes.logger.name):
+        run(call(comfy, "/deadline/jobs/download", body))
+    assert comfy.server.events[-1][1] == {
+        "jobId": JOB_ID,
+        "status": "FAILED",
+        "error": "The Deadline Cloud library failed. Traceback: boom",
+    }
+    assert f"Couldn't download the outputs of {JOB_ID}:" in caplog.text
+
+
+def test_download_failures_log_the_error_indented(comfy, monkeypatch, caplog):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    error = {"event": "error", "message": "Credentials are expired\nERROR forged entry"}
+    fake_bridge(monkeypatch, comfy.tmp_path, {"download": [error]})
     body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
     with caplog.at_level("ERROR", logger=comfy.routes.logger.name):
         run(call(comfy, "/deadline/jobs/download", body))
@@ -2095,6 +2325,57 @@ def test_download_failures_log_stderr_indented(comfy, monkeypatch, caplog):
         "    Credentials are expired",
         "    ERROR forged entry",
     ]
+
+
+# A made-up AWS error. 123456789012 is the example account ID from the AWS documentation, and
+# ASIAABCDEFGHIJKLMNOP is a fake access key ID: "ASIA" followed by the letters A to P. Neither
+# is real. They only check that logged errors leave out account IDs and access key IDs.
+ACCESS_DENIED = (
+    "An error occurred (AccessDeniedException): User: "
+    "arn:aws:sts::123456789012:assumed-role/Artist/artist@example.com is not authorized to "
+    "perform: deadline:GetJob on resource: arn:aws:deadline:us-west-2:123456789012:farm/farm-1"
+    " with key ASIAABCDEFGHIJKLMNOP"
+)
+
+
+def test_download_failures_log_aws_errors_without_account_details(comfy, monkeypatch, caplog):
+    """ComfyUI serves its log from a route that doesn't check the Host header."""
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    fake_bridge(
+        monkeypatch, comfy.tmp_path, {"download": [{"event": "error", "message": ACCESS_DENIED}]}
+    )
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
+    with caplog.at_level("ERROR", logger=comfy.routes.logger.name):
+        run(call(comfy, "/deadline/jobs/download", body))
+    message = caplog.records[-1].getMessage()
+    for detail in ("123456789012", "artist@example.com", "Artist", "ASIAABCDEFGHIJKLMNOP"):
+        assert detail not in message
+    assert "arn:aws:sts::<account>:<redacted>" in message
+    assert "arn:aws:deadline:us-west-2:<account>:<redacted>" in message
+    # The tab that asked still gets the whole error, to fix its permissions.
+    assert comfy.server.events[-1][1]["error"] == ACCESS_DENIED
+
+
+def test_submission_failures_log_aws_errors_without_account_details(comfy, monkeypatch, caplog):
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    fake_bridge(
+        monkeypatch, comfy.tmp_path, {"submit": [{"event": "error", "message": ACCESS_DENIED}]}
+    )
+    with caplog.at_level("ERROR", logger=comfy.routes.logger.name):
+        status, _ = run(call(comfy, "/deadline/jobs", JOB))
+    assert status == 202
+    [record] = [r for r in caplog.records if "Couldn't submit" in r.getMessage()]
+    assert "123456789012" not in record.getMessage()
+    assert "artist@example.com" not in record.getMessage()
+    assert comfy.server.events[-1][1]["error"] == ACCESS_DENIED
+
+
+def test_bridge_failures_log_stderr_without_account_details(comfy, caplog):
+    with caplog.at_level("ERROR", logger=comfy.routes.logger.name):
+        message = comfy.routes._bridge_failure([], ACCESS_DENIED.encode(), 1)
+    assert "123456789012" not in caplog.text
+    assert "artist@example.com" not in caplog.text
+    assert message == f"The Deadline Cloud library failed. {ACCESS_DENIED}"
 
 
 def test_download_only_takes_deadline_ids(comfy, monkeypatch):
@@ -2627,6 +2908,13 @@ def test_bad_parameter_values_are_refused_before_anything_is_staged(
     assert not (comfy.tmp_path / "user" / "deadline_submissions").exists()
 
 
+@pytest.mark.parametrize("client_id", [None, "", "not valid", 7])
+def test_events_are_never_broadcast_to_every_tab(comfy, client_id):
+    with pytest.raises(ValueError, match="client ID"):
+        comfy.routes._send("deadline.submitted", {"status": "FAILED"}, client_id)
+    assert comfy.server.events == []
+
+
 def _task_parameters(bundle_dir: Path) -> list[str]:
     template = yaml.safe_load((bundle_dir / "template.yaml").read_text())
     space = template["steps"][0]["parameterSpace"]["taskParameterDefinitions"]
@@ -2642,7 +2930,8 @@ def test_jobs_runs_list_items_as_tasks(comfy, monkeypatch):
         },
     }
     requests = fake_tools(monkeypatch, comfy.tmp_path)
-    _, body = run(post(comfy, {"workflow": workflow, "splitTasks": True}))
+    split = {"workflow": workflow, "splitTasks": True, "parameters": {"List10Items": "1-2"}}
+    _, body = run(post(comfy, split))
     assert _task_parameters(Path(body["job_bundle"])) == ["List10"]
     assert "List10" not in sent_parameters(requests)
 
@@ -2659,7 +2948,8 @@ def test_jobs_runs_lists_of_different_lengths_as_separate_task_parameters(comfy,
         "11": {"class_type": "CreateList", "inputs": {"input0": ["1", 0], "input1": ["2", 0]}},
     }
     fake_tools(monkeypatch, comfy.tmp_path)
-    _, body = run(post(comfy, {"workflow": workflow, "splitTasks": True}))
+    ranges = {"List10Items": "1-3", "List11Items": "1-2"}
+    _, body = run(post(comfy, {"workflow": workflow, "splitTasks": True, "parameters": ranges}))
     assert _task_parameters(Path(body["job_bundle"])) == ["List10", "List11"]
     assert not any("different numbers of items" in warning for warning in body["warnings"])
 
@@ -2693,7 +2983,8 @@ def test_jobs_run_as_one_task_unless_the_lists_are_split(comfy, monkeypatch):
         _, response = run(post(comfy, body))
         template = Path(response["job_bundle"]) / "template.yaml"
         assert template.read_text() == submit.JOB_TEMPLATE.read_text()
-    _, body = run(post(comfy, {"workflow": workflow, "splitTasks": True}))
+    split = {"workflow": workflow, "splitTasks": True, "parameters": {"List10Items": "1-2"}}
+    _, body = run(post(comfy, split))
     assert _task_parameters(Path(body["job_bundle"])) == ["List10"]
     status, body = run(post(comfy, {"workflow": workflow, "splitTasks": "no"}))
     assert (status, body["error"]) == (400, "splitTasks must be true or false.")
@@ -2713,7 +3004,10 @@ def test_task_warnings_only_apply_to_multiple_tasks(comfy, monkeypatch):
     assert task_warning not in plan["warnings"]
     _, one = run(post(comfy, {"workflow": workflow}))
     assert task_warning not in one["warnings"]
-    _, split = run(post(comfy, {"workflow": workflow, "splitTasks": True}))
+    # The panel sends a range for each list it splits: one item each keeps the job small.
+    ranges = {f"List{100 + i}Items": "1" for i in range(submit.MAX_ITEM_SOURCES)}
+    body = {"workflow": workflow, "splitTasks": True, "parameters": ranges}
+    _, split = run(post(comfy, body))
     assert task_warning in split["warnings"]
 
 
@@ -2797,6 +3091,76 @@ def test_templates_with_their_own_task_parameters_run_lists_whole(comfy, monkeyp
     space = template["steps"][0]["parameterSpace"]
     assert [parameter["name"] for parameter in space["taskParameterDefinitions"]] == ["Frame"]
     assert "List10Items" not in sent_parameters(requests)
+
+
+def test_templates_with_their_own_task_parameters_drop_the_workflows_submitter_keys(
+    comfy, monkeypatch
+):
+    """A studio task script can follow the keys, so a shared workflow's own are removed."""
+    _studio_step_with_task_parameters(comfy, monkeypatch)
+    fake_tools(monkeypatch, comfy.tmp_path)
+    workflow = {
+        **WORKFLOW,
+        "10": {
+            "class_type": "LoadImageDataSetFromFolder",
+            "inputs": {"folder": "cats"},
+            "_meta": {"title": "Cats", "deadline_files": ["/etc/passwd"], "deadline_item": "X"},
+        },
+    }
+    status, body = run(post(comfy, {"workflow": workflow}))
+    assert status == 202, body
+    sent = json.loads(Path(body["workflow_file"]).read_text())
+    assert sent["10"]["_meta"] == {"title": "Cats"}
+
+
+def _two_lists(first: int, second: int) -> dict:
+    return {
+        **WORKFLOW,
+        "10": {"class_type": "CreateList", "inputs": {f"input{i}": i for i in range(first)}},
+        "11": {"class_type": "CreateList", "inputs": {f"input{i}": i for i in range(second)}},
+    }
+
+
+def test_jobs_refuse_more_tasks_than_the_limit(comfy, monkeypatch):
+    """Every combination of the lists is a task, so the ranges multiply."""
+    monkeypatch.setattr(submit, "MAX_TASKS", 10)
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    ranges = {"List10Items": "1-3", "List11Items": "1-4"}
+    body = {"workflow": _two_lists(3, 4), "splitTasks": True, "parameters": ranges}
+    status, response = run(post(comfy, body))
+    assert status == 400
+    assert response["error"].startswith("The job would run 12 tasks")
+    assert not requests.exists()
+    # Running a list whole counts as one item.
+    body["parameters"] = {"List10Items": "1-3", "List11Items": "0"}
+    status, _ = run(post(comfy, body))
+    assert status == 202
+
+
+def test_jobs_refuse_a_list_the_panel_didnt_show(comfy, monkeypatch):
+    """A list without a range, such as a folder that gained an image, would run every item."""
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    body = {
+        "workflow": _two_lists(2, 3),
+        "splitTasks": True,
+        "parameters": {"List10Items": "1-2"},
+    }
+    status, response = run(post(comfy, body))
+    assert status == 400
+    assert response["error"].startswith(
+        "The workflow's lists changed since it was read (List11Items)."
+    )
+    assert not requests.exists()
+
+
+def test_jobs_submit_the_checked_range(comfy, monkeypatch):
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    ranges = {"List10Items": " 1 - 2 ", "List11Items": "3, 1"}
+    body = {"workflow": _two_lists(2, 3), "splitTasks": True, "parameters": ranges}
+    status, _ = run(post(comfy, body))
+    assert status == 202
+    sent = sent_parameters(requests)
+    assert (sent["List10Items"], sent["List11Items"]) == ("1-2", "3,1")
 
 
 def test_templates_with_their_own_task_parameters_dont_warn_without_lists(comfy, monkeypatch):

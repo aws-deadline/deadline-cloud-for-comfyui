@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
+import re
 import sys
 import time
 from collections.abc import Callable
@@ -141,11 +143,26 @@ def queue(request: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# What each saved default's ID looks like. An empty string clears it.
+DEFAULT_IDS = {
+    "farmId": re.compile(r"farm-[0-9a-f]{32}"),
+    "queueId": re.compile(r"queue-[0-9a-f]{32}"),
+    "storageProfileId": re.compile(r"sp-[0-9a-f]{32}"),
+}
+
+
 def set_defaults(request: dict[str, Any]) -> dict[str, Any]:
-    """Saves the farm, queue and storage profile as the defaults."""
+    """
+    Saves the farm, queue and storage profile as the defaults. Every ID is checked before
+    anything is saved: the config names sections after the farm ID.
+    """
     from deadline.client.config import config_file
 
-    config_file.write_config(_config(request))
+    for key, pattern in DEFAULT_IDS.items():
+        value = request.get(key, "")
+        if not isinstance(value, str) or (value and not pattern.fullmatch(value)):
+            raise ValueError(f"{key} isn't a Deadline Cloud ID.")
+    config_file.write_config(_config({key: request[key] for key in DEFAULT_IDS if key in request}))
     return {}
 
 
@@ -205,11 +222,14 @@ def _progress(stage: str) -> Callable[[Any], bool]:
 
 
 def _confirm(message: str, default: bool) -> bool:
-    """Asks the panel, which answers with a line of stdin. No answer counts as no."""
+    """
+    Asks the panel, which answers with a line of stdin. Only {"accept": true} is a yes: no answer,
+    or anything else, such as "yes" or 1, counts as no.
+    """
     emit("confirm", message=message, default=default)
     line = sys.stdin.readline()
     try:
-        return bool(json.loads(line).get("accept"))
+        return json.loads(line).get("accept") is True
     except (ValueError, AttributeError):
         return False
 
@@ -241,10 +261,48 @@ def _check_sdk_has_bool(bundle_dir: str) -> None:
         )
 
 
+def _report_job_creation(request: dict[str, Any]) -> None:
+    """
+    Emits "creating" just before the library calls CreateJob, and "created" with the job's ID once
+    it returns. The library then waits for the job, prints its monitor URL and runs hooks before
+    it returns, so without these a failure or Cancel in that time would hide a job that runs.
+    """
+    from deadline.client import api
+
+    get_client = api.get_boto3_client
+
+    def creating(**kwargs: Any) -> None:
+        emit("creating")
+
+    def created(parsed: Any = None, **kwargs: Any) -> None:
+        job_id = parsed.get("jobId") if isinstance(parsed, dict) else None
+        if isinstance(job_id, str):
+            emit(
+                "created",
+                jobId=job_id,
+                farmId=request.get("farmId"),
+                queueId=request.get("queueId"),
+            )
+
+    def get_boto3_client(service_name: str, *args: Any, **kwargs: Any) -> Any:
+        client = get_client(service_name, *args, **kwargs)
+        if service_name == "deadline":
+            # botocore's per-client events. unique_id keeps a cached client from getting two.
+            events = client.meta.events
+            events.register(
+                "before-call.deadline.CreateJob", creating, unique_id="comfyui-creating"
+            )
+            events.register("after-call.deadline.CreateJob", created, unique_id="comfyui-created")
+        return client
+
+    api.get_boto3_client = get_boto3_client
+
+
 def submit(request: dict[str, Any]) -> dict[str, Any]:
     from deadline.client import api
 
     _check_sdk_has_bool(request["bundleDir"])
+    _report_job_creation(request)
     settings = request.get("settings", {})
     options = {
         argument: settings[key]
@@ -275,6 +333,87 @@ def submit(request: dict[str, Any]) -> dict[str, Any]:
     return {"jobId": job_id, "farmId": request.get("farmId"), "queueId": request.get("queueId")}
 
 
+def _inside(directory: str, path: str) -> bool:
+    """Whether path is inside directory once links are resolved, compared as the OS compares."""
+    base = os.path.normcase(os.path.realpath(directory))
+    target = os.path.normcase(os.path.realpath(path))
+    try:
+        return target != base and os.path.commonpath([base, target]) == base
+    except ValueError:
+        # Paths on different Windows drives.
+        return False
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def download(request: dict[str, Any]) -> dict[str, Any]:
+    """
+    Downloads a job's outputs into the Output Directory it was submitted with, and nowhere else.
+    Output manifests come from the queue's job attachments, which every job on the queue can
+    write to, so the destination of every file is checked against the job's Output Directory
+    before any is written.
+    """
+    from deadline.client import api
+    from deadline.job_attachments.download import OutputDownloader
+    from deadline.job_attachments.models import FileConflictResolution, JobAttachmentS3Settings
+
+    farm_id, queue_id, job_id = (str(request[key]) for key in ("farmId", "queueId", "jobId"))
+    config = _config({})
+    deadline = api.get_boto3_client("deadline", config=config)
+    job = deadline.get_job(farmId=farm_id, queueId=queue_id, jobId=job_id)
+    # Set when the job is created. Workers can't change it.
+    output_dir = ((job.get("parameters") or {}).get("OutputDir") or {}).get("path")
+    if not isinstance(output_dir, str) or not os.path.isabs(output_dir):
+        raise RuntimeError("This job has no Output Directory on this machine to download into.")
+    queue = deadline.get_queue(farmId=farm_id, queueId=queue_id)
+    session = api.get_queue_user_boto3_session(
+        deadline=deadline,
+        config=config,
+        farm_id=farm_id,
+        queue_id=queue_id,
+        queue_display_name=queue["displayName"],
+    )
+    with contextlib.redirect_stdout(sys.stderr):
+        downloader = OutputDownloader(
+            s3_settings=JobAttachmentS3Settings(**queue["jobAttachmentSettings"]),
+            farm_id=farm_id,
+            queue_id=queue_id,
+            job_id=job_id,
+            session=session,
+        )
+    # download() writes the same plan that get_paths_by_root() lists.
+    planned = [
+        os.path.join(root, path)
+        for root, paths in downloader.get_paths_by_root().items()
+        for path in paths
+    ]
+    if not planned:
+        return {"fileCount": 0, "directory": output_dir, "message": "The job has no outputs yet."}
+    outside = [path for path in planned if not _inside(output_dir, path)]
+    if outside:
+        raise RuntimeError(
+            f"Nothing was downloaded: {_plural(len(outside), 'output file')} of {len(planned)} "
+            f"would be written outside the job's Output Directory {output_dir}, such as "
+            f"{outside[0][:300]!r}."
+        )
+    with contextlib.redirect_stdout(sys.stderr):
+        summary = downloader.download(
+            file_conflict_resolution=FileConflictResolution.CREATE_COPY,
+            on_downloading_files=_progress("downloading"),
+        )
+    downloaded = [str(path) for path in getattr(summary, "downloaded_files", [])]
+    if any(not _inside(output_dir, path) for path in downloaded):
+        raise RuntimeError(f"Some output files were written outside {output_dir}.")
+    count = len(downloaded) or int(getattr(summary, "processed_files", 0) or 0)
+    return {
+        "fileCount": count,
+        "directory": output_dir,
+        "message": f"Downloaded {_plural(count, 'file')}",
+    }
+
+
 COMMANDS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "status": status,
     "login": login,
@@ -284,6 +423,7 @@ COMMANDS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "set-defaults": set_defaults,
     "jobs": jobs,
     "submit": submit,
+    "download": download,
 }
 
 

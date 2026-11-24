@@ -12,8 +12,8 @@ import asyncio
 import ipaddress
 import json
 import logging
-import os
 import re
+import secrets
 import shutil
 import threading
 import time
@@ -37,6 +37,7 @@ from .get_local_assets import (
     node_pack_size,
     stage_local_models,
     stage_local_node_packs,
+    workflow_file_inputs,
     write_asset_references,
 )
 from .submit import (
@@ -48,9 +49,9 @@ from .submit import (
     check_cli_version,
     check_item_range,
     check_parameter_values,
+    check_task_count,
     create_job_bundle,
     host_requirements,
-    input_folders,
     job_description,
     load_config,
     local_node_packs,
@@ -67,6 +68,7 @@ from .submit import (
     template_host_requirements,
     template_supports_task_lists,
     validate_api_workflow,
+    without_submitter_meta,
     workflow_models,
     write_private_text,
 )
@@ -79,11 +81,8 @@ CONFIRM_EVENT = "deadline.confirm"
 # The job template's switch for loading the attached custom node packs on the worker.
 ATTACH_NODES = "AttachCustomNodes"
 DOWNLOAD_EVENT = "deadline.download"
-# A farm, queue or job ID, which goes on the CLI's command line.
+# A farm, queue or job ID.
 _RESOURCE_ID = re.compile(r"(farm|queue|job)-[0-9a-f]{32}")
-# download-output's JSON summary is one line that lists every downloaded file, so it can be far
-# longer than asyncio's default 64 KiB line limit.
-DOWNLOAD_LINE_LIMIT = 64 * 1024 * 1024
 # The job settings that a saved bundle keeps as deadline:<name> parameter values, which `deadline
 # bundle submit` reads.
 SAVED_JOB_SETTINGS = (
@@ -130,14 +129,19 @@ class _Submission:
     # The browser tab that submitted it, which alone gets its events.
     client_id: str
     canceled: bool = False
-    confirms: int = 0
-    answered: int = 0
+    # The ID of the confirmation prompt waiting for an answer, if one is. Each prompt gets a new
+    # one, so a late or repeated answer to an earlier prompt can't answer a later one.
+    prompt_id: str | None = None
     # Timers that decline unanswered confirmations, canceled when the submission ends.
     timers: list[asyncio.Task] = field(default_factory=list)
     # The job bundle, deleted once the job is created or the submission is canceled.
     bundle_dir: Path | None = None
     # Where the job's outputs download to, shown with the job in the panel.
     output_dir: str | None = None
+    # Whether the library has started CreateJob, after which Cancel can't stop the job.
+    creating: bool = False
+    # The job CreateJob made, reported even if a later step fails: {jobId, farmId, queueId}.
+    created: dict[str, str] | None = None
 
 
 _submissions: dict[str, _Submission] = {}
@@ -300,11 +304,14 @@ def _is_loopback(remote: str | None) -> bool:
 
 
 def _is_local_host(host: str | None) -> bool:
-    """Whether a Host header names this machine by localhost or a loopback address."""
+    """
+    Whether a Host header names this machine by localhost or a loopback address. Names under
+    .localhost, and names with a trailing dot, can be resolved through DNS, so they're refused.
+    """
     if host is None:
         return False
-    host = host.strip("[]").rstrip(".").lower()
-    return host == "localhost" or host.endswith(".localhost") or _is_loopback(host)
+    host = host.strip("[]").lower()
+    return host == "localhost" or _is_loopback(host)
 
 
 _CLIENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
@@ -316,8 +323,10 @@ def _client_id(body: dict[str, Any]) -> str | None:
     return client_id if isinstance(client_id, str) and _CLIENT_ID.fullmatch(client_id) else None
 
 
-def _send(event: str, data: dict[str, Any], client_id: str | None) -> None:
-    """Sends an event to its browser tab, or broadcasts tool requests without a websocket ID."""
+def _send(event: str, data: dict[str, Any], client_id: str) -> None:
+    """Sends an event to the browser tab that started it. It's never broadcast to every tab."""
+    if not isinstance(client_id, str) or not _CLIENT_ID.fullmatch(client_id):
+        raise ValueError("A Deadline Cloud event needs the client ID of its browser tab")
     PromptServer.instance.send_sync(event, data, client_id)
 
 
@@ -335,9 +344,35 @@ def _log_block(text: str) -> str:
     return text.rstrip().replace("\r\n", "\n").replace("\n", "\n    ").replace("\r", "\\r")
 
 
+# An ARN's account and resource, such as an assumed role's session name, which is often an email.
+_ARN = re.compile(r"\b(arn:aws[\w-]*:[\w-]*:[\w-]*:)\d{12}:[^\s\"',;]*")
+_ACCESS_KEY_ID = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
+
+
+def _redact_aws(text: str) -> str:
+    """
+    AWS error text without account IDs, ARNs or access key IDs. ComfyUI keeps its log in memory
+    and serves it from /internal/logs, which doesn't check the Host header, so a website that
+    points its domain at this machine could read the log. The browser tab still gets the full
+    error.
+    """
+    return _ACCESS_KEY_ID.sub("<access key ID>", _ARN.sub(r"\1<account>:<redacted>", text))
+
+
 # Headers that identify a forwarded request. A local proxy can connect from loopback on
-# behalf of other browsers.
-_FORWARDING_HEADERS = ("Forwarded", "X-Forwarded-For", "X-Real-IP")
+# behalf of other browsers. A proxy that adds none of them can't be told apart from a local
+# client, which is why the README says to reach ComfyUI through localhost only.
+_FORWARDING_HEADERS = (
+    "Forwarded",
+    "X-Forwarded-For",
+    "X-Forwarded-Host",
+    "X-Forwarded-Proto",
+    "X-Real-IP",
+    "Via",
+    "CF-Connecting-IP",
+    "True-Client-IP",
+    "X-Client-IP",
+)
 
 
 def _has_local_host(request: web.Request) -> bool:
@@ -420,7 +455,10 @@ async def _read_request(
     if isinstance(body, web.Response):
         return body
     try:
-        workflow = validate_api_workflow(body.get("workflow"), body.get("ui_workflow"))
+        # Off the event loop: a large workflow mustn't hold up ComfyUI's server while it's read.
+        workflow = await asyncio.to_thread(
+            validate_api_workflow, body.get("workflow"), body.get("ui_workflow")
+        )
         template = resolve_job_template()
     except SubmitError as e:
         return _error(400, str(e))
@@ -458,7 +496,9 @@ def _prepare(
         }
         items = plan_task_lists(workflow, input_dir, reserved)
     prepared = _Prepared(
-        workflow=items.workflow if items else workflow,
+        # Without task lists, the submitter's own _meta keys are still removed, so a studio
+        # template's task script can't follow ones that a shared workflow brought along.
+        workflow=items.workflow if items else without_submitter_meta(workflow),
         items=items,
         conda_channels=resolve_conda_channels(config),
     )
@@ -646,17 +686,28 @@ def _local_model_paths(
         return {}, {}
 
 
+def _file_inputs(workflow: dict[str, Any]) -> dict[str, frozenset[str]] | None:
+    """The file inputs of the workflow's node types, as ComfyUI's node definitions mark them."""
+    try:
+        import nodes
+    except ImportError:
+        # get_local_assets then reads only ComfyUI's own loaders.
+        return None
+    return workflow_file_inputs(workflow, nodes.NODE_CLASS_MAPPINGS)
+
+
 def _local_assets(workflow: dict[str, Any]) -> LocalAssets:
-    """The input files the workflow loads, with the folders its folder loaders read."""
-    input_dir = folder_paths.get_input_directory()
-    assets = get_local_assets(
+    """
+    The input files the workflow's file inputs and folder loaders load, inside ComfyUI's input,
+    output and temp folders. A folder loader's folder is attached as the files in it.
+    """
+    return get_local_assets(
         workflow,
-        input_dir=input_dir,
+        input_dir=folder_paths.get_input_directory(),
         output_dir=folder_paths.get_output_directory(),
         temp_dir=folder_paths.get_temp_directory(),
+        file_inputs=_file_inputs(workflow),
     )
-    assets.directories = sorted({*assets.directories, *input_folders(workflow, Path(input_dir))})
-    return assets
 
 
 def _save_asset_references(
@@ -763,6 +814,14 @@ def _plan(body: dict[str, Any], workflow: dict[str, Any], template: Path) -> dic
         "attachments": {
             "filenames": [str(path) for path in assets.filenames],
             "directories": [str(path) for path in assets.directories],
+            # Each folder loader's folder with the files attached from it, which filenames lists
+            # too, so the panel shows a folder as one row.
+            "folders": [
+                {"path": str(folder), "files": [str(path) for path in files]}
+                for folder, files in sorted(
+                    getattr(assets, "folders", {}).items(), key=lambda item: str(item[0])
+                )
+            ],
         },
         # Attached when submitting.
         "localModels": [
@@ -777,7 +836,8 @@ def _plan(body: dict[str, Any], workflow: dict[str, Any], template: Path) -> dic
         "hostRequirements": template_host_requirements(job_template),
         # Attached when submitting, unless the artist turns off Attach Custom Nodes.
         "localNodes": [_local_node(name, path) for name, path in prepared.local_nodes.items()],
-        "warnings": prepared.warnings,
+        # With the inputs the workflow names that aren't attached, such as an absolute path.
+        "warnings": [*prepared.warnings, *assets.warnings],
         # About splitting the lists into tasks, so only for Multiple tasks.
         "taskWarnings": prepared.items.warnings if prepared.items else [],
         "nodeWarnings": prepared.node_warnings,
@@ -856,12 +916,32 @@ def _parse_event(line: bytes) -> dict[str, Any] | None:
     return event if isinstance(event, dict) and isinstance(event.get("event"), str) else None
 
 
+async def _stop(process: asyncio.subprocess.Process) -> None:
+    """
+    Kills a child whose output can't be read any more, and waits for it. asyncio waits for the
+    pipes to close as well as the process to exit, so the unread rest of stdout is read too.
+    """
+    if process.returncode is None:
+        process.kill()
+    if process.stdout is not None:
+        try:
+            while await process.stdout.read(1 << 16):
+                pass
+        except (OSError, ValueError) as e:
+            logger.debug("Couldn't read the rest of a stopped process's output: %s", e)
+    await process.wait()
+
+
 def _bridge_failure(events: list[dict[str, Any]], stderr: bytes, returncode: int | None) -> str:
     for event in events:
         if event["event"] == "error":
             return str(event.get("message"))
     errors = stderr.decode(errors="replace").strip()
-    logger.error("The Deadline Cloud bridge exited with code %s:\n%s", returncode, errors)
+    logger.error(
+        "The Deadline Cloud bridge exited with code %s:\n    %s",
+        returncode,
+        _log_block(_redact_aws(errors)),
+    )
     last_line = next((line for line in reversed(errors.splitlines()) if line.strip()), "")
     return f"The Deadline Cloud library failed. {last_line.strip()}".strip()
 
@@ -893,6 +973,12 @@ async def call_deadline_cloud(request: web.Request) -> web.Response:
     body = await _read_body(request)
     if isinstance(body, web.Response):
         return body
+    if command == "set-defaults":
+        try:
+            # Only the checked IDs reach the CLI config, which the IDs also name sections of.
+            body = _default_ids(body)
+        except SubmitError as e:
+            return _error(400, str(e))
     try:
         result = await _run_bridge(
             command, body, LOGIN_TIMEOUT if command == "login" else BRIDGE_TIMEOUT
@@ -900,6 +986,32 @@ async def call_deadline_cloud(request: web.Request) -> web.Response:
     except SubmitError as e:
         return _error(502, str(e))
     return web.json_response(result)
+
+
+# The defaults the panel saves to the Deadline Cloud CLI config, by request key: each one's
+# resource type and ID. The config names sections after the farm ID, so an ID with "]" or a line
+# break would add sections or keys of its own.
+_DEFAULT_IDS = {
+    "farmId": ("farm", re.compile(r"farm-[0-9a-f]{32}")),
+    "queueId": ("queue", re.compile(r"queue-[0-9a-f]{32}")),
+    "storageProfileId": ("storage profile", re.compile(r"sp-[0-9a-f]{32}")),
+}
+
+
+def _default_ids(body: dict[str, Any]) -> dict[str, str]:
+    """
+    The farm, queue and storage profile IDs to save as the defaults, each checked before any is
+    saved. An empty string clears that default. Raises SubmitError.
+    """
+    ids: dict[str, str] = {}
+    for key, (kind, pattern) in _DEFAULT_IDS.items():
+        if key not in body:
+            continue
+        value = body[key]
+        if not isinstance(value, str) or (value and not pattern.fullmatch(value)):
+            raise SubmitError(f"{key} must be a Deadline Cloud {kind} ID, or empty to clear it.")
+        ids[key] = value
+    return ids
 
 
 def _model_ids(value: Any) -> set[str]:
@@ -956,6 +1068,17 @@ class _Bundle:
     warnings: list[str]
 
 
+def _hidden_paths(definitions: list[Any]) -> set[str]:
+    """The job template's PATH parameters that its user interface hides."""
+    return {
+        str(definition.get("name"))
+        for definition in definitions
+        if isinstance(definition, dict)
+        and definition.get("type") == "PATH"
+        and (definition.get("userInterface") or {}).get("control") == "HIDDEN"
+    }
+
+
 def _attaches_nodes(definitions: list[Any], parameters: dict[str, Any]) -> bool:
     """
     Whether the job loads the attached custom node packs: the panel's Attach Custom Nodes, or the
@@ -1005,8 +1128,6 @@ async def _build_bundle(
         parameters.pop(source.parameter, None)
     if items:
         prepared.warnings = [*items.warnings, *prepared.warnings]
-    for source in sources or []:
-        check_item_range(source, parameters.get(source.parameter, source.range))
     defined = {
         parameter.get("name")
         for parameter in read_job_template(template, sources).get("parameterDefinitions", [])
@@ -1014,11 +1135,21 @@ async def _build_bundle(
     # A list's field from an older plan, such as before the list was renamed, before anything is
     # staged. Queue parameters aren't in the template, but don't end in "Items".
     stale = sorted(name for name in parameters if name.endswith("Items") and name not in defined)
-    if split and stale:
+    # The panel sends every list it showed. One it didn't, such as a folder that has more than
+    # one image since it was read, would multiply the job past the tasks the panel counted.
+    missing = [source.parameter for source in sources or [] if source.parameter not in parameters]
+    changed = stale if split and stale else missing
+    if changed:
         raise SubmitError(
-            f"The workflow's lists changed since it was read ({', '.join(stale)}). Read the "
+            f"The workflow's lists changed since it was read ({', '.join(changed)}). Read the "
             "workflow again, then choose their items."
         )
+    counts = []
+    for source in sources or []:
+        # The checked range, without spaces, is what's submitted.
+        parameters[source.parameter], count = check_item_range(source, parameters[source.parameter])
+        counts.append(count)
+    check_task_count(counts)
     bundle_dir, workflow_path = create_job_bundle(
         template,
         prepared.workflow,
@@ -1041,6 +1172,16 @@ async def _build_bundle(
     attach_nodes = _attaches_nodes(definitions, parameters)
     # Copying models and custom nodes can take a while when the bundle is on another volume.
     staged = await asyncio.to_thread(_stage_prepared, prepared, workflow, bundle_dir, attach_nodes)
+    if assets is None:
+        # A request without the panel's list attaches what the workflow's file inputs name, and
+        # warns about what they name that isn't attached.
+        try:
+            assets = await asyncio.to_thread(_local_assets, workflow)
+        except Exception:
+            # _save_asset_references tries again, and saves the bundle without them if it can't.
+            logger.exception("Couldn't find the workflow's input files")
+        else:
+            prepared.warnings.extend(assets.warnings)
     await asyncio.to_thread(
         _save_asset_references, workflow, bundle_dir, assets, staged.filenames, staged.directories
     )
@@ -1048,7 +1189,12 @@ async def _build_bundle(
     # The artist's values win over the ones the submitter fills in, except the workflow file. The
     # library rejects parameters that neither the job template nor the queue defines.
     filled = {key: value for key, value in prepared.values.items() if key in defined}
-    values = {**filled, **parameters, "WorkflowFile": str(workflow_path)}
+    # The submitter sets the job template's hidden paths, such as Model Directory and Custom Nodes
+    # Directory, which the panel doesn't show. A request's own value could point the job's
+    # custom nodes at any folder on the workers, or mark every path as known to the library.
+    hidden = _hidden_paths(definitions)
+    shown = {key: value for key, value in parameters.items() if key not in hidden}
+    values = {**filled, **shown, "WorkflowFile": str(workflow_path)}
     # Attached files are only mapped through these directories, so they win over the panel's values.
     if staged.model_dir is not None:
         values["ModelDirectory"] = str(staged.model_dir)
@@ -1185,31 +1331,55 @@ async def _watch_submission(submission_id: str) -> None:
     # stdout, so reading stderr only after stdout ends would wait forever.
     stderr_task = asyncio.create_task(process.stderr.read())
     try:
-        async for line in process.stdout:
-            event = _parse_event(line)
-            if event is None:
-                continue
-            events.append(event)
-            kind = event["event"]
-            data = {key: value for key, value in event.items() if key != "event"}
-            if kind in ("progress", "message"):
-                _send(PROGRESS_EVENT, {**base, **data, "kind": kind}, submission.client_id)
-            elif kind == "confirm":
-                submission.confirms += 1
-                _send(CONFIRM_EVENT, {**base, **data}, submission.client_id)
-                submission.timers.append(
-                    asyncio.create_task(
-                        _decline_unanswered(submission_id, submission, submission.confirms)
+        try:
+            async for line in process.stdout:
+                event = _parse_event(line)
+                if event is None:
+                    continue
+                events.append(event)
+                kind = event["event"]
+                data = {key: value for key, value in event.items() if key != "event"}
+                if kind in ("progress", "message"):
+                    _send(PROGRESS_EVENT, {**base, **data, "kind": kind}, submission.client_id)
+                elif kind == "confirm":
+                    # The answer has to name this prompt, so an earlier prompt's can't answer it.
+                    prompt_id = secrets.token_hex(16)
+                    submission.prompt_id = prompt_id
+                    confirm = {**base, **data, "promptId": prompt_id}
+                    _send(CONFIRM_EVENT, confirm, submission.client_id)
+                    submission.timers.append(
+                        asyncio.create_task(
+                            _decline_unanswered(submission_id, submission, prompt_id)
+                        )
                     )
-                )
-            elif kind == "result":
-                result = event.get("data")
-        stderr = await stderr_task
-        await process.wait()
+                elif kind == "creating":
+                    submission.creating = True
+                elif kind == "created":
+                    ids = {key: event.get(key) for key in ("jobId", "farmId", "queueId")}
+                    checked = {
+                        key: value
+                        for key, value in ids.items()
+                        if isinstance(value, str) and _RESOURCE_ID.fullmatch(value)
+                    }
+                    if len(checked) == len(ids):
+                        submission.created = checked
+                elif kind == "result":
+                    result = event.get("data")
+            stderr = await stderr_task
+            await process.wait()
+        except Exception as e:
+            # Any failure, such as a line over the limit, still stops the bridge and ends the
+            # panel's submission.
+            logger.exception("Couldn't read the submission of %s", _log_value(submission.name))
+            await _stop(process)
+            message = f"Couldn't read the Deadline Cloud library's output: {e}"
+            events.insert(0, {"event": "error", "message": message})
+            stderr = b""
     finally:
         stderr_task.cancel()
         for timer in submission.timers:
             timer.cancel()
+        submission.prompt_id = None
         _submissions.pop(submission_id, None)
 
     # A job the bridge created is reported even when Cancel came too late to stop it.
@@ -1224,8 +1394,35 @@ async def _watch_submission(submission_id: str) -> None:
             submitted["outputDir"] = submission.output_dir
         _send(SUBMITTED_EVENT, submitted, submission.client_id)
         await asyncio.to_thread(_remove_bundle, submission.bundle_dir)
+    elif submission.created:
+        # CreateJob made the job, so it runs, but something after it failed, such as waiting for
+        # the job or a post-submission hook.
+        error = _bridge_failure(events, stderr, process.returncode)
+        logger.warning(
+            "Submitted %s to Deadline Cloud as %s, but the submission didn't finish: %s",
+            _log_value(submission.name),
+            _log_value(submission.created["jobId"]),
+            _log_block(_redact_aws(str(error))),
+        )
+        submitted = {
+            **base,
+            **submission.created,
+            "status": "SUBMITTED",
+            "warning": f"The job was created, but the submission didn't finish: {error}",
+        }
+        if submission.output_dir:
+            submitted["outputDir"] = submission.output_dir
+        _send(SUBMITTED_EVENT, submitted, submission.client_id)
+        await asyncio.to_thread(_remove_bundle, submission.bundle_dir)
     elif submission.canceled:
-        _send(SUBMITTED_EVENT, {**base, "status": "CANCELED"}, submission.client_id)
+        canceled: dict[str, Any] = {**base, "status": "CANCELED"}
+        if submission.creating:
+            # Cancel came as CreateJob was sent, so the job may exist.
+            canceled["warning"] = (
+                "The job may have been created before the submission stopped. Check Deadline "
+                "Cloud monitor."
+            )
+        _send(SUBMITTED_EVENT, canceled, submission.client_id)
         await asyncio.to_thread(_remove_bundle, submission.bundle_dir)
     else:
         # A failed submission's bundle is kept for a day, to look into or submit again.
@@ -1233,7 +1430,7 @@ async def _watch_submission(submission_id: str) -> None:
         logger.error(
             "Couldn't submit %s to Deadline Cloud: %s",
             _log_value(submission.name),
-            _log_block(str(error)),
+            _log_block(_redact_aws(str(error))),
         )
         _send(SUBMITTED_EVENT, {**base, "status": "FAILED", "error": error}, submission.client_id)
 
@@ -1242,17 +1439,6 @@ def _output_dir(values: dict[str, Any]) -> str | None:
     """The OutputDir a job is submitted with. The CLI downloads the job's outputs there."""
     value = values.get("OutputDir")
     return str(value) if value else None
-
-
-def _download_directory(files: Any) -> str | None:
-    """The folder that holds every file the CLI downloaded, from its summary's list of files."""
-    if not isinstance(files, list) or not files or not all(isinstance(f, str) for f in files):
-        return None
-    try:
-        return os.path.commonpath([os.path.dirname(f) for f in files])
-    except ValueError:
-        # Files on different Windows drives have no folder in common.
-        return None
 
 
 async def _write_line(process: asyncio.subprocess.Process, data: dict[str, Any]) -> bool:
@@ -1266,14 +1452,13 @@ async def _write_line(process: asyncio.subprocess.Process, data: dict[str, Any])
     return True
 
 
-async def _decline_unanswered(submission_id: str, submission: _Submission, number: int) -> None:
-    """Declines the bridge's confirmation `number` if it's still unanswered after the timeout."""
+async def _decline_unanswered(submission_id: str, submission: _Submission, prompt_id: str) -> None:
+    """Declines the bridge's confirmation prompt_id if it's still unanswered after the timeout."""
     await asyncio.sleep(CONFIRM_TIMEOUT)
     if (
         _submissions.get(submission_id) is not submission
         or submission.canceled
-        or submission.confirms != number
-        or submission.answered >= number
+        or submission.prompt_id != prompt_id
     ):
         return
     logger.warning(
@@ -1281,7 +1466,8 @@ async def _decline_unanswered(submission_id: str, submission: _Submission, numbe
         _log_value(submission.name),
         CONFIRM_TIMEOUT,
     )
-    submission.answered = number
+    # A late answer to it gets a 409, like any other answer to a prompt that isn't pending.
+    submission.prompt_id = None
     await _write_line(submission.process, {"accept": False})
 
 
@@ -1294,7 +1480,7 @@ def _running_submission(body: dict[str, Any]) -> _Submission | web.Response:
 
 @PromptServer.instance.routes.post("/deadline/jobs/confirm")
 async def confirm_submission(request: web.Request) -> web.Response:
-    """Answers a submission's confirmation."""
+    """Answers the submission's pending confirmation, which the request names by its promptId."""
     body = await _read_body(request)
     if isinstance(body, web.Response):
         return body
@@ -1303,11 +1489,20 @@ async def confirm_submission(request: web.Request) -> web.Response:
         return submission
     if _client_id(body) != submission.client_id:
         return _error(403, "Only the browser tab that started this submission can confirm it.")
-    if submission.canceled or submission.confirms <= submission.answered:
-        return _error(409, "That submission has no pending confirmation.")
+    # Only true is a yes. Checked before the prompt is claimed, so a bad answer leaves it pending.
+    accept = body.get("accept")
+    if not isinstance(accept, bool):
+        return _error(400, "accept must be true or false.")
+    prompt_id = body.get("promptId")
+    if submission.canceled or prompt_id is None or prompt_id != submission.prompt_id:
+        return _error(
+            409,
+            "That submission has no pending confirmation with that promptId. It was answered, or "
+            "declined because nobody answered it in time.",
+        )
     # Claim this prompt before yielding to the bridge, so another answer cannot queue behind it.
-    submission.answered = submission.confirms
-    if not await _write_line(submission.process, {"accept": body.get("accept") is True}):
+    submission.prompt_id = None
+    if not await _write_line(submission.process, {"accept": accept}):
         return _error(404, "That submission isn't running.")
     return web.json_response({})
 
@@ -1323,6 +1518,12 @@ async def cancel_submission(request: web.Request) -> web.Response:
         return submission
     if _client_id(body) != submission.client_id:
         return _error(403, "Only the browser tab that started this submission can cancel it.")
+    if submission.creating:
+        return _error(
+            409,
+            "The job is already being created, so it can't be canceled here. Cancel it in "
+            "Deadline Cloud monitor once it appears.",
+        )
     submission.canceled = True
     try:
         submission.process.kill()
@@ -1370,15 +1571,6 @@ async def choose_paths(request: web.Request) -> web.Response:
     return web.json_response({"paths": [str(Path(path)) for path in paths if path]})
 
 
-def _cli_message(line: bytes) -> dict[str, Any] | None:
-    """A JSON line from the CLI's --output json."""
-    try:
-        message = json.loads(line)
-    except ValueError:
-        return None
-    return message if isinstance(message, dict) and "messageType" in message else None
-
-
 @PromptServer.instance.routes.post("/deadline/jobs/download")
 async def download_outputs(request: web.Request) -> web.Response:
     """Downloads a job's outputs in the background, to the paths the job was submitted with."""
@@ -1399,96 +1591,75 @@ async def download_outputs(request: web.Request) -> web.Response:
     cli = await _checked_cli(config)
     if isinstance(cli, web.Response):
         return cli
-    command = [
-        cli,
-        "job",
-        "download-output",
-        "--farm-id",
-        farm_id,
-        "--queue-id",
-        queue_id,
-        "--job-id",
-        job_id,
-        "--conflict-resolution",
-        "create_copy",
-        "--output",
-        "json",
-        "--yes",
-    ]
+    # The bridge downloads with the library, so it can check every file's destination against
+    # the job's Output Directory before writing any.
     try:
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            limit=DOWNLOAD_LINE_LIMIT,
-        )
-    except OSError as e:
-        return _error(500, f"Couldn't run the Deadline Cloud CLI: {e}")
+        process = await _bridge_process("download", cli)
+    except SubmitError as e:
+        return _error(500, str(e))
+    if not await _write_line(process, {"farmId": farm_id, "queueId": queue_id, "jobId": job_id}):
+        await _stop(process)
+        return _error(500, "The Deadline Cloud CLI's Python exited before it could download.")
     _start(_watch_download(process, job_id, client_id))
     return web.json_response({"jobId": job_id}, status=202)
 
 
 async def _watch_download(process: asyncio.subprocess.Process, job_id: str, client_id: str) -> None:
     assert process.stdout is not None and process.stderr is not None
-    summary = None
-    errors = []
+    events: list[dict[str, Any]] = []
+    result = None
     # Read stderr while reading stdout, as _watch_submission does.
     stderr_task = asyncio.create_task(process.stderr.read())
     try:
         async for line in process.stdout:
-            message = _cli_message(line)
-            if message is None:
+            event = _parse_event(line)
+            if event is None:
                 continue
-            kind = message["messageType"]
-            if kind == "progress":
+            events.append(event)
+            if event["event"] == "progress":
                 _send(
                     DOWNLOAD_EVENT,
-                    {"jobId": job_id, "status": "DOWNLOADING", "progress": message["value"]},
+                    {"jobId": job_id, "status": "DOWNLOADING", "progress": event.get("progress")},
                     client_id,
                 )
-            elif kind == "summary":
-                summary = message
-            elif kind == "error":
-                errors.append(str(message.get("value")))
+            elif event["event"] == "result":
+                result = event.get("data")
         stderr = await stderr_task
         await process.wait()
     except Exception as e:
         # Any failure, such as a line over the limit, still ends the panel's download.
         logger.exception("Couldn't read the download of %s", _log_value(job_id))
-        if process.returncode is None:
-            process.kill()
-        await process.wait()
+        await _stop(process)
         _send(
             DOWNLOAD_EVENT,
-            {"jobId": job_id, "status": "FAILED", "error": f"Couldn't read the CLI's output: {e}"},
+            {
+                "jobId": job_id,
+                "status": "FAILED",
+                "error": f"Couldn't read the Deadline Cloud library's output: {e}",
+            },
             client_id,
         )
         return
     finally:
         stderr_task.cancel()
-    if process.returncode == 0 and summary is not None:
+    if process.returncode == 0 and isinstance(result, dict):
         downloaded = {
             "jobId": job_id,
             "status": "DOWNLOADED",
-            "message": str(summary.get("value")),
-            "fileCount": summary.get("fileCount", 0),
+            "message": str(result.get("message", "")),
+            "fileCount": result.get("fileCount", 0),
         }
-        directory = _download_directory(summary.get("files"))
-        if directory:
-            downloaded["directory"] = directory
+        if isinstance(result.get("directory"), str):
+            downloaded["directory"] = result["directory"]
         _send(DOWNLOAD_EVENT, downloaded, client_id)
         return
-    text = stderr.decode(errors="replace")
+    error = _bridge_failure(events, stderr, process.returncode)
     logger.error(
-        "Couldn't download the outputs of %s:\n    %s", _log_value(job_id), _log_block(text)
+        "Couldn't download the outputs of %s:\n    %s",
+        _log_value(job_id),
+        _log_block(_redact_aws(error)),
     )
-    last_line = next((line for line in reversed(text.splitlines()) if line.strip()), "")
-    _send(
-        DOWNLOAD_EVENT,
-        {"jobId": job_id, "status": "FAILED", "error": (errors or [last_line.strip()])[-1]},
-        client_id,
-    )
+    _send(DOWNLOAD_EVENT, {"jobId": job_id, "status": "FAILED", "error": error}, client_id)
 
 
 # Deletes old bundles in the background, so ComfyUI's start doesn't wait on slow storage.

@@ -11,6 +11,7 @@ import http.server
 import io
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -227,6 +228,16 @@ def test_model_paths_map_every_attached_model_folder(tmp_path):
     }
 
 
+def test_model_paths_leave_out_folders_comfyui_reads_as_settings_or_code(tmp_path):
+    """An attached custom_nodes model folder would load as code, even with Attach Custom Nodes off."""
+    attached = tmp_path / "attached models"
+    for name in ("loras", "custom_nodes", "base_path", "is_default"):
+        (attached / name).mkdir(parents=True)
+    assert write_model_paths(tmp_path, attached) == {
+        "model_directory": {"base_path": str(attached), "loras": "loras/"},
+    }
+
+
 def test_model_paths_are_empty_without_models_or_conda_custom_nodes(tmp_path):
     """The file stays empty, and the Enter script then doesn't pass it to ComfyUI."""
     assert write_model_paths(tmp_path) is None
@@ -313,7 +324,7 @@ def test_an_empty_extra_model_paths_file_isnt_passed_to_comfyui(tmp_path):
     """ComfyUI can't read an empty extra_model_paths.yaml."""
     assert model_path_args(tmp_path) == []
     studio = "/mnt/studio/extra_model_paths.yaml"
-    assert model_path_args(tmp_path, studio) == ["--extra-model-paths-config", studio]
+    assert model_path_args(tmp_path, studio) == [f"--extra-model-paths-config={studio}"]
 
 
 def test_conda_custom_nodes_and_the_studio_config_are_both_passed(tmp_path):
@@ -321,9 +332,8 @@ def test_conda_custom_nodes_and_the_studio_config_are_both_passed(tmp_path):
     conda_nodes.mkdir()
     studio = "/mnt/studio/extra_model_paths.yaml"
     assert model_path_args(tmp_path, studio, conda_nodes) == [
-        "--extra-model-paths-config",
-        str(tmp_path / "extra_model_paths.yaml"),
-        studio,
+        f"--extra-model-paths-config={tmp_path / 'extra_model_paths.yaml'}",
+        f"--extra-model-paths-config={studio}",
     ]
 
 
@@ -332,9 +342,8 @@ def test_attached_models_and_the_studio_config_are_both_passed(tmp_path):
     (attached / "loras").mkdir(parents=True)
     studio = "/mnt/studio/extra_model_paths.yaml"
     assert model_path_args(tmp_path, studio, model_directory=attached) == [
-        "--extra-model-paths-config",
-        str(tmp_path / "extra_model_paths.yaml"),
-        studio,
+        f"--extra-model-paths-config={tmp_path / 'extra_model_paths.yaml'}",
+        f"--extra-model-paths-config={studio}",
     ]
 
 
@@ -349,9 +358,8 @@ def test_model_paths_preserve_quotes_and_line_breaks(tmp_path):
     }
     studio = str(tmp_path / 'artist\'s "config"; $(touch injected).yaml')
     assert model_path_args(tmp_path, studio, conda_nodes, attached) == [
-        "--extra-model-paths-config",
-        str(tmp_path / "extra_model_paths.yaml"),
-        studio,
+        f"--extra-model-paths-config={tmp_path / 'extra_model_paths.yaml'}",
+        f"--extra-model-paths-config={studio}",
     ]
     assert not (tmp_path / "injected").exists()
 
@@ -430,7 +438,7 @@ def test_enter_passes_paths_and_extra_arguments_as_literal_argv(tmp_path):
     assert result.returncode == 0, result.stderr
     assert args[args.index("--input-directory") + 1] == inputs
     assert args[args.index("--output-directory") + 1] == output
-    assert args[args.index("--extra-model-paths-config") + 1] == config
+    assert f"--extra-model-paths-config={config}" in args
     start = args.index("--") + 1
     assert args[start : start + 8] == [
         "--lowvram",
@@ -491,6 +499,66 @@ def test_enter_keeps_the_required_server_arguments_authoritative(tmp_path, extra
     assert parsed.output_directory == output
     assert parsed.base_directory == str(tmp_path / "comfyui")
     assert parsed.input_directory == str(tmp_path / "comfyui" / "input")
+
+
+@pytest.mark.parametrize(
+    "config", ["--enable-cors-header=*", "--temp-directory=/shared/x", "--enable-manager"]
+)
+def test_the_studio_model_paths_config_cant_be_read_as_an_option(tmp_path, config):
+    """ComfyUI's --extra-model-paths-config takes several values, so each file is attached."""
+    attached = tmp_path / "attached models"
+    (attached / "loras").mkdir(parents=True)
+    result, args = run_enter(tmp_path, ModelDirectory=str(attached), ExtraModelPathsConfig=config)
+    assert result.returncode == 0, result.stderr
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--extra-model-paths-config", nargs="+", action="append")
+    parser.add_argument("--enable-cors-header", nargs="?", const="*")
+    parser.add_argument("--temp-directory")
+    parser.add_argument("--enable-manager", action="store_true")
+    parsed, _ = parser.parse_known_args(args[args.index("--") + 1 :])
+    assert parsed.enable_cors_header is None
+    assert parsed.temp_directory is None
+    assert parsed.enable_manager is False
+    assert parsed.extra_model_paths_config == [
+        [str(tmp_path / "extra_model_paths.yaml")],
+        [config],
+    ]
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        "--enable-cors-header",
+        "--enable-cors-header=*",
+        "--lowvram --enable-c=*",
+        "--tls-keyfile key.pem --tls-certfile cert.pem",
+        "--front-end-root /",
+        "--user-directory /shared",
+        "--temp-dir=/shared",
+        "--database-url sqlite:////shared/comfy.db",
+        "--enable-manager",
+        # A model paths file with a custom_nodes key loads code from any worker path.
+        "--extra-model-paths-config /shared/nodes.yaml",
+        "--extra-model-paths=/shared/nodes.yaml",
+        # Downloads a front end from GitHub and serves it.
+        "--front-end-version org/frontend@latest",
+    ],
+)
+def test_enter_refuses_arguments_that_widen_access_before_launching(tmp_path, extra_args):
+    result, args = run_enter(tmp_path, ComfyUIArgs=extra_args)
+    assert result.returncode != 0
+    assert "openjd_fail: Invalid Extra ComfyUI Arguments" in result.stdout
+    assert "is not supported" in result.stdout
+    assert args == []
+
+
+@pytest.mark.parametrize(
+    "extra_args", ["--lowvram", "--enable-compress-response-body", "--fp16-vae"]
+)
+def test_enter_still_passes_other_arguments(tmp_path, extra_args):
+    result, args = run_enter(tmp_path, ComfyUIArgs=extra_args)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert args[args.index("--") + 1] == extra_args
 
 
 def test_enter_rejects_an_argument_terminator_before_launching(tmp_path):
@@ -766,11 +834,11 @@ def _environment_file(name: str) -> str:
 
 
 def _run_node_requirements(
-    tmp_path: Path, requirements: str
+    tmp_path: Path, *packs: str
 ) -> tuple[subprocess.CompletedProcess, list[str]]:
     """
-    Runs the Enter script's custom node requirements block for one pack, and returns its result
-    and the pip commands it ran.
+    Runs the Enter script's custom node requirements block for packs with these
+    requirements.txt files, and returns its result and the pip commands it ran.
     """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -782,7 +850,7 @@ def _run_node_requirements(
     real_python = shlex.quote(sys.executable)
     venv_python = (
         "#!/bin/sh\n"
-        f'case "$1" in -c|*.py) exec {real_python} "$@";; esac\n'
+        f'case "$1" in -c|-I|*.py) exec {real_python} "$@";; esac\n'
         'if [ "$3" = list ]; then printf "torch==2.5.1\\nnumpy==2.1.0\\n"; exit 0; fi\n'
         f'echo "$* constraint=$PIP_CONSTRAINT" >> {shlex.quote(str(log))}\n'
     )
@@ -796,18 +864,27 @@ def _run_node_requirements(
         f'else exec {real_python} "$@"; fi\n'
     )
     python.chmod(0o755)
-    node = tmp_path / "pack"
-    node.mkdir()
-    (node / "requirements.txt").write_text(requirements)
+    nodes = []
+    for index, requirements in enumerate(packs):
+        node = tmp_path / ("pack" if index == 0 else f"pack{index + 1}")
+        node.mkdir()
+        (node / "requirements.txt").write_text(requirements)
+        nodes.append(shlex.quote(str(node)))
     check = tmp_path / "check-requirements.py"
     check.write_text(_environment_file("CheckRequirements"))
     data = _environment_file("Enter")
     block = data[data.index("# The attached packs' pip") : data.index("PORT=$(python")]
     diagnostics = data[data.index("diagnostics() {") : data.index("MODEL_PATHS=")]
-    nodes = f"ATTACHED_NODES=({shlex.quote(str(node))})"
+    attached = f"ATTACHED_NODES=({' '.join(nodes)})"
     result = subprocess.run(
         # The Enter script gets the requirements check as its first argument.
-        ["bash", "-c", f"set -euo pipefail\n{diagnostics}\n{nodes}\n{block}", "enter", str(check)],
+        [
+            "bash",
+            "-c",
+            f"set -euo pipefail\n{diagnostics}\n{attached}\n{block}",
+            "enter",
+            str(check),
+        ],
         env={
             "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
             "COMFYUI_SESSION_DIR": str(tmp_path),
@@ -821,13 +898,16 @@ def _run_node_requirements(
 
 def test_custom_node_requirements_are_constrained_to_the_conda_packages(tmp_path):
     """Packages conda installed, such as torch, are pinned too, so a pack can't replace them."""
-    result, pip = _run_node_requirements(tmp_path, "torch>=99\n")
+    result, pip = _run_node_requirements(tmp_path, "torch>=99  # newer\n")
     assert result.returncode == 0, result.stdout + result.stderr
     constraints = tmp_path / "constraints.txt"
-    assert constraints.read_text() == "torch==2.5.1\nnumpy==2.1.0\n"
-    requirements = tmp_path / "pack" / "requirements.txt"
+    # "===" so that a local build, such as 2.5.1+cu124, doesn't match too.
+    assert constraints.read_text() == "torch===2.5.1\nnumpy===2.1.0\n"
+    # pip installs the checked copy, not the pack's own file.
+    checked = tmp_path / "node-requirements" / "0.txt"
+    assert checked.read_text() == "torch>=99\n"
     assert pip == [
-        f"-m pip install -r {requirements} constraint={constraints}",
+        f"-m pip install -r {checked} constraint={constraints}",
         f"-m pip check constraint={constraints}",
     ]
 
@@ -850,27 +930,83 @@ def test_a_pack_cant_point_pip_at_another_package_index(tmp_path):
     )
 
 
-@pytest.mark.parametrize(
-    "line",
-    [
-        "numpy>=1.26  # pinned for the sampler",
-        "# a comment",
-        'opencv-python-headless; sys_platform == "linux"',
-        "segment-anything @ git+https://github.com/facebookresearch/segment-anything.git",
-        "torchvision==0.20.1 --hash=sha256:0123abcd",
-        "https://files.example.com/pkg-1.0-py3-none-any.whl",
-    ],
-)
-def test_requirements_check_accepts_packages_and_https_urls(tmp_path, line):
-    (tmp_path / "requirements.txt").write_text(line + "\n")
-    (tmp_path / "check.py").write_text(_environment_file("CheckRequirements"))
-    result = subprocess.run(
-        [sys.executable, str(tmp_path / "check.py"), str(tmp_path / "requirements.txt")],
+def test_every_packs_requirements_are_checked_before_any_are_installed(tmp_path):
+    """Installing a pack's requirements can run build code, so a later refusal is too late."""
+    result, pip = _run_node_requirements(tmp_path, "numpy\n", "pkg @ file:/opt/pkg\n")
+    assert result.returncode == 1
+    assert pip == []
+    assert "The requirements of pack2" in result.stdout.splitlines()[-1]
+
+
+def test_the_requirements_check_fails_closed_without_packaging(tmp_path):
+    (tmp_path / "requirements.txt").write_text("numpy\n")
+    check = tmp_path / "check.py"
+    blocker = "import sys\nsys.modules['pip'] = None\nsys.modules['packaging'] = None\n"
+    check.write_text(blocker + _environment_file("CheckRequirements"))
+    result = _check(tmp_path, check)
+    assert result.returncode != 0
+    assert not (tmp_path / "copy.txt").exists()
+
+
+def _check(tmp_path: Path, check: Path | None = None) -> subprocess.CompletedProcess:
+    if check is None:
+        check = tmp_path / "check.py"
+        check.write_text(_environment_file("CheckRequirements"))
+    return subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(check),
+            str(tmp_path / "requirements.txt"),
+            str(tmp_path / "copy.txt"),
+        ],
         capture_output=True,
         text=True,
         check=False,
     )
+
+
+DIGEST = "0123456789abcdef" * 4
+
+
+@pytest.mark.parametrize(
+    ("text", "written"),
+    [
+        ("numpy>=1.26  # pinned for the sampler", "numpy>=1.26"),
+        ("# a comment", ""),
+        ('opencv-python-headless; sys_platform == "linux"', None),
+        ("transformers[torch]>=4.40,<5", "transformers[torch]<5,>=4.40"),
+        (
+            "segment-anything @ git+https://github.com/facebookresearch/segment-anything.git",
+            "segment-anything@ git+https://github.com/facebookresearch/segment-anything.git",
+        ),
+        (
+            "pkg @ git+https://github.com/org/repo.git@v1.2#subdirectory=python",
+            "pkg@ git+https://github.com/org/repo.git@v1.2#subdirectory=python",
+        ),
+        (f"torchvision==0.20.1 --hash=sha256:{DIGEST}", None),
+        (
+            f"torchvision==0.20.1 \\\n    --hash sha256:{DIGEST}",
+            f"torchvision==0.20.1 --hash=sha256:{DIGEST}",
+        ),
+        ("\ufeffnumpy", "numpy"),
+        ("# -*- coding: utf-8 -*-\nnumpy", "numpy"),
+        ("numpy\r\nscipy", "numpy\nscipy"),
+    ],
+)
+def test_requirements_check_accepts_packages_and_https_urls(tmp_path, text, written):
+    (tmp_path / "requirements.txt").write_text(text + "\n", encoding="utf-8", newline="")
+    result = _check(tmp_path)
     assert (result.returncode, result.stdout) == (0, "")
+    expected = text if written is None else written
+
+    def url_separator(requirements: str) -> str:
+        # packaging writes "name@ URL" in older releases and "name @ URL" in newer ones. pip
+        # reads both. An "@" inside a URL, such as a git ref, has no space after it.
+        return re.sub(r"\s*@\s+", " @ ", requirements)
+
+    copy = (tmp_path / "copy.txt").read_text()
+    assert url_separator(copy) == url_separator(expected + "\n" if expected else "")
 
 
 @pytest.mark.parametrize(
@@ -884,32 +1020,62 @@ def test_requirements_check_accepts_packages_and_https_urls(tmp_path, line):
         ("-r other.txt", "it's a pip option"),
         ("-c constraints.txt", "it's a pip option"),
         ("-e .", "it's a pip option"),
-        ("numpy --index-url https://packages.example.com/simple", "it has a pip option"),
-        ("numpy \\\n  --extra-index-url https://packages.example.com/", "it has a pip option"),
+        ("numpy --index-url https://packages.example.com/simple", "only pip option"),
+        ("numpy \\\n  --extra-index-url https://packages.example.com/", "only pip option"),
+        ("numpy --config-settings=x=y", "only pip option"),
+        ("numpy --hash=sha256:abc", "only pip option"),
         ("pkg @ https://${AWS_SECRET_ACCESS_KEY}@packages.example.com/x", "environment variable"),
-        ("pkg @ http://packages.example.com/pkg.whl", "only https URLs are installed"),
-        ("git+ssh://git@example.com/pack.git", "only https URLs are installed"),
-        ("pkg @ file:///tmp/pkg", "only https URLs are installed"),
-        ("./vendor/pkg", "it's a local path"),
-        ("~/pkg", "it's a local path"),
-        ("C:\\pkgs\\pkg.whl", "it's a local path"),
+        ("pkg @ http://packages.example.com/pkg.whl", "only https"),
+        ("pkg @ git+ssh://git@example.com/pack.git", "only https"),
+        ("pkg @ file:///tmp/pkg", "only https"),
+        ("pkg @ file:/opt/pkg", "only https"),
+        ("pkg@file:/opt/pkg", "only https"),
+        ("pkg @ git+file:/srv/repo.git", "only https"),
+        ("pkg @ https://user:secret@packages.example.com/pkg.whl", "needs a host"),
+        ("pkg @ https:pkg.whl", "needs a host"),
+        ("https://files.example.com/pkg-1.0-py3-none-any.whl", "isn't a package name"),
+        ("git+ssh://git@example.com/pack.git", "isn't a package name"),
+        ("./vendor/pkg", "isn't a package name"),
+        ("~/pkg", "isn't a package name"),
+        ("vendor/pkg", "isn't a package name"),
+        ("x/../pkg", "isn't a package name"),
+        ("pkg-1.0.tar.gz", "local file"),
+        ("pkg.whl[extra]", "local file"),
+        ("C:\\pkgs\\pkg.whl", "backslash"),
+        ("# note \\\n--extra-index-url https://packages.example.com/", "it's a pip option"),
+        ("numpy  # note \\\n--extra-index-url https://packages.example.com/", "comment ends"),
+        ("num\u0440y", "printable ASCII"),
     ],
 )
 def test_requirements_check_refuses_what_could_change_where_pip_installs_from(
     tmp_path, line, reason
 ):
-    (tmp_path / "requirements.txt").write_text("numpy\n" + line + "\n")
-    (tmp_path / "check.py").write_text(_environment_file("CheckRequirements"))
-    result = subprocess.run(
-        [sys.executable, str(tmp_path / "check.py"), str(tmp_path / "requirements.txt")],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    (tmp_path / "requirements.txt").write_text("numpy\n" + line + "\n", encoding="utf-8")
+    result = _check(tmp_path)
     assert result.returncode == 1
-    [message] = result.stdout.splitlines()
-    assert message.startswith("Line 2, ")
-    assert reason in message
+    messages = result.stdout.splitlines()
+    assert messages
+    assert all(message.startswith(("Line 2, ", "Line 3, ")) for message in messages)
+    assert any(reason in message for message in messages)
+    assert not (tmp_path / "copy.txt").exists()
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        "numpy\n".encode("utf-16"),
+        "numpy\n".encode("utf-32"),
+        b"# -*- coding: utf-7 -*-\nnumpy\n",
+        b"numpy\n# coding: latin-1\n",
+        b"\xff\xfenumpy\n",
+    ],
+)
+def test_requirements_check_refuses_a_file_pip_would_decode_differently(tmp_path, data):
+    (tmp_path / "requirements.txt").write_bytes(data)
+    result = _check(tmp_path)
+    assert result.returncode == 1
+    assert "UTF-8" in result.stdout
+    assert not (tmp_path / "copy.txt").exists()
 
 
 def _create_list():
@@ -1021,6 +1187,28 @@ def test_folders_load_the_tasks_image(tmp_path):
     _, _, ran = run_task(tmp_path, _images(), {"Cats": 1})
     assert ran["3"]["class_type"] == "LoadImage"
     assert ran["3"]["inputs"] == {"image": "cats/a.png"}
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "/home/artist/ComfyUI/input/cats/a.png",
+        "\\\\server\\share\\a.png",
+        "C:/input/cats/a.png",
+        "cats/../../secret.png",
+        "cats//a.png",
+        "",
+        7,
+    ],
+)
+def test_folders_refuse_files_outside_the_input_directory(tmp_path, image):
+    """Load Image would read an absolute path, or one with "..", from elsewhere on the worker."""
+    workflow = _images()
+    workflow["3"]["_meta"][submit.FILES_META] = [image, "cats/b.png"]
+    code, output, ran = run_task(tmp_path, workflow, {"Cats": 1})
+    assert code == 1
+    assert "openjd_fail: The folder of node 3 names a file outside the input directory." in output
+    assert ran == {}
 
 
 def test_folder_loaders_that_arent_split_load_the_whole_folder(tmp_path):

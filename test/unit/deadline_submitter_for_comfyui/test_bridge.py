@@ -9,6 +9,8 @@ import io
 import json
 import sys
 import types
+from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -23,9 +25,32 @@ class Source(enum.Enum):
     DEADLINE_CLOUD_MONITOR_LOGIN = 3
 
 
+class FakeEvents:
+    """A botocore client's event emitter, which keeps one handler per unique_id."""
+
+    def __init__(self):
+        self.handlers: dict[str, list] = {}
+
+    def register(self, event_name, handler, unique_id=None):
+        handlers = self.handlers.setdefault(event_name, [])
+        if unique_id and any(existing_id == unique_id for existing_id, _ in handlers):
+            return
+        handlers.append((unique_id, handler))
+
+    def emit(self, event_name, **kwargs):
+        for _, handler in self.handlers.get(event_name, []):
+            handler(**kwargs)
+
+
 class FakeApi:
     def __init__(self):
         self.calls = []
+        self.client = types.SimpleNamespace(meta=types.SimpleNamespace(events=FakeEvents()))
+        # What the library does after CreateJob returns, such as waiting for the job.
+        self.after_create_job = None
+
+    def get_boto3_client(self, service_name, config=None):
+        return self.client
 
     def get_credentials_source(self, config):
         return Source.DEADLINE_CLOUD_MONITOR_LOGIN
@@ -72,6 +97,12 @@ class FakeApi:
         kwargs["print_function_callback"]("Submitting")
         if not kwargs["interactive_confirmation_callback"]("Upload 2 files?", True):
             raise RuntimeError("Canceled")
+        # As the library calls CreateJob, through a client from api.get_boto3_client.
+        events = self.get_boto3_client("deadline", config=kwargs["config"]).meta.events
+        events.emit("before-call.deadline.CreateJob", params={})
+        events.emit("after-call.deadline.CreateJob", parsed={"jobId": "job-1"}, http_response=None)
+        if self.after_create_job:
+            self.after_create_job()
         return "job-1"
 
 
@@ -164,14 +195,43 @@ def test_queue(deadline_api, monkeypatch, capsys):
     }
 
 
+FARM_ID, QUEUE_ID, PROFILE_ID = "farm-" + "a" * 32, "queue-" + "b" * 32, "sp-" + "c" * 32
+
+
 def test_set_defaults_saves_the_farm_queue_and_storage_profile(deadline_api, monkeypatch, capsys):
-    request = {"farmId": "farm-2", "queueId": "queue-2", "storageProfileId": "sp-1"}
+    request = {"farmId": FARM_ID, "queueId": QUEUE_ID, "storageProfileId": PROFILE_ID}
     code, _ = run(monkeypatch, capsys, "set-defaults", request)
     assert code == 0
     written = deadline_api.config_file.written
-    assert written["defaults.farm_id"] == "farm-2"
-    assert written["defaults.queue_id"] == "queue-2"
-    assert written["settings.storage_profile_id"] == "sp-1"
+    assert written["defaults.farm_id"] == FARM_ID
+    assert written["defaults.queue_id"] == QUEUE_ID
+    assert written["settings.storage_profile_id"] == PROFILE_ID
+
+
+def test_set_defaults_clears_a_default_set_to_an_empty_string(deadline_api, monkeypatch, capsys):
+    request = {"farmId": FARM_ID, "queueId": QUEUE_ID, "storageProfileId": ""}
+    code, _ = run(monkeypatch, capsys, "set-defaults", request)
+    assert code == 0
+    assert deadline_api.config_file.written["settings.storage_profile_id"] == ""
+
+
+@pytest.mark.parametrize(
+    "request_ids",
+    [
+        {"farmId": "farm-x]\n[other", "queueId": QUEUE_ID},
+        {"farmId": FARM_ID, "queueId": "queue-2"},
+        {"farmId": FARM_ID, "queueId": QUEUE_ID, "storageProfileId": "sp-1"},
+        {"farmId": QUEUE_ID},
+        {"farmId": 7},
+    ],
+)
+def test_set_defaults_saves_nothing_when_an_id_is_malformed(
+    deadline_api, monkeypatch, capsys, request_ids
+):
+    code, events = run(monkeypatch, capsys, "set-defaults", request_ids)
+    assert code == 1
+    assert events[-1]["event"] == "error"
+    assert deadline_api.config_file.written is None
 
 
 SUBMISSION = {
@@ -199,8 +259,16 @@ def test_submit_streams_progress_and_asks_to_confirm(deadline_api, monkeypatch, 
         "progress",
         "message",
         "confirm",
+        "creating",
+        "created",
         "result",
     ]
+    assert events[5] == {
+        "event": "created",
+        "jobId": "job-1",
+        "farmId": "farm-2",
+        "queueId": "queue-2",
+    }
     assert events[0] == {
         "event": "progress",
         "stage": "hashing",
@@ -231,7 +299,18 @@ def test_submit_streams_progress_and_asks_to_confirm(deadline_api, monkeypatch, 
     assert deadline_api.config_file.written is None
 
 
-@pytest.mark.parametrize("answers", [[{"accept": False}], [], ["not an object"]])
+@pytest.mark.parametrize(
+    "answers",
+    [
+        [{"accept": False}],
+        [],
+        ["not an object"],
+        # Only true is a yes, not other values that are truthy.
+        [{"accept": "yes"}],
+        [{"accept": 1}],
+        [{"accept": "false"}],
+    ],
+)
 def test_submit_stops_unless_confirmed(deadline_api, monkeypatch, capsys, answers):
     code, events = run(monkeypatch, capsys, "submit", SUBMISSION, answers=answers)
     assert code == 1
@@ -341,3 +420,192 @@ def test_jobs_reports_each_job(deadline_api, monkeypatch, capsys):
         {"jobId": "job-gone", "error": "ResourceNotFoundException", "notFound": True},
         {"jobId": "job-throttled", "error": "ThrottlingException"},
     ]
+
+
+class FakeDeadlineClient:
+    def __init__(self, output_dir):
+        self.output_dir = output_dir
+
+    def get_job(self, farmId, queueId, jobId):
+        parameters = {} if self.output_dir is None else {"OutputDir": {"path": self.output_dir}}
+        return {"name": "fox", "parameters": parameters}
+
+    def get_queue(self, farmId, queueId):
+        return {
+            "displayName": "GPU",
+            "jobAttachmentSettings": {"s3BucketName": "bucket", "rootPrefix": "DeadlineCloud"},
+        }
+
+
+class FakeOutputDownloader:
+    """Stands in for the library's OutputDownloader. Tests set the plan its manifests give."""
+
+    plan: ClassVar[dict[str, list[str]]] = {}
+    written: ClassVar[list[str] | None] = None
+    instances: ClassVar[list["FakeOutputDownloader"]] = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.downloaded_with = None
+        FakeOutputDownloader.instances.append(self)
+
+    def get_paths_by_root(self):
+        return self.plan
+
+    def download(self, file_conflict_resolution, on_downloading_files):
+        self.downloaded_with = file_conflict_resolution
+        on_downloading_files(types.SimpleNamespace(progress=100, progressMessage="Downloaded"))
+        written = self.written
+        if written is None:
+            written = [str(Path(root, path)) for root, paths in self.plan.items() for path in paths]
+        return types.SimpleNamespace(downloaded_files=written, processed_files=len(written))
+
+
+class FileConflictResolution(enum.Enum):
+    CREATE_COPY = 3
+
+
+@pytest.fixture
+def outputs(deadline_api, monkeypatch, tmp_path):
+    """ComfyUI's base folder, and a job whose Output Directory is its output folder."""
+    base = tmp_path / "ComfyUI"
+    (base / "output").mkdir(parents=True)
+    state = types.SimpleNamespace(base=base, output=base / "output", sessions=[])
+    state.output_dir = str(state.output)
+
+    def queue_session(**kwargs):
+        state.sessions.append(kwargs)
+        return "queue-role-session"
+
+    monkeypatch.setattr(
+        deadline_api.api,
+        "get_boto3_client",
+        lambda name, config: FakeDeadlineClient(state.output_dir),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        deadline_api.api, "get_queue_user_boto3_session", queue_session, raising=False
+    )
+    monkeypatch.setattr(FakeOutputDownloader, "plan", {})
+    monkeypatch.setattr(FakeOutputDownloader, "written", None)
+    monkeypatch.setattr(FakeOutputDownloader, "instances", [])
+    download = types.SimpleNamespace(OutputDownloader=FakeOutputDownloader)
+    models = types.SimpleNamespace(
+        FileConflictResolution=FileConflictResolution,
+        JobAttachmentS3Settings=lambda **settings: ("s3", settings),
+    )
+    monkeypatch.setitem(sys.modules, "deadline.job_attachments", types.SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "deadline.job_attachments.download", download)
+    monkeypatch.setitem(sys.modules, "deadline.job_attachments.models", models)
+    return state
+
+
+DOWNLOAD = {"farmId": "farm-1", "queueId": "queue-1", "jobId": "job-1"}
+
+
+def test_download_writes_outputs_inside_the_output_directory(outputs, monkeypatch, capsys):
+    # As the worker uploads them: relative to the job's root, ComfyUI's base folder.
+    FakeOutputDownloader.plan = {str(outputs.base): ["output/fox_00001_.png", "output/a/b.png"]}
+    code, events = run(monkeypatch, capsys, "download", DOWNLOAD)
+    assert code == 0
+    [downloader] = FakeOutputDownloader.instances
+    assert downloader.downloaded_with is FileConflictResolution.CREATE_COPY
+    assert downloader.kwargs["session"] == "queue-role-session"
+    assert downloader.kwargs["job_id"] == "job-1"
+    assert outputs.sessions[0]["queue_display_name"] == "GPU"
+    assert events[0]["event"] == "progress"
+    assert events[-1] == {
+        "event": "result",
+        "data": {
+            "fileCount": 2,
+            "directory": str(outputs.output),
+            "message": "Downloaded 2 files",
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "plan",
+    [
+        # A manifest whose S3 metadata names another root folder.
+        lambda o: {str(o.base.parent / "Library" / "LaunchAgents"): ["evil.plist"]},
+        # The job's real root, with a file outside the output folder that ComfyUI would run.
+        lambda o: {str(o.base): ["output/ok.png", "custom_nodes/evil/__init__.py"]},
+        lambda o: {str(o.base): ["output/../custom_nodes/evil.py"]},
+        lambda o: {str(o.output): ["../user/default/comfy.settings.json"]},
+        # A sibling folder whose name starts with the output folder's.
+        lambda o: {str(o.base): ["output_evil/x.png"]},
+        # The output folder itself isn't a file to write.
+        lambda o: {str(o.output): [""]},
+    ],
+)
+def test_download_refuses_any_file_outside_the_output_directory(outputs, monkeypatch, capsys, plan):
+    FakeOutputDownloader.plan = plan(outputs)
+    code, events = run(monkeypatch, capsys, "download", DOWNLOAD)
+    assert code == 1
+    assert events[-1]["event"] == "error"
+    assert "Nothing was downloaded" in events[-1]["message"]
+    [downloader] = FakeOutputDownloader.instances
+    assert downloader.downloaded_with is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Creating links needs privileges on Windows.")
+def test_download_refuses_a_link_in_the_output_directory_that_leads_out(
+    outputs, monkeypatch, capsys
+):
+    (outputs.base / "custom_nodes").mkdir()
+    (outputs.output / "nodes").symlink_to(outputs.base / "custom_nodes", target_is_directory=True)
+    FakeOutputDownloader.plan = {str(outputs.output): ["nodes/evil/__init__.py"]}
+    code, _ = run(monkeypatch, capsys, "download", DOWNLOAD)
+    assert code == 1
+    assert FakeOutputDownloader.instances[0].downloaded_with is None
+
+
+@pytest.mark.parametrize("output_dir", [None, "", "relative/output"])
+def test_download_needs_the_jobs_absolute_output_directory(
+    outputs, monkeypatch, capsys, output_dir
+):
+    outputs.output_dir = output_dir
+    FakeOutputDownloader.plan = {str(outputs.base): ["output/fox.png"]}
+    code, events = run(monkeypatch, capsys, "download", DOWNLOAD)
+    assert code == 1
+    assert "no Output Directory" in events[-1]["message"]
+    assert FakeOutputDownloader.instances == []
+
+
+def test_download_reports_a_job_without_outputs(outputs, monkeypatch, capsys):
+    code, events = run(monkeypatch, capsys, "download", DOWNLOAD)
+    assert code == 0
+    assert events[-1]["data"]["fileCount"] == 0
+    assert FakeOutputDownloader.instances[0].downloaded_with is None
+
+
+def test_download_reports_files_the_library_wrote_elsewhere(outputs, monkeypatch, capsys):
+    FakeOutputDownloader.plan = {str(outputs.base): ["output/fox.png"]}
+    FakeOutputDownloader.written = [str(outputs.base / "custom_nodes" / "fox.png")]
+    code, events = run(monkeypatch, capsys, "download", DOWNLOAD)
+    assert code == 1
+    assert "outside" in events[-1]["message"]
+
+
+def test_submit_reports_a_created_job_before_a_later_failure(deadline_api, monkeypatch, capsys):
+    """Waiting for the job or a hook can fail after CreateJob, and the job still runs."""
+
+    def timed_out():
+        raise RuntimeError("Timed out waiting for the job to be created")
+
+    deadline_api.api.after_create_job = timed_out
+    code, events = run(monkeypatch, capsys, "submit", SUBMISSION, answers=[{"accept": True}])
+    assert code == 1
+    assert [event["event"] for event in events][-3:] == ["creating", "created", "error"]
+    assert events[-2]["jobId"] == "job-1"
+
+
+def test_submit_registers_its_job_creation_events_once(deadline_api, monkeypatch, capsys):
+    """A cached client gets the handlers once, however often the library asks for it."""
+    run(monkeypatch, capsys, "submit", SUBMISSION, answers=[{"accept": True}])
+    deadline_api.api.get_boto3_client("deadline")
+    run(monkeypatch, capsys, "submit", SUBMISSION, answers=[{"accept": True}])
+    handlers = deadline_api.api.client.meta.events.handlers
+    assert len(handlers["before-call.deadline.CreateJob"]) == 1
+    assert len(handlers["after-call.deadline.CreateJob"]) == 1

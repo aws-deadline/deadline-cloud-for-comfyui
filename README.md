@@ -13,22 +13,29 @@ GPU workers, with the models, input files and custom nodes it uses attached to t
 
 - A **Deadline** tab in ComfyUI's sidebar, with:
   - your login status, with **Log in** for Deadline Cloud monitor profiles
-  - the farm, queue and storage profile, saved as your Deadline Cloud defaults
+  - the farm, queue and storage profile, saved as your Deadline Cloud defaults. **Submit** waits
+    until the chosen queue's details, its parameters and storage profiles, have loaded
   - the workflow's [items to run as tasks](#splitting-a-workflow-into-tasks), with the number of
     tasks as you change them or the workflow
   - job settings: name, description, priority, initial state, max failed tasks, retries and
     workers, how workers read attachments, and whether every input path has to exist
   - [host requirements](#host-requirements), starting from the job template's
   - the job template's parameters, such as Workflow Timeout, and the queue's, such as Conda Channels
-  - the input files and folders, models and custom nodes to attach. You can remove files, folders,
-    models and custom node packs, or add more with a file dialog on the ComfyUI machine
+  - the input files and folders, models and custom nodes to attach. A folder loader's folder is
+    one row with its number of files. Open it to list the files, and remove single files from it.
+    Its **✕** removes every file in it, and **Add back** restores them all. You can remove files,
+    folders, models and custom node packs, or add more with a file dialog on the ComfyUI machine.
+    Each workflow tab keeps its own changes. Next to **Submit**, a summary counts what the job
+    attaches, with a folder loader's folder as one folder of its files, and names the files and
+    folders you added
   - upload progress, the status of your recent jobs, and **Download** for their outputs, which
     go back into the output directory they were submitted with. Each job shows that directory.
   - **Save job bundle**, which creates the job bundle without submitting it, to submit later with
     `deadline bundle submit`. The bundle keeps the parameters, host requirements, priority,
     initial state, and the failed task, retry and worker limits. Pass the job name with `--name`.
 - A **Deadline** button next to **Run**, and **Workflow > Submit to Deadline Cloud…**, which open a
-  short dialog: farm, queue, tasks and **Submit**.
+  short dialog: farm, queue, tasks, the attachments the job uploads, and **Submit**, with the same
+  summary of what the job attaches.
 
 When you submit, the extension:
 
@@ -94,8 +101,12 @@ The script:
 
 1. Builds the panel. It runs `npm ci` and `npm run build` in `frontend/`, which compiles the
    panel's TypeScript into the JavaScript that ComfyUI serves.
-2. Copies the extension into `ComfyUI/custom_nodes/deadline-cloud-for-comfyui`. If you cloned
-   the repository into `custom_nodes` yourself, it uses that copy where it is.
+2. Copies the extension into `ComfyUI/custom_nodes/deadline-cloud-for-comfyui`. It copies only the
+   files the extension runs: its Python package, the job template, the compiled panel, the setup
+   script, `__init__.py`, `LICENSE`, `NOTICE` and `README.md`. Anything else in your checkout, such
+   as `.npmrc`, credentials, logs or old builds, isn't copied. The script stops if one of those
+   files is a symlink or a Windows junction, since a link can point anywhere. If you cloned the
+   repository into `custom_nodes` yourself, it uses that copy where it is.
 3. Finds the Deadline Cloud CLI. If `deadline` 0.60.8 or later is on the `PATH`, and it runs on a
    Python the extension can find, it uses that. The panel runs the CLI's own Python, so a
    standalone build of the CLI without one isn't used. Otherwise it creates a Python environment
@@ -117,9 +128,10 @@ to **Run** appear. If they don't, check the ComfyUI server log for lines that st
 | `--deadline-cli PATH` | Use this Deadline Cloud CLI, 0.60.8 or later. The default is the first `deadline` on the `PATH`. |
 | `--private-cli` | Install a private copy of the CLI in the extension folder, even if one is on the `PATH`. |
 | `--link` | Symlink this checkout into `custom_nodes` instead of copying it, for development. |
-| `--force` | Replace a `custom_nodes/deadline-cloud-for-comfyui` folder that isn't this extension. |
+| `--force` | Replace a `custom_nodes/deadline-cloud-for-comfyui` folder that isn't a copy this installer made, such as another folder or a git checkout of the extension. Its files, including a checkout's history and uncommitted changes, are deleted. |
 
-Run the script again to update the extension and the CLI. It doesn't prompt, so it can run from
+Run the script again to update the extension and the CLI. An update keeps the copy's private CLI
+in `.deadline-cli` and its `deadline_cloud_submitter.json`. It doesn't prompt, so it can run from
 configuration management such as Ansible. To uninstall, delete the extension folder from
 `custom_nodes`.
 
@@ -160,10 +172,15 @@ The job runs as one task, or a task for each combination of the workflow's
 parameters to its copy of the template. Workers get everything the workflow uses as job attachments,
 uploaded from this machine:
 
-- **Input files.** The submitter lists the files in ComfyUI's input directory that the workflow
-  loads, such as Load Image's image, in the job bundle's `asset_references.yaml`, with the whole
-  folder that a folder loader reads. They're attached to the job, and path mapping points
-  **Input Directory** at them on the worker.
+- **Input files.** The submitter reads only the inputs that ComfyUI's node definitions mark as
+  files, such as Load Image's image, Load Video's file and Load Audio's audio, and the folder that
+  a folder loader reads. It lists the files they name in ComfyUI's input directory, or with
+  `[output]` or `[temp]`, in its output or temp directory, in the job bundle's
+  `asset_references.yaml`. A folder loader's folder is attached as the files in it. Text in other
+  inputs, such as a prompt, never attaches a file. Neither does an absolute path or a link that
+  leads out of ComfyUI's folders. The panel warns about those, and you can attach any file or
+  folder yourself with **Add files…** or **Add folder…** under **Attachments**. On the worker,
+  path mapping points **Input Directory** at the attached files.
 - **Outputs.** Outputs are returned through job attachments. Download them with Deadline Cloud
   monitor or `deadline job download-output`.
 - **Models.** Workers don't have your local models. The submitter finds each model file the workflow
@@ -189,10 +206,13 @@ uploaded from this machine:
   on this machine, the panel warns about it. The job fails with the import error when a custom
   node doesn't load.
 
-  A pack's `requirements.txt` can list packages and `https` URLs, such as `git+https`. The job
-  fails before installing anything when the file has a pip option, such as `--extra-index-url` or
-  `-r`, a local path, an environment variable or another kind of URL. pip still uses the package
-  index the workers are set up with, such as through `PIP_INDEX_URL` in a queue environment.
+  A pack's `requirements.txt` can list packages, with extras, version specifiers, markers and
+  `--hash` options, and `name @ URL` requirements for `https` and `git+https` URLs, such as
+  `pkg @ git+https://github.com/org/pkg.git`. Every attached pack's file is checked before any
+  are installed, and the job fails when one has a pip option, such as `--extra-index-url` or `-r`,
+  a local path or file, an environment variable, another kind of URL, or isn't UTF-8 text. pip
+  installs a checked copy of each file, never the pack's own. It still uses the package index the
+  workers are set up with, such as through `PIP_INDEX_URL` in a queue environment.
 
   Anyone who can use the queue can read a job's attachments. Staging leaves out files named like
   credential stores, such as `.env`, `*.pem`, `.npmrc`, `hf_token` and `service_account.json`,
@@ -229,6 +249,9 @@ the image's EXIF rotation and loads every frame of an animated image, unlike the
 In the panel, narrow a field to run only some of its items, such as `2,3`, or set it to `0` to run
 that list whole in each task while the other lists split. A step can have at most
 16 task parameters. Lists past the first 16 run whole in one task, and the panel warns about them.
+A job can run at most 10,000 tasks, every combination of its lists' items, and a workflow's lists
+and folders past the first 256 always run whole. Folder images are sent as paths in the input
+directory, and the worker refuses any other path.
 The number in a label such as **Create List #64** is the node's ID, which ComfyUI shows with
 **Settings > Lite Graph > Node ID badge**. Lists that a workflow builds while it runs, such as
 Rebatch Images, always run whole in one task, because Deadline Cloud sets a job's tasks when you
@@ -283,18 +306,51 @@ the same machine.
 **What the extension adds.**
 
 - The routes require a loopback peer address. A request from another address, or one
-  with a `Forwarded`, `X-Forwarded-For` or `X-Real-IP` header from a reverse proxy, gets a 403.
+  with a header that a reverse proxy adds, such as `Forwarded`, `X-Forwarded-For`, `X-Real-IP` or
+  `Via`, gets a 403. A proxy or port forwarder on this machine that adds none of these headers
+  can't be told apart from a local client, so don't put one in front of ComfyUI.
 - They only accept requests addressed to `localhost` or a loopback address such as `127.0.0.1`,
   so a website that points its own domain name at this machine can't pass for ComfyUI's page.
+  Names under `.localhost`, and names with a trailing dot, are refused too.
 - They refuse requests that a browser marks as coming from another website, even when
   `--enable-cors-header` turns off ComfyUI's own check. When an `Origin` header is present, its
   scheme, host and port must match the ComfyUI request, even without browser fetch metadata.
 - They only accept JSON, which a page from another website can't send without the server's
   permission.
-- Submission progress, confirmation prompts and errors, and download progress go only to the
-  browser tab that started them, not to every tab connected to the server.
+- Submission progress, confirmation prompts and errors, and download progress are sent to the
+  browser client ID that started them, not to every tab connected to the server. A client ID
+  isn't a secret: ComfyUI lists it in the queue and history, and anyone who can reach ComfyUI can
+  connect with it, so this keeps tabs apart rather than protecting the messages.
 - A submission requires a valid browser client ID. Only that client can confirm or cancel it,
-  and confirmation answers are accepted only while a prompt is pending.
+  and confirmation answers are accepted only while a prompt is pending. Once the job is being
+  created, Cancel can't stop it, and a job that was created is always reported, even when a later
+  step, such as waiting for it, fails.
+- Each confirmation prompt has its own random ID, and an answer has to name the prompt that's
+  pending now. A late or repeated answer, to a prompt that was already answered or that was
+  declined because nobody answered it in time, gets a 409 and doesn't answer a later prompt. Only
+  `"accept": true` or `false` is an answer: any other value gets a 400, and the prompt stays
+  pending.
+- Submit stays off until the details of the chosen farm and queue, their parameters and storage
+  profiles, have loaded. Changing the queue forgets the previous queue's details, the queue
+  parameters you edited for it and its storage profile, and an answer for a queue that's no
+  longer chosen, or one that a newer request for the same queue replaced, is ignored. So a job is
+  never submitted with another queue's parameters, or without its storage profile because the
+  profiles hadn't loaded yet.
+- A storage profile of **None** that you choose stays None, even when the panel reloads your
+  defaults. A default or earlier storage profile that the chosen queue doesn't list is cleared,
+  and Submit stays off, and says why, until you choose a profile or None. Without a storage
+  profile, files on shared storage are uploaded too.
+- The files you add or remove under **Attachments**, and the models and custom node packs you
+  remove, belong to the workflow tab you changed them in. Another workflow's job doesn't get
+  them, and a file dialog that closes after you've opened another workflow adds nothing. Next to
+  **Submit**, in the panel and in the dialog, a summary counts the files, folders, models and
+  custom node packs the job attaches, and names the ones you added.
+- Input files are uploaded to the queue's job attachments bucket, where anyone who can use the
+  queue can read them. The submitter only attaches files that the workflow's file inputs and
+  folder loaders name inside ComfyUI's input, output and temp folders. It checks them with links
+  resolved, so a shared workflow can't attach other files on this machine.
+- The job template's hidden paths, Model Directory and Custom Nodes Directory, are set by the
+  extension, not by the request, so a request can't point a job's custom nodes at another folder.
 - Job bundles in `ComfyUI/user/deadline_submissions/` hold your workflows, prompts and file paths.
   On Linux and macOS that folder and each bundle in it can only be opened by the user that runs
   ComfyUI (mode `0700`), and the files the extension writes there can only be read by that user
@@ -302,6 +358,9 @@ the same machine.
   your files and keep their permissions, but they can only be reached through the bundle, which
   is deleted once its job is created. On Windows, bundles inherit the permissions of the ComfyUI
   user folder. The `deadline_cloud_submitter.json` config file is also `0600`.
+- **Download** only writes files inside the Output Directory the job was submitted with. Output
+  manifests come from the queue's job attachments, where any job on the queue can write, so the
+  extension checks every file's destination first, and downloads nothing when one is elsewhere.
 - Custom node packs are uploaded with their files to the queue's job attachments bucket, where
   anyone who can use the queue can read them. Credential files, such as `.env`, `*.key` and `*.pem`,
   are left out. A pack's settings files, such as `config.json`, are attached as they are, so keep

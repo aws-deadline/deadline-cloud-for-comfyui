@@ -16,9 +16,11 @@ import pytest
 NODE = shutil.which("node")
 FRONTEND = Path(__file__).resolve().parents[3] / "frontend"
 TSC = FRONTEND / "node_modules" / ".bin" / ("tsc.cmd" if os.name == "nt" else "tsc")
-pytestmark = pytest.mark.skipif(
-    NODE is None or not TSC.exists(), reason="Needs Node.js, and npm ci run in frontend/"
-)
+MISSING_TOOLS = NODE is None or not TSC.exists()
+# CI sets this so that the frontend job fails, rather than passing with no panel tests run.
+if MISSING_TOOLS and os.environ.get("COMFYUI_DEADLINE_REQUIRE_PANEL_TESTS") == "1":
+    raise RuntimeError("The panel tests need Node.js, and npm ci run in frontend/")
+pytestmark = pytest.mark.skipif(MISSING_TOOLS, reason="Needs Node.js, and npm ci run in frontend/")
 
 PANEL = Path(__file__).parent / "panel"
 
@@ -60,6 +62,9 @@ def _run_scenario(tmp_path: Path, ui_source: str, scenario: str) -> dict:
         " pollJobs as __pollJobs, formFromRequirements as __formFromRequirements,"
         " requirementsFromForm as __requirementsFromForm,"
         " createView as __createView, itemEditBase as __itemEditBase,"
+        " DIALOG_SECTIONS as __dialogSections, PANEL_SECTIONS as __panelSections,"
+        " loadQueue as __loadQueue, loadQueues as __loadQueues, loadFarms as __loadFarms,"
+        " attachmentEdits as __attachmentEdits,"
         " answerConfirmation as __answerConfirmation, cancelSubmission as __cancelSubmission };\n"
     )
     (web / "deadline_ui.js").write_text(ui_source + exports, encoding="utf-8")
@@ -104,28 +109,31 @@ def test_a_confirmation_before_the_response_is_shown(run_scenario):
     assert result["submission"]["confirm"] == {
         "message": "Upload 5 GB?",
         "default": True,
+        "promptId": "prompt-1",
     }
     assert result["submission"]["starting"] is False
 
 
-def test_confirmation_answers_include_the_submitting_client(run_scenario):
+def answer(prompt_id: str, accept: bool) -> dict:
+    return {"submissionId": "a" * 32, "clientId": "tab-1", "promptId": prompt_id, "accept": accept}
+
+
+def test_confirmation_answers_name_their_prompt_and_the_submitting_client(run_scenario):
+    """The server only takes an answer that names the prompt pending now."""
     result = run_scenario("answer-confirmation")
-    assert result == {
-        "answers": [{"submissionId": "a" * 32, "clientId": "tab-1", "accept": True}],
-        "pending": None,
-    }
+    assert result == {"answers": [answer("prompt-1", True)], "pending": None}
 
 
 def test_a_new_confirmation_survives_an_earlier_answer_finishing(run_scenario):
     result = run_scenario("answer-while-next-prompt-arrives")
-    assert result["answersWhileFirstPending"] == [
-        {"submissionId": "a" * 32, "clientId": "tab-1", "accept": True}
-    ]
-    assert result["nextPrompt"] == {"message": "Run hooks?", "default": False}
-    assert result["answers"] == [
-        {"submissionId": "a" * 32, "clientId": "tab-1", "accept": True},
-        {"submissionId": "a" * 32, "clientId": "tab-1", "accept": False},
-    ]
+    assert result["answersWhileFirstPending"] == [answer("prompt-1", True)]
+    assert result["nextPrompt"] == {
+        "message": "Run hooks?",
+        "default": False,
+        "promptId": "prompt-2",
+    }
+    # Each answer names the prompt it was shown with, so the first can't answer the second.
+    assert result["answers"] == [answer("prompt-1", True), answer("prompt-2", False)]
     assert result["pending"] is None
 
 
@@ -290,6 +298,223 @@ def test_a_finished_download_says_where_the_files_are(run_scenario, scenario, de
 def test_bool_parameters_are_read_as_openjd_reads_them(run_scenario):
     """So the Attach Custom Nodes checkbox and the attachments agree with what the job does."""
     assert run_scenario("parse-bool")["values"] == [True] * 6 + [False] * 6 + [None] * 5
+
+
+def test_an_earlier_queues_details_dont_replace_the_chosen_queues(run_scenario):
+    """The queue parameters and storage profiles sent are the chosen queue's."""
+    assert run_scenario("late-queue-details") == {"queueParameters": ["Queue2Parameter"]}
+
+
+def test_a_farm_or_queue_the_panel_doesnt_list_isnt_submitted_to(run_scenario):
+    assert run_scenario("target-not-listed") == {
+        "queueId": "",
+        # Not chosen for the next queue, rather than None, so the account's default can fill it.
+        "storageProfileId": None,
+        "canSubmitUnlisted": False,
+        "canSubmitWithoutFarms": False,
+    }
+
+
+def test_switching_queues_forgets_the_previous_queues_details(run_scenario):
+    """Nothing from queue 1, its parameters or its storage profile, is shown or sent to queue 2."""
+    result = run_scenario("switch-queue")
+    assert result["queue1Sent"] == {
+        "parameters": {"Queue1Parameter": "for queue 1", "Shared": "edited for queue 1"},
+        "storageProfileId": "sp-1",
+    }
+    assert result["canSubmitBeforeSwitching"] is True
+    assert result["queueWhileLoading"] is None
+    assert result["queueParametersWhileLoading"] is None
+    assert result["canSubmitWhileLoading"] is False
+    assert result["blockerWhileLoading"] == "Loading the queue's details…"
+    assert result["sentWhileLoading"] is None
+    assert result["canSubmitLoaded"] is True
+    # Shared has the same name on both queues, but its edit was for queue 1.
+    assert result["queue2Sent"] == {
+        "queueId": "queue-2",
+        "parameters": {"Queue2Parameter": "for queue 2"},
+        "storageProfileId": "",
+    }
+
+
+def test_submit_waits_for_the_latest_queue_details(run_scenario):
+    result = run_scenario("pending-queue-details")
+    assert result["canSubmitWhilePending"] is False
+    assert result["blockerWhilePending"] == "Loading the queue's details…"
+    assert result["sentWhilePending"] is None
+    # An earlier answer for the same queue came last, and was ignored.
+    assert result["parameters"] == ["Newer"]
+    assert result["profiles"] == ["sp-new"]
+    assert result["canSubmitLoaded"] is True
+    assert result["blockerLoaded"] is None
+    # Details that fail to load keep Submit off, and Submit says why.
+    assert result["queueFailed"] is None
+    assert result["canSubmitFailed"] is False
+    assert result["blockerFailed"].startswith("Couldn't load the queue's details:")
+    assert "ThrottlingException" in result["blockerFailed"]
+
+
+def test_a_storage_profile_of_none_survives_reloading_the_account(run_scenario):
+    """None is a choice, not a missing value that the account's default fills in again."""
+    result = run_scenario("storage-profile-none")
+    # The default isn't dropped while the queue's details load.
+    assert result["whileLoading"] == {"storageProfileId": "sp-1", "canSubmit": False}
+    assert result["defaultSent"] == "sp-1"
+    assert result["afterReload"] == ""
+    assert result["noneSent"] == ""
+    assert result["savedDefaults"] == [""]
+
+
+def test_a_default_storage_profile_the_queue_doesnt_list_needs_a_choice(run_scenario):
+    """Submitting without it would upload files that are on shared storage, without saying so."""
+    result = run_scenario("storage-profile-cleared")
+    assert result["storageProfileId"] is None
+    assert result["canSubmit"] is False
+    assert "doesn't list the storage profile sp-gone" in result["blocker"]
+    assert result["sentBeforeChoosing"] is None
+    assert result["canSubmitAfterNone"] is True
+    assert result["blockerAfterNone"] is None
+    assert result["noneSent"] == ""
+
+
+def test_attachment_changes_stay_with_their_workflow(run_scenario):
+    """A file added to workflow A, or removed from it, doesn't change workflow B's job."""
+    result = run_scenario("workflow-attachments")
+    in_a = {
+        "attachments": {"filenames": ["/manual/clip.mov"], "directories": []},
+        "excludedModels": ["checkpoints/sd.safetensors"],
+    }
+    assert result["fromA"] == in_a
+    assert result["fromB"] == {
+        "attachments": {"filenames": ["/input/old.png"], "directories": []},
+        "excludedModels": [],
+    }
+    # Back in A, its changes are as the artist left them.
+    assert result["backInA"] == in_a
+
+
+def test_a_file_dialog_that_closes_after_switching_workflows_adds_nothing(run_scenario):
+    result = run_scenario("late-file-dialog")
+    assert result["fromB"] == ["/input/old.png"]
+    assert result["fromA"] == ["/input/old.png"]
+    assert "warn" in result["toasts"]
+
+
+def test_both_views_show_what_the_job_attaches_next_to_submit(run_scenario):
+    result = run_scenario("attachment-summary")
+    assert result["planned"] == "Attaches 2 files, 2 models and 1 custom node pack."
+    summary = (
+        "Attaches 2 files, 1 folder, 1 model and 1 custom node pack. "
+        "You added /outside/clip.mov, /outside/frames."
+    )
+    assert result["summary"] == summary
+    assert result["sidebar"] == summary
+    assert result["dialog"] == summary
+    # The summary is what's sent.
+    assert result["sent"] == {
+        "attachments": {
+            "filenames": ["/input/old.png", "/outside/clip.mov"],
+            "directories": ["/outside/frames"],
+        },
+        "excludedModels": ["checkpoints/b.safetensors"],
+        "excludedNodes": [],
+    }
+
+
+FOLDER = "/input/cats"
+FOLDER_FILES = [f"{FOLDER}/cat-{index}.png" for index in range(5000)]
+LOOSE_FILES = ["/input/fox.png", "/input/mask.png", "/input/owl.png"]
+
+
+def test_a_folder_loaders_folder_is_one_row_until_it_is_opened(run_scenario):
+    """A dataset folder of thousands of files doesn't render a row for each until it's opened."""
+    result = run_scenario("attachment-folders")
+    collapsed = result["collapsed"]
+    assert collapsed["listed"] == [*LOOSE_FILES, FOLDER]
+    assert collapsed["folder"] == f"▸ {FOLDER} (5,000 files)✕"
+    assert collapsed["expanded"] == "false"
+    assert collapsed["title"] == "Attachments (4)"
+    opened = result["opened"]
+    assert opened["rows"] == 4 + 5000
+    assert opened["folder"].startswith(f"▾ {FOLDER} (5,000 files)")
+    assert opened["expanded"] == "true"
+    # Each file is listed by its path in the folder.
+    assert (opened["first"], opened["firstClass"]) == ("cat-0.png✕", "dl-nested")
+    assert result["closed"]["rows"] == 4
+    assert result["closed"]["expanded"] == "false"
+
+
+def test_one_click_removes_a_folder_and_add_back_restores_every_file(run_scenario):
+    result = run_scenario("attachment-folders")
+    removed = result["folderRemoved"]
+    assert removed["sent"] == {"filenames": LOOSE_FILES, "directories": []}
+    assert removed["folder"] == f"▸ {FOLDER} (5,000 files)Add back"
+    assert removed["folderClass"] == "dl-folder dl-removed"
+    assert removed["title"] == "Attachments (3)"
+    assert removed["rows"] == 4
+    restored = result["folderRestored"]
+    assert restored["sent"] == {"filenames": [*LOOSE_FILES, *FOLDER_FILES], "directories": []}
+    assert restored["folderClass"] == "dl-folder"
+    assert restored["title"] == "Attachments (4)"
+
+
+def test_a_file_removed_from_an_open_folder_leaves_the_rest_attached(run_scenario):
+    result = run_scenario("attachment-folders")
+    removed = result["fileRemoved"]
+    kept = [path for path in FOLDER_FILES if path != f"{FOLDER}/cat-42.png"]
+    assert removed["sent"] == {"filenames": [*LOOSE_FILES, *kept], "directories": []}
+    assert removed["folder"] == f"▾ {FOLDER} (4,999 of 5,000 files)✕"
+    assert removed["fileRow"] == "cat-42.pngAdd back"
+    assert removed["fileClass"] == "dl-nested dl-removed"
+    # The list stays where the artist scrolled it.
+    assert removed["scroll"] == 900
+    # The folder's ✕ removes the rest, and Add back restores every file, with the one removed on
+    # its own.
+    assert result["removedWhileOpen"]["sent"] == {"filenames": LOOSE_FILES, "directories": []}
+    assert result["removedWhileOpen"]["scroll"] == 900
+    assert result["restoredWhileOpen"]["sent"] == {
+        "filenames": [*LOOSE_FILES, *FOLDER_FILES],
+        "directories": [],
+    }
+
+
+def test_the_summary_counts_a_folder_loaders_folder_as_one_folder(run_scenario):
+    result = run_scenario("attachment-folders")
+    summary = "Attaches 3 files and 1 folder (5,000 files)."
+    assert result["collapsed"]["summary"] == summary
+    assert result["shownSummary"] == summary
+    assert result["fileRemoved"]["summary"] == "Attaches 3 files and 1 folder (4,999 files)."
+    assert result["folderRemoved"]["summary"] == "Attaches 3 files."
+    assert result["summaryWithAddedFolder"] == (
+        "Attaches 3 files and 2 folders (5,000 files in 1 of them). You added /outside/frames."
+    )
+
+
+def test_the_sidebar_lists_the_attachments_before_submit(run_scenario):
+    sections = run_scenario("panel-sections")["sections"]
+    assert sections.index("attachments") < sections.index("submit")
+    assert sections[-1] == "submit"
+
+
+def test_the_panel_has_the_submitters_task_limit(run_scenario):
+    from deadline.comfyui_submitter import submit
+
+    result = run_scenario("task-limit")
+    assert result == {
+        "maxTasks": submit.MAX_TASKS,
+        # As one task, the lists run whole, however many items they have.
+        "canSubmitOneTask": True,
+        # 100 × 101 tasks is over the limit, and 100 × 100 is the limit.
+        "canSubmitOverLimit": False,
+        "canSubmitAtLimit": True,
+    }
+
+
+def test_the_dialog_lists_the_attachments_before_submit(run_scenario):
+    # The Deadline button opens the dialog, which must show every file the job uploads.
+    sections = run_scenario("dialog-sections")["sections"]
+    assert "attachments" in sections
+    assert sections.index("attachments") < sections.index("submit")
 
 
 def test_task_lists_count_tasks_and_send_their_ranges(run_scenario):

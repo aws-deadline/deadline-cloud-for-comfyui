@@ -54,6 +54,17 @@ interface PathLists {
   directories: string[];
 }
 
+// A folder loader's folder, and the files attached from it, which the plan's filenames lists too.
+interface FolderFiles {
+  path: string;
+  files: string[];
+}
+
+// The input files and folders the workflow loads. The panel lists each folder's files under it.
+interface PlannedAttachments extends PathLists {
+  folders?: FolderFiles[];
+}
+
 interface AttributeRequirement {
   name: string;
   anyOf?: string[];
@@ -101,7 +112,7 @@ interface Plan {
   parameters: Parameter[];
   values?: Record<string, ParameterValue>;
   queueValues?: Record<string, string>;
-  attachments?: PathLists;
+  attachments?: PlannedAttachments;
   hostRequirements?: HostRequirements;
   // id is the model's folder and name, such as checkpoints/sd.safetensors. Two models can share a
   // name in different folders.
@@ -114,6 +125,13 @@ interface Plan {
   sources?: TaskList[];
 }
 
+// A confirmation prompt the server relayed. Its answer names promptId, so it can't answer another.
+interface Confirmation {
+  message: string;
+  default?: boolean;
+  promptId?: string;
+}
+
 interface Submission {
   id: string;
   starting: boolean;
@@ -121,7 +139,7 @@ interface Submission {
   name?: string;
   stage?: string;
   progress?: number;
-  confirm?: { message: string; default?: boolean } | null;
+  confirm?: Confirmation | null;
 }
 
 interface Job {
@@ -153,12 +171,15 @@ interface SubmissionEvent {
   progress?: number;
   message?: string;
   default?: boolean;
+  promptId?: string;
   status?: "SUBMITTED" | "FAILED" | "CANCELED";
   jobId?: string;
   farmId?: string;
   queueId?: string;
   outputDir?: string;
   error?: string;
+  // A job that was created although the submission didn't finish, or may have been.
+  warning?: string;
 }
 
 interface DownloadEvent {
@@ -170,6 +191,13 @@ interface DownloadEvent {
   // The folder the CLI downloaded the files into.
   directory?: string;
   error?: string;
+}
+
+// What the artist changed in one workflow's attachments: the files the job doesn't attach, by
+// path, and the ones they added with the file dialog.
+interface AttachmentEdits {
+  removed: Set<string>;
+  added: PathLists;
 }
 
 // The host requirements form. Its numbers are kept as the text in the fields.
@@ -194,6 +222,10 @@ const SETTINGS_KEY = "DeadlineCloud.Submitter.JobSettings";
 const JOBS_KEY = "DeadlineCloud.Submitter.RecentJobs";
 const MAX_RECENT_JOBS = 20;
 const JOB_POLL_MS = 20000;
+// The value of the storage profile select's None, when it has a "Choose…" placeholder as well.
+const NO_STORAGE_PROFILE = "none";
+// The open workflow tab when the frontend doesn't say which it is.
+const DEFAULT_TAB = "ComfyUI workflow";
 const PLAN_DEBOUNCE_MS = 1000;
 const TOOLTIP_DELAY_MS = 200;
 const TOOLTIP_GAP = 6;
@@ -244,15 +276,24 @@ interface State {
   loggingIn: boolean;
   farms: Farm[] | null;
   queues: Queue[] | null;
-  // The chosen queue's environment parameters and storage profiles.
+  // The chosen queue's environment parameters and storage profiles, once they load.
   queue: QueueDetails | null;
+  // The farm and queue that queue is for, as targetKey gives them.
+  queueKey: string | null;
+  queueError: string | null;
   cloudError: string | null;
   farmId: string;
   queueId: string;
-  storageProfileId: string;
+  // The storage profile to submit with: null until the artist chooses one or a default loads, and
+  // "" for None, which a reload of the account's defaults doesn't replace.
+  storageProfileId: string | null;
+  // A default or earlier storage profile that the chosen queue doesn't list, so it was cleared.
+  storageProfileCleared: string | null;
   plan: Plan | null;
   // The workflow the plan was made from, as workflowKey gives it.
   planKey: string | null;
+  // The workflow tab the plan was made from, as workflowTab gives it.
+  planTab: string | null;
   planError: string | null;
   planning: boolean;
   // The artist's values, which win over the ones the submitter fills in.
@@ -268,8 +309,10 @@ interface State {
   // The host requirements form, once the artist edits it. Until then the job template's apply.
   hostForm: HostForm | null;
   settings: Settings;
-  removedAttachments: Set<string>;
-  addedAttachments: PathLists;
+  // Each workflow tab's attachment changes, so files added for one workflow never go with another.
+  attachmentEdits: Map<string, AttachmentEdits>;
+  // The folders whose files the attachments list shows, by path. The rest show as one row each.
+  openFolders: Set<string>;
   submission: Submission | null;
   jobs: Job[];
   jobStatus: Record<string, JobStatus>;
@@ -282,12 +325,16 @@ const state: State = {
   farms: null,
   queues: null,
   queue: null,
+  queueKey: null,
+  queueError: null,
   cloudError: null,
   farmId: "",
   queueId: "",
-  storageProfileId: "",
+  storageProfileId: null,
+  storageProfileCleared: null,
   plan: null,
   planKey: null,
+  planTab: null,
   planError: null,
   planning: false,
   edits: {},
@@ -298,8 +345,8 @@ const state: State = {
   jobDescription: "",
   hostForm: null,
   settings: { ...DEFAULT_SETTINGS, ...readStorage<Settings>(SETTINGS_KEY, {}) },
-  removedAttachments: new Set(),
-  addedAttachments: { filenames: [], directories: [] },
+  attachmentEdits: new Map(),
+  openFolders: new Set(),
   submission: null,
   jobs: readStorage<Job[]>(JOBS_KEY, []),
   jobStatus: {},
@@ -390,8 +437,15 @@ interface WorkflowBody {
 export async function currentWorkflow(): Promise<WorkflowBody> {
   // The UI-format workflow carries the model folders that loaders and templates record.
   const { output, workflow } = await app.graphToPrompt();
-  const name = app.extensionManager.workflow?.activeWorkflow?.filename || "ComfyUI workflow";
+  const name = app.extensionManager.workflow?.activeWorkflow?.filename || DEFAULT_TAB;
   return { workflow: output, ui_workflow: workflow, name };
+}
+
+// The open workflow tab: its path, which no other open tab has, or its file name on frontends that
+// don't give the path. Each tab keeps its own attachment changes.
+function workflowTab(): string {
+  const workflow = app.extensionManager.workflow?.activeWorkflow;
+  return workflow?.path || workflow?.filename || DEFAULT_TAB;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -411,7 +465,10 @@ export function loadAccount(force = false) {
       state.account = account;
       state.farmId ||= account.farmId ?? "";
       state.queueId ||= account.queueId ?? "";
-      state.storageProfileId ||= account.storageProfileId ?? "";
+      // Only fills in a profile nobody chose. None, which the artist chose, stays None.
+      if (state.storageProfileId === null && account.storageProfileId) {
+        state.storageProfileId = account.storageProfileId;
+      }
       if (!state.settings.jobAttachmentsFileSystem && account.jobAttachmentsFileSystem) {
         state.settings.jobAttachmentsFileSystem = account.jobAttachmentsFileSystem;
       }
@@ -432,6 +489,12 @@ async function loadFarms() {
   state.cloudError = null;
   try {
     state.farms = (await cloud<{ farms: Farm[] }>("farms")).farms;
+    // A default farm that isn't listed can't be shown as chosen, so it isn't submitted to.
+    if (state.farmId && !state.farms.some((farm) => farm.farmId === state.farmId)) {
+      state.farmId = "";
+      state.queueId = "";
+      forgetQueue();
+    }
   } catch (error) {
     state.cloudError = messageOf(error);
   }
@@ -441,13 +504,52 @@ async function loadFarms() {
   }
 }
 
-async function loadQueues() {
-  state.queues = null;
+// Identifies the farm and queue that queue details are for.
+function targetKey(farmId: string, queueId: string): string {
+  return JSON.stringify([farmId, queueId]);
+}
+
+// Each request for queue details, so an answer that a newer request replaced, such as an earlier
+// one for the same queue, is ignored.
+let queueRequest = 0;
+
+// Forgets the chosen queue's details and what came from them, when the farm or queue changes: its
+// parameter values and storage profile were for that queue only.
+function forgetQueue() {
+  queueRequest++;
   state.queue = null;
-  refresh("target", "queueParameters");
+  state.queueKey = null;
+  state.queueError = null;
+  state.queueEdits = {};
+  state.storageProfileId = null;
+  state.storageProfileCleared = null;
+}
+
+async function loadQueues() {
+  const farmId = state.farmId;
+  state.queues = null;
+  // The details of a queue from before are no use until this farm's queues are listed again.
+  queueRequest++;
+  state.queue = null;
+  state.queueKey = null;
+  state.queueError = null;
+  refresh("target", "queueParameters", "submit");
   try {
-    state.queues = (await cloud<{ queues: Queue[] }>("queues", { farmId: state.farmId })).queues;
+    const { queues } = await cloud<{ queues: Queue[] }>("queues", { farmId });
+    // Each request runs its own bridge, so an earlier farm's answer can come last.
+    if (state.farmId !== farmId) {
+      return;
+    }
+    state.queues = queues;
+    // A default queue that isn't listed can't be shown as chosen, so it isn't submitted to.
+    if (state.queueId && !queues.some((queue) => queue.queueId === state.queueId)) {
+      state.queueId = "";
+      forgetQueue();
+    }
   } catch (error) {
+    if (state.farmId !== farmId) {
+      return;
+    }
     state.cloudError = messageOf(error);
   }
   refresh("target");
@@ -457,16 +559,62 @@ async function loadQueues() {
 }
 
 async function loadQueue() {
+  const { farmId, queueId } = state;
+  const key = targetKey(farmId, queueId);
+  const request = ++queueRequest;
+  // Whether the answer is still the one to use: from the latest request, for the chosen queue.
+  // An earlier queue's answer, or an earlier one for this queue, can come last.
+  const current = () => request === queueRequest && targetKey(state.farmId, state.queueId) === key;
+  // Until this queue's details load, nothing from another queue's is shown or submitted.
+  state.queue = null;
+  state.queueKey = null;
+  state.queueError = null;
+  refresh("target", "queueParameters", "submit");
   try {
-    const queue = await cloud<QueueDetails>("queue", { farmId: state.farmId, queueId: state.queueId });
+    const queue = await cloud<QueueDetails>("queue", { farmId, queueId });
+    if (!current()) {
+      return;
+    }
     state.queue = queue;
-    if (!queue.storageProfiles.some((profile) => profile.storageProfileId === state.storageProfileId)) {
-      state.storageProfileId = "";
+    state.queueKey = key;
+    // A default or earlier profile this queue doesn't list is cleared, and Submit says why.
+    const chosen = state.storageProfileId;
+    if (chosen && !queue.storageProfiles.some((profile) => profile.storageProfileId === chosen)) {
+      state.storageProfileCleared = chosen;
+      state.storageProfileId = null;
     }
   } catch (error) {
-    state.cloudError = messageOf(error);
+    if (!current()) {
+      return;
+    }
+    state.queueError = `Couldn't load the queue's details: ${messageOf(error)}`;
   }
-  refresh("target", "queueParameters");
+  refresh("target", "queueParameters", "submit");
+}
+
+// The artist chose a farm in the Farm select.
+export async function selectFarm(farmId: string) {
+  state.farmId = farmId;
+  state.queueId = "";
+  forgetQueue();
+  await loadQueues();
+  saveDefaults();
+}
+
+// The artist chose a queue in the Queue select.
+export async function selectQueue(queueId: string) {
+  state.queueId = queueId;
+  forgetQueue();
+  await loadQueue();
+  saveDefaults();
+}
+
+// The artist chose a storage profile, or None, which is "" or NO_STORAGE_PROFILE.
+export function chooseStorageProfile(value: string) {
+  state.storageProfileId = value === NO_STORAGE_PROFILE ? "" : value;
+  state.storageProfileCleared = null;
+  refresh("target", "submit");
+  saveDefaults();
 }
 
 async function saveDefaults() {
@@ -474,7 +622,7 @@ async function saveDefaults() {
     await cloud("set-defaults", {
       farmId: state.farmId,
       queueId: state.queueId,
-      storageProfileId: state.storageProfileId,
+      storageProfileId: state.storageProfileId ?? "",
     });
   } catch (error) {
     toast("warn", `Couldn't save the farm and queue as your defaults: ${messageOf(error)}`);
@@ -503,14 +651,24 @@ let planRequest = 0;
 // The workflow of the latest plan request, so moving nodes around doesn't plan again.
 let requestedKey: string | null = null;
 
+// Each time a workflow is opened or its tab selected, so what was started for the workflow before,
+// such as a file dialog, doesn't land in the next one.
+let workflowGeneration = 0;
+
 // Reads the workflow again, unless it's unchanged. force reads it anyway.
 export async function loadPlan(force = false) {
   let body: WorkflowBody;
+  const tab = workflowTab();
+  const generation = workflowGeneration;
   try {
     body = await currentWorkflow();
   } catch (error) {
     state.planError = `Couldn't convert the workflow to API format: ${messageOf(error)}`;
     refresh("status", "submit");
+    return;
+  }
+  // Another workflow opened while this one was read. workflowLoaded plans that one.
+  if (generation !== workflowGeneration) {
     return;
   }
   const key = workflowKey(body);
@@ -545,6 +703,7 @@ export async function loadPlan(force = false) {
   if (plan) {
     state.plan = plan;
     state.planKey = key;
+    state.planTab = tab;
     dropStaleItemEdits(plan.sources ?? []);
   }
   refresh();
@@ -606,13 +765,17 @@ function schedulePlan(event?: CustomEvent<unknown>) {
 }
 
 // Opening a workflow or selecting its tab doesn't send graphChanged. The plan is for the previous
-// graph, so clear it before a submission can mix the two.
+// graph, so clear it before a submission can mix the two. A plan still loading for it is dropped.
 export function workflowLoaded() {
   clearTimeout(planTimer);
+  workflowGeneration++;
+  planRequest++;
   requestedKey = null;
   graphKey = null;
   state.plan = null;
   state.planKey = null;
+  state.planTab = null;
+  state.planning = false;
   state.planError = null;
   if (views.size) {
     refresh();
@@ -739,9 +902,28 @@ export function taskCount(
   return total;
 }
 
-function currentTaskCount() {
+// The most tasks a job can run, as the submitter's MAX_TASKS allows.
+export const MAX_TASKS = 10000;
+
+// The number of tasks, or null when a field has an error. It can be over MAX_TASKS.
+function uncheckedTaskCount() {
   const sources = state.plan?.sources ?? [];
   return sources.length ? taskCount(sources, itemsValue) : 1;
+}
+
+// The number of tasks, or null when a field has an error or there are more than MAX_TASKS. One task
+// is never over the limit: fieldCount counts every list as 1 unless the lists are split.
+function currentTaskCount() {
+  const total = uncheckedTaskCount();
+  return splitsTasks() && total !== null && total > MAX_TASKS ? null : total;
+}
+
+// Why the job can't be submitted with this many tasks, if it can't.
+function taskLimitError() {
+  const total = splitsTasks() ? uncheckedTaskCount() : null;
+  return total !== null && total > MAX_TASKS
+    ? `The job would run ${total.toLocaleString()} tasks, over the limit of ${MAX_TASKS.toLocaleString()}. Choose fewer items, or 0 to run a list whole.`
+    : null;
 }
 
 // How the fields multiply into tasks, such as "3 × 2 = 6 tasks", leaving out fields of one item.
@@ -845,12 +1027,38 @@ export function editQueueParameter(name: string, value: ParameterValue | null | 
   }
 }
 
+// The artist's attachment changes for the workflow tab the plan was made from. Each tab keeps its
+// own, so files added to one workflow, or removed from it, never change another's job.
+function attachmentEdits(): AttachmentEdits {
+  const tab = state.planTab;
+  if (tab === null) {
+    return { removed: new Set(), added: { filenames: [], directories: [] } };
+  }
+  let edits = state.attachmentEdits.get(tab);
+  if (!edits) {
+    edits = { removed: new Set(), added: { filenames: [], directories: [] } };
+    state.attachmentEdits.set(tab, edits);
+  }
+  return edits;
+}
+
+// The folder loaders' folders that attach files, each with the files attached from it.
+function plannedFolders(): FolderFiles[] {
+  return (state.plan?.attachments?.folders ?? []).filter((folder) => folder.files.length);
+}
+
+// The input files and folders the job attaches: the planned ones, with every file in a folder
+// loader's folder, less those removed, and the ones added, each once.
 function attachments(): PathLists {
   const listed = state.plan?.attachments ?? { filenames: [], directories: [] };
-  const keep = (paths: string[]) => paths.filter((path) => !state.removedAttachments.has(path));
+  const { removed, added } = attachmentEdits();
+  const keep = (...lists: string[][]) => [
+    ...new Set(lists.flat().filter((path) => !removed.has(path))),
+  ];
+  const folderFiles = plannedFolders().map((folder) => folder.files);
   return {
-    filenames: [...keep(listed.filenames), ...keep(state.addedAttachments.filenames)],
-    directories: [...keep(listed.directories), ...keep(state.addedAttachments.directories)],
+    filenames: keep(listed.filenames, ...folderFiles, added.filenames),
+    directories: keep(listed.directories, added.directories),
   };
 }
 
@@ -858,11 +1066,47 @@ function jobName() {
   return state.jobName ?? `ComfyUI - ${state.plan?.name ?? "workflow"}`;
 }
 
+// Whether the chosen farm and queue are the ones the panel shows: listed, so their selects show
+// them, rather than a default that isn't, or one from before a list failed to load.
+function targetShown(): boolean {
+  return (
+    Boolean(state.farmId) &&
+    Boolean(state.queueId) &&
+    Boolean(state.farms?.some((farm) => farm.farmId === state.farmId)) &&
+    Boolean(state.queues?.some((queue) => queue.queueId === state.queueId))
+  );
+}
+
+// Whether the details loaded are the chosen queue's: its parameters and storage profiles.
+function queueDetailsLoaded(): boolean {
+  return state.queue !== null && state.queueKey === targetKey(state.farmId, state.queueId);
+}
+
+// A default or earlier storage profile was cleared because the queue doesn't list it, and the
+// artist hasn't chosen another, or None, since. Submitting without one would upload files that
+// are on shared storage.
+function storageProfileUnresolved(): boolean {
+  return (
+    state.storageProfileCleared !== null &&
+    state.storageProfileId === null &&
+    Boolean(state.queue?.storageProfiles.length)
+  );
+}
+
+// The storage profile to submit with: the chosen one, if the loaded queue lists it, or "" for
+// None. canSubmit waits for the queue's details, so a profile isn't dropped while they load.
+function shownStorageProfileId(): string {
+  const chosen = state.storageProfileId;
+  const listed = state.queue?.storageProfiles.some((profile) => profile.storageProfileId === chosen);
+  return chosen && listed ? chosen : "";
+}
+
 export function canSubmit(): boolean {
   return (
     state.account?.authenticationStatus === "AUTHENTICATED" &&
-    Boolean(state.farmId) &&
-    Boolean(state.queueId) &&
+    targetShown() &&
+    queueDetailsLoaded() &&
+    !storageProfileUnresolved() &&
     state.plan !== null &&
     !state.planning &&
     !state.planError &&
@@ -870,6 +1114,26 @@ export function canSubmit(): boolean {
     !hostFormError() &&
     currentTaskCount() !== null
   );
+}
+
+// Why Submit is off, when the farm, queue or storage profile is the reason. Other reasons, such as
+// the account or the workflow, show where they are.
+export function submitBlocker(): string | null {
+  if (state.account?.authenticationStatus !== "AUTHENTICATED" || state.submission) {
+    return null;
+  }
+  if (!targetShown()) {
+    const listing =
+      !state.cloudError && (state.farms === null || (Boolean(state.farmId) && state.queues === null));
+    return listing ? "Loading the farms and queues…" : "Choose a farm and a queue to submit to.";
+  }
+  if (!queueDetailsLoaded()) {
+    return state.queueError ? state.queueError : "Loading the queue's details…";
+  }
+  if (storageProfileUnresolved()) {
+    return `The queue doesn't list the storage profile ${state.storageProfileCleared}, so it isn't used. Choose a storage profile, or None to upload every input file.`;
+  }
+  return null;
 }
 
 // What the job bundle is made from, whether it's submitted or saved.
@@ -887,7 +1151,9 @@ function bundleRequest() {
     }
     parameters[parameter.name] = value;
   }
-  for (const parameter of state.queue?.parameters ?? []) {
+  // Only the chosen queue's own parameters. queueEdits is cleared when the queue changes.
+  const queueParameters = queueDetailsLoaded() ? state.queue?.parameters ?? [] : [];
+  for (const parameter of queueParameters) {
     if (parameter.name in state.queueEdits || parameter.name in (plan?.queueValues ?? {})) {
       parameters[parameter.name] = queueParameterValue(parameter);
     }
@@ -928,8 +1194,10 @@ function bundleRequest() {
 // the plan, so a workflow edited since then (while the plan is debounced or still loading) would
 // be sent with another revision's files. Then the workflow is read again and this returns null.
 async function plannedWorkflow(): Promise<WorkflowBody | null> {
+  const tab = workflowTab();
   const body = await currentWorkflow();
-  if (state.plan && workflowKey(body) === state.planKey) {
+  // The same workflow in another tab has its own attachments, so it's planned again too.
+  if (state.plan && workflowKey(body) === state.planKey && tab === state.planTab) {
     return body;
   }
   toast("info", "The workflow changed since it was read. Check the job again, then submit.", 8000);
@@ -975,7 +1243,7 @@ export async function submit() {
       clientId: api.clientId,
       farmId: state.farmId,
       queueId: state.queueId,
-      storageProfileId: state.storageProfileId,
+      storageProfileId: shownStorageProfileId(),
       ...request,
     });
     // Events may already have updated the submission, or finished it and cleared it.
@@ -1005,12 +1273,15 @@ async function answerConfirmation(accept: boolean) {
   if (!submission?.confirm) {
     return;
   }
+  const { promptId } = submission.confirm;
   submission.confirm = null;
   refresh("submit");
   try {
+    // The prompt's own ID, so this answer can't answer a later prompt of the submission.
     await postJson("/deadline/jobs/confirm", {
       submissionId: submission.id,
       clientId: api.clientId,
+      promptId,
       accept,
     });
   } catch (error) {
@@ -1060,7 +1331,12 @@ export function listenForSubmissions() {
     if (!submission || detail.submissionId !== submission.id) {
       return;
     }
-    submission.confirm = { message: detail.message ?? "", default: detail.default };
+    // The answer echoes promptId, which the server checks is the prompt pending now.
+    submission.confirm = {
+      message: detail.message ?? "",
+      default: detail.default,
+      promptId: detail.promptId,
+    };
     refresh("submit");
     if (!views.size) {
       openDialog();
@@ -1069,7 +1345,11 @@ export function listenForSubmissions() {
   api.addEventListener<SubmissionEvent>("deadline.submitted", ({ detail }) => {
     const ours = detail.submissionId === state.submission?.id;
     if (detail.status === "SUBMITTED") {
-      toast("success", `Submitted ${detail.name} as ${detail.jobId}.`, 10000);
+      if (detail.warning) {
+        toast("warn", `Submitted ${detail.name} as ${detail.jobId}. ${detail.warning}`, 15000);
+      } else {
+        toast("success", `Submitted ${detail.name} as ${detail.jobId}.`, 10000);
+      }
       if (detail.jobId && detail.farmId && detail.queueId) {
         rememberJob({
           jobId: detail.jobId,
@@ -1084,7 +1364,11 @@ export function listenForSubmissions() {
     } else if (detail.status === "FAILED") {
       toast("error", `Couldn't submit ${detail.name}. ${detail.error ?? ""}`, 15000);
     } else if (detail.status === "CANCELED" && ours) {
-      toast("info", `Canceled submitting ${detail.name}.`);
+      toast(
+        detail.warning ? "warn" : "info",
+        `Canceled submitting ${detail.name}.${detail.warning ? ` ${detail.warning}` : ""}`,
+        detail.warning ? 15000 : undefined
+      );
     }
     if (ours) {
       state.submission = null;
@@ -1343,24 +1627,38 @@ function renderTarget() {
   }
   const farms = state.farms;
   const queues = state.queues;
-  const profiles = state.queue?.storageProfiles ?? [];
+  // Only the chosen queue's own profiles, once its details load.
+  const profiles = queueDetailsLoaded() ? state.queue?.storageProfiles ?? [] : [];
+  const profileOptions = profiles.map((profile) => [profile.storageProfileId, profile.displayName]);
+  // After a default profile was cleared, None has to be chosen like any profile, so the select
+  // starts on a placeholder rather than on None.
+  const profileSelect = storageProfileUnresolved()
+    ? select(
+        [[NO_STORAGE_PROFILE, "None"], ...profileOptions],
+        "",
+        chooseStorageProfile,
+        "Choose a storage profile"
+      )
+    : select(profileOptions, state.storageProfileId ?? "", chooseStorageProfile, "None");
   return h(
     "div",
     { className: "dl-grid" },
     state.cloudError ? h("div", { className: "dl-notice dl-error" }, state.cloudError) : null,
+    state.queueError
+      ? h(
+          "div",
+          { className: "dl-notice dl-error" },
+          state.queueError,
+          h("button", { className: "dl-link", onClick: () => loadQueue() }, "Try again")
+        )
+      : null,
     field(
       "Farm",
       farms
         ? select(
             farms.map((farm) => [farm.farmId, farm.displayName]),
             state.farmId,
-            async (value: string) => {
-              state.farmId = value;
-              state.queueId = "";
-              state.storageProfileId = "";
-              await loadQueues();
-              saveDefaults();
-            },
+            selectFarm,
             "Choose a farm"
           )
         : h("span", { className: "dl-muted" }, "Loading…"),
@@ -1373,12 +1671,7 @@ function renderTarget() {
             ? select(
                 queues.map((queue) => [queue.queueId, queue.displayName]),
                 state.queueId,
-                async (value: string) => {
-                  state.queueId = value;
-                  state.storageProfileId = "";
-                  await loadQueue();
-                  saveDefaults();
-                },
+                selectQueue,
                 "Choose a queue"
               )
             : h("span", { className: "dl-muted" }, "Loading…"),
@@ -1388,15 +1681,7 @@ function renderTarget() {
     profiles.length
       ? field(
           "Storage profile",
-          select(
-            profiles.map((profile) => [profile.storageProfileId, profile.displayName]),
-            state.storageProfileId,
-            (value: string) => {
-              state.storageProfileId = value;
-              saveDefaults();
-            },
-            "None"
-          ),
+          profileSelect,
           "Tells Deadline Cloud which of your paths are on shared storage, so they aren't uploaded."
         )
       : null
@@ -1408,6 +1693,10 @@ function renderStatus() {
   const children: Children[] = [];
   if (state.planError) {
     children.push(h("div", { className: "dl-notice dl-error" }, state.planError));
+  }
+  const limitError = plan ? taskLimitError() : null;
+  if (limitError) {
+    children.push(h("div", { className: "dl-notice dl-error" }, limitError));
   }
   if (plan) {
     // A workflow split into tasks says how many it runs.
@@ -1444,7 +1733,7 @@ function renderStatus() {
     }
     const largePacks = attachesNodes()
       ? (plan.localNodes ?? []).filter(
-          (pack) => isLargePack(pack) && !state.removedAttachments.has(pack.path)
+          (pack) => isLargePack(pack) && !attachmentEdits().removed.has(pack.path)
         )
       : [];
     for (const pack of largePacks) {
@@ -1645,7 +1934,7 @@ function renderParameters() {
           parameterControl(parameter, parameterValue(parameter), (value: string) => {
             state.edits[parameter.name] = value;
             if (parameter.name === ATTACH_NODES_PARAMETER) {
-              refresh("status", "attachments");
+              refresh("status", "attachments", "submit");
             }
           }),
           parameter.description
@@ -1656,7 +1945,8 @@ function renderParameters() {
 }
 
 function renderQueueParameters() {
-  const parameters = (state.queue?.parameters ?? []).filter(
+  const loaded = queueDetailsLoaded() ? state.queue?.parameters ?? [] : [];
+  const parameters = loaded.filter(
     (parameter) => parameter.userInterface?.control !== "HIDDEN"
   );
   if (!parameters.length) {
@@ -2162,8 +2452,9 @@ function renderJobSettings() {
 }
 
 function excludedModels(): string[] {
+  const { removed } = attachmentEdits();
   return (state.plan?.localModels ?? [])
-    .filter((model) => state.removedAttachments.has(model.path))
+    .filter((model) => removed.has(model.path))
     .map((model) => model.id);
 }
 
@@ -2203,9 +2494,110 @@ function isLargePack(pack: LocalNode): boolean {
 
 // The custom node packs the artist removed. With Attach Custom Nodes off, none are attached.
 function excludedNodes(): string[] {
+  const { removed } = attachmentEdits();
   return (state.plan?.localNodes ?? [])
-    .filter((pack) => state.removedAttachments.has(pack.path))
+    .filter((pack) => removed.has(pack.path))
     .map((pack) => pack.name);
+}
+
+// The custom node packs the job attaches.
+function attachedNodes(): LocalNode[] {
+  const { removed } = attachmentEdits();
+  return attachesNodes() ? (state.plan?.localNodes ?? []).filter((pack) => !removed.has(pack.path)) : [];
+}
+
+// "3 files", "1 folder" and so on, joined as "3 files, 1 folder and 2 models".
+function listText(parts: string[]): string {
+  return parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}` : parts[0] ?? "";
+}
+
+// How many added paths the summary names before it says how many more there are.
+const SUMMARY_PATHS = 5;
+
+// A number of files, such as 5,000 files.
+function fileCount(count: number): string {
+  return `${count.toLocaleString("en-US")} file${count === 1 ? "" : "s"}`;
+}
+
+// "1 folder (5,000 files)" for the folder loaders' folders that attach files, and with whole
+// folders the artist added, "3 folders (5,000 files in 1 of them)".
+function foldersText(groups: number, groupedFiles: number, directories: number): string | null {
+  const folders = groups + directories;
+  if (!groups) {
+    return folders ? plural(folders, "folder") : null;
+  }
+  const within = directories ? ` in ${groups} of them` : "";
+  return `${plural(folders, "folder")} (${fileCount(groupedFiles)}${within})`;
+}
+
+// What the job attaches: the planned input files less those removed, plus those added, and the
+// models and custom node packs. A folder loader's folder counts as one folder of the files it
+// attaches. Both views show it next to Submit, so the artist sees what this workflow's job
+// uploads, including what they added, wherever they submit from.
+export function attachmentSummary(): string | null {
+  if (!state.plan) {
+    return null;
+  }
+  const { filenames, directories } = attachments();
+  const attached = new Set(filenames);
+  const folders = plannedFolders();
+  const inFolders = new Set(folders.flatMap((folder) => folder.files));
+  const groups = folders.filter((folder) => folder.files.some((path) => attached.has(path))).length;
+  const groupedFiles = filenames.filter((path) => inFolders.has(path)).length;
+  const models = (state.plan.localModels ?? []).length - excludedModels().length;
+  const packs = attachedNodes().length;
+  const files = filenames.length - groupedFiles;
+  const parts = [
+    files ? plural(files, "file") : null,
+    foldersText(groups, groupedFiles, directories.length),
+    models ? plural(models, "model") : null,
+    packs ? plural(packs, "custom node pack") : null,
+  ].filter((part): part is string => part !== null);
+  // The paths the artist added that the workflow doesn't load, and so only go because of them.
+  const listed = state.plan.attachments ?? { filenames: [], directories: [] };
+  const planned = new Set([...listed.filenames, ...inFolders, ...listed.directories]);
+  const { added, removed } = attachmentEdits();
+  const extra = [...new Set([...added.filenames, ...added.directories])].filter(
+    (path) => !removed.has(path) && !planned.has(path)
+  );
+  const more = extra.length > SUMMARY_PATHS ? `, and ${extra.length - SUMMARY_PATHS} more` : "";
+  const shown = extra.length
+    ? ` You added ${extra.slice(0, SUMMARY_PATHS).join(", ")}${more}.`
+    : "";
+  return `${parts.length ? `Attaches ${listText(parts)}.` : "Attaches no files."}${shown}`;
+}
+
+// Adds files or a folder with a file dialog, which opens on the ComfyUI machine, whose files the
+// job attaches. A dialog that's still open when another workflow opens adds nothing: its files
+// were chosen for the workflow before.
+export async function chooseAttachments(kind: string, key: keyof PathLists) {
+  const generation = workflowGeneration;
+  const tab = state.planTab;
+  let paths: string[];
+  try {
+    ({ paths } = await postJson<{ paths: string[] }>("/deadline/choose", { kind }));
+  } catch (error) {
+    toast("error", messageOf(error), 8000);
+    return;
+  }
+  if (generation !== workflowGeneration || tab === null || state.planTab !== tab) {
+    if (paths.length) {
+      toast(
+        "warn",
+        "The workflow changed while the file dialog was open, so the files you chose weren't added. Add them again.",
+        10000
+      );
+    }
+    return;
+  }
+  const edits = attachmentEdits();
+  for (const path of paths) {
+    if (!edits.added[key].includes(path)) {
+      edits.added[key].push(path);
+    }
+    edits.removed.delete(path);
+  }
+  refresh("attachments", "submit");
 }
 
 function attachmentItem(
@@ -2213,12 +2605,15 @@ function attachmentItem(
   path: string,
   prefix: string | null,
   onRemove: () => void,
-  onRestore: () => void
+  onRestore: () => void,
+  // A file listed under its folder.
+  nested = false
 ) {
-  const removed = state.removedAttachments.has(path);
+  const removed = attachmentEdits().removed.has(path);
+  const className = [nested ? "dl-nested" : null, removed ? "dl-removed" : null].filter(Boolean);
   return h(
     "li",
-    { title: path, className: removed ? "dl-removed" : null },
+    { title: path, className: className.join(" ") || null },
     prefix ? h("span", { className: "dl-muted" }, prefix) : null,
     h("span", { className: "dl-path" }, text),
     removed
@@ -2227,13 +2622,60 @@ function attachmentItem(
   );
 }
 
+// A folder loader's folder as one row, which opens to list its files. Its ✕ removes every file
+// in it, and Add back restores them all.
+function folderItem(
+  folder: FolderFiles,
+  open: boolean,
+  onToggle: () => void,
+  onRemove: () => void,
+  onRestore: () => void
+) {
+  const { removed } = attachmentEdits();
+  const attached = folder.files.filter((path) => !removed.has(path)).length;
+  // A removed folder is struck through, like a removed file. One that's partly removed says how
+  // many of its files are attached.
+  const total = fileCount(folder.files.length);
+  const partly = attached > 0 && attached < folder.files.length;
+  const count = partly ? `${attached.toLocaleString("en-US")} of ${total}` : total;
+  return h(
+    "li",
+    { title: folder.path, className: attached ? "dl-folder" : "dl-folder dl-removed" },
+    h(
+      "button",
+      {
+        className: "dl-link dl-folder-toggle",
+        "aria-expanded": open ? "true" : "false",
+        onClick: onToggle,
+      },
+      h("span", { className: "dl-muted" }, open ? "▾ " : "▸ "),
+      h("span", { className: "dl-path" }, `${folder.path} (${count})`)
+    ),
+    attached
+      ? h("button", { className: "dl-link", title: "Don't attach the folder", onClick: onRemove }, "✕")
+      : h("button", { className: "dl-link", onClick: onRestore }, "Add back")
+  );
+}
+
+// A file's path in its folder, such as sub/a.png for /input/cats/sub/a.png in /input/cats.
+function pathInFolder(path: string, folder: string): string {
+  const separator = path.charAt(folder.length);
+  return path.startsWith(folder) && (separator === "/" || separator === "\\")
+    ? path.slice(folder.length + 1)
+    : path;
+}
+
 function renderAttachments() {
   if (!state.plan) {
     return null;
   }
   // The files the workflow loads stay listed after you remove them, so you can add them back.
   const planned = state.plan.attachments ?? { filenames: [], directories: [] };
-  const added = state.addedAttachments;
+  // A folder loader's files are listed under their folder, which shows as one row until opened.
+  const folders = plannedFolders();
+  const inFolders = new Set(folders.flatMap((folder) => folder.files));
+  // This workflow's own changes. Another workflow tab has its own.
+  const { added, removed } = attachmentEdits();
   interface Row {
     path: string;
     kind: "file" | "folder";
@@ -2250,7 +2692,7 @@ function renderAttachments() {
   ];
   for (const [paths, kind, manual] of lists) {
     for (const path of paths) {
-      if (!rows.has(path)) {
+      if (!rows.has(path) && !(kind === "file" && inFolders.has(path))) {
         rows.set(path, { path, kind, manual, key: kind === "file" ? "filenames" : "directories" });
       }
     }
@@ -2258,48 +2700,77 @@ function renderAttachments() {
   const localModels = state.plan.localModels ?? [];
   const localNodes = attachesNodes() ? state.plan.localNodes ?? [] : [];
   const attachedCount =
-    [...rows.keys()].filter((path) => !state.removedAttachments.has(path)).length +
+    [...rows.keys()].filter((path) => !removed.has(path)).length +
+    folders.filter((folder) => folder.files.some((path) => !removed.has(path))).length +
     localModels.length -
     excludedModels().length +
-    localNodes.filter((pack) => !state.removedAttachments.has(pack.path)).length;
+    attachedNodes().length;
+  // Each change re-renders Submit too, whose summary lists what the job attaches.
   const remove = (row: Row) => () => {
     if (row.manual) {
       added[row.key] = added[row.key].filter((path) => path !== row.path);
     } else {
-      state.removedAttachments.add(row.path);
+      removed.add(row.path);
     }
-    refresh("attachments");
+    refresh("attachments", "submit");
   };
   const restore = (row: Row) => () => {
-    state.removedAttachments.delete(row.path);
-    refresh("attachments");
+    removed.delete(row.path);
+    refresh("attachments", "submit");
   };
-  // Removing a model or a custom node pack can make the job fail. The status warns about it.
-  const toggleFound = (found: { path: string }, removed: boolean) => () => {
-    if (removed) {
-      state.removedAttachments.add(found.path);
-    } else {
-      state.removedAttachments.delete(found.path);
-    }
-    refresh("status", "attachments");
-  };
-  // The dialog opens on the ComfyUI machine, whose files the job attaches.
-  const add = (kind: string, key: keyof PathLists) => async () => {
-    let paths: string[];
-    try {
-      ({ paths } = await postJson<{ paths: string[] }>("/deadline/choose", { kind }));
-    } catch (error) {
-      toast("error", messageOf(error), 8000);
-      return;
-    }
-    for (const path of paths) {
-      if (!state.addedAttachments[key].includes(path)) {
-        state.addedAttachments[key].push(path);
+  // A folder's ✕ and Add back change every file in it.
+  const changeFolder = (folder: FolderFiles, remove: boolean) => () => {
+    for (const path of folder.files) {
+      if (remove) {
+        removed.add(path);
+      } else {
+        removed.delete(path);
       }
-      state.removedAttachments.delete(path);
+    }
+    refresh("attachments", "submit");
+  };
+  const toggleFolder = (folder: FolderFiles) => () => {
+    if (!state.openFolders.delete(folder.path)) {
+      state.openFolders.add(folder.path);
     }
     refresh("attachments");
   };
+  const rowItem = (row: Row) =>
+    attachmentItem(row.path, row.path, row.kind === "folder" ? "▸ " : "", remove(row), restore(row));
+  // A folder's row, and its files only while it's open, so a folder of thousands of files is one
+  // row until the artist opens it.
+  const folderItems = (folder: FolderFiles) => {
+    const open = state.openFolders.has(folder.path);
+    const row = folderItem(
+      folder,
+      open,
+      toggleFolder(folder),
+      changeFolder(folder, true),
+      changeFolder(folder, false)
+    );
+    if (!open) {
+      return [row];
+    }
+    const files = folder.files.map((path) => {
+      const file: Row = { path, kind: "file", manual: false, key: "filenames" };
+      const text = pathInFolder(path, folder.path);
+      return attachmentItem(text, path, null, remove(file), restore(file), true);
+    });
+    return [row, ...files];
+  };
+  // The workflow's own files, then its folders, then the paths the artist added.
+  const rowList = [...rows.values()];
+  const plannedFiles = rowList.filter((row) => row.kind === "file" && !row.manual).length;
+  // Removing a model or a custom node pack can make the job fail. The status warns about it.
+  const toggleFound = (found: { path: string }, remove: boolean) => () => {
+    if (remove) {
+      removed.add(found.path);
+    } else {
+      removed.delete(found.path);
+    }
+    refresh("status", "attachments", "submit");
+  };
+  const add = (kind: string, key: keyof PathLists) => () => chooseAttachments(kind, key);
   return section(
     `Attachments (${attachedCount})`,
     false,
@@ -2344,19 +2815,13 @@ function renderAttachments() {
           ),
         ]
       : null,
-    rows.size
+    rows.size || folders.length
       ? h(
           "ul",
           { className: "dl-files", "data-dl-scroll": "inputs" },
-          [...rows.values()].map((row) =>
-            attachmentItem(
-              row.path,
-              row.path,
-              row.kind === "folder" ? "▸ " : "",
-              remove(row),
-              restore(row)
-            )
-          )
+          rowList.slice(0, plannedFiles).map(rowItem),
+          folders.map(folderItems),
+          rowList.slice(plannedFiles).map(rowItem)
         )
       : h("div", { className: "dl-muted" }, "The workflow loads no input files."),
     h(
@@ -2402,10 +2867,18 @@ function renderSubmit() {
     );
   }
   const count = currentTaskCount();
+  const blocker = submitBlocker();
+  const summary = attachmentSummary();
   return h(
-    "button",
-    { className: "dl-button dl-primary dl-wide", disabled: !canSubmit(), onClick: submit },
-    state.plan?.sources?.length && splitsTasks() && count ? `Submit ${plural(count, "task")}` : "Submit"
+    "div",
+    { className: "dl-submit" },
+    summary ? h("div", { className: "dl-muted dl-message", "data-role": "attachment-summary" }, summary) : null,
+    h(
+      "button",
+      { className: "dl-button dl-primary dl-wide", disabled: !canSubmit(), onClick: submit },
+      state.plan?.sources?.length && splitsTasks() && count ? `Submit ${plural(count, "task")}` : "Submit"
+    ),
+    blocker ? h("div", { className: "dl-muted dl-message", "data-role": "submit-blocker" }, blocker) : null
   );
 }
 
@@ -2605,6 +3078,21 @@ function createView(container: HTMLElement, sections: SectionName[]): View {
 // ---------------------------------------------------------------------------------------------
 // The sidebar panel and the dialog
 
+const PANEL_SECTIONS: SectionName[] = [
+  "account",
+  "target",
+  "status",
+  "tasks",
+  "jobSettings",
+  "parameters",
+  "queueParameters",
+  "hostRequirements",
+  "attachments",
+  "jobs",
+  // Last, and stuck to the bottom, with the summary of what the job attaches.
+  "submit",
+];
+
 export function renderPanel(element: HTMLElement): () => void {
   injectStyles();
   element.replaceChildren();
@@ -2622,20 +3110,7 @@ export function renderPanel(element: HTMLElement): () => void {
     )
   );
   element.append(root);
-  const view = createView(root, [
-    "account",
-    "target",
-    "status",
-    "tasks",
-    "jobSettings",
-    "parameters",
-    "queueParameters",
-    "hostRequirements",
-    "attachments",
-    "jobs",
-    // Last, and stuck to the bottom.
-    "submit",
-  ]);
+  const view = createView(root, PANEL_SECTIONS);
   loadAccount();
   loadPlan();
   pollJobs();
@@ -2645,6 +3120,17 @@ export function renderPanel(element: HTMLElement): () => void {
 }
 
 let dialog: { overlay: HTMLElement; view: View | null } | null = null;
+
+// The dialog lists the attachments too, so the artist sees every file the job uploads before
+// Submit, wherever they submit from.
+const DIALOG_SECTIONS: SectionName[] = [
+  "account",
+  "target",
+  "status",
+  "tasks",
+  "attachments",
+  "submit",
+];
 
 export function openDialog() {
   injectStyles();
@@ -2708,7 +3194,7 @@ export function openDialog() {
   document.body.append(overlay);
   document.addEventListener("keydown", onKey);
   dialog = { overlay, view: null };
-  dialog.view = createView(body, ["account", "target", "status", "tasks", "submit"]);
+  dialog.view = createView(body, DIALOG_SECTIONS);
   loadAccount();
   loadPlan();
 }
@@ -2797,10 +3283,13 @@ textarea.dl-input { resize: vertical; }
 .dl-files li { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
 .dl-removed .dl-path { text-decoration: line-through; color: var(--dl-muted); }
 .dl-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.dl-folder-toggle { display: flex; align-items: center; gap: 4px; flex: 1; min-width: 0; padding: 0;
+  color: inherit; text-align: left; }
+.dl-files li.dl-nested { padding-left: 16px; }
 .dl-jobs li { border-bottom: 1px solid var(--dl-border); padding-bottom: 4px; }
 .dl-destination { font-size: 12px; }
 .dl-jobs .dl-row { justify-content: space-between; font-size: 12px; }
-.dl-progress { display: flex; flex-direction: column; gap: 6px; }
+.dl-progress, .dl-submit { display: flex; flex-direction: column; gap: 6px; }
 .dl-progress progress { width: 100%; }
 .dl-message { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 200px; overflow-y: auto; }
 .dl-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5); z-index: 2000;
