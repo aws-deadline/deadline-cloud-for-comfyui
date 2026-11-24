@@ -232,6 +232,9 @@ the image's EXIF rotation and loads every frame of an animated image, unlike the
 In the panel, narrow a field to run only some of its items, such as `2,3`, or set it to `0` to run
 that list whole in each task while the other lists split. A step can have at most
 16 task parameters. Lists past the first 16 run whole in one task, and the panel warns about them.
+A job can run at most 10,000 tasks, every combination of its lists' items, and a workflow's lists
+and folders past the first 256 always run whole. Folder images are sent as paths in the input
+directory, and the worker refuses any other path.
 The number in a label such as **Create List #64** is the node's ID, which ComfyUI shows with
 **Settings > Lite Graph > Node ID badge**. Lists that a workflow builds while it runs, such as
 Rebatch Images, always run whole in one task, because Deadline Cloud sets a job's tasks when you

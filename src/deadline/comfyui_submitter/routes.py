@@ -47,6 +47,7 @@ from .submit import (
     check_cli_version,
     check_item_range,
     check_parameter_values,
+    check_task_count,
     create_job_bundle,
     host_requirements,
     input_folders,
@@ -66,6 +67,7 @@ from .submit import (
     template_host_requirements,
     template_supports_task_lists,
     validate_api_workflow,
+    without_submitter_meta,
     workflow_models,
     write_private_text,
 )
@@ -485,7 +487,9 @@ def _prepare(
         }
         items = plan_task_lists(workflow, input_dir, reserved)
     prepared = _Prepared(
-        workflow=items.workflow if items else workflow,
+        # Without task lists, the submitter's own _meta keys are still removed, so a studio
+        # template's task script can't follow ones that a shared workflow brought along.
+        workflow=items.workflow if items else without_submitter_meta(workflow),
         items=items,
         conda_channels=resolve_conda_channels(config),
     )
@@ -1052,8 +1056,6 @@ async def _build_bundle(
         parameters.pop(source.parameter, None)
     if items:
         prepared.warnings = [*items.warnings, *prepared.warnings]
-    for source in sources or []:
-        check_item_range(source, parameters.get(source.parameter, source.range))
     defined = {
         parameter.get("name")
         for parameter in read_job_template(template, sources).get("parameterDefinitions", [])
@@ -1061,11 +1063,21 @@ async def _build_bundle(
     # A list's field from an older plan, such as before the list was renamed, before anything is
     # staged. Queue parameters aren't in the template, but don't end in "Items".
     stale = sorted(name for name in parameters if name.endswith("Items") and name not in defined)
-    if split and stale:
+    # The panel sends every list it showed. One it didn't, such as a folder that has more than
+    # one image since it was read, would multiply the job past the tasks the panel counted.
+    missing = [source.parameter for source in sources or [] if source.parameter not in parameters]
+    changed = stale if split and stale else missing
+    if changed:
         raise SubmitError(
-            f"The workflow's lists changed since it was read ({', '.join(stale)}). Read the "
+            f"The workflow's lists changed since it was read ({', '.join(changed)}). Read the "
             "workflow again, then choose their items."
         )
+    counts = []
+    for source in sources or []:
+        # The checked range, without spaces, is what's submitted.
+        parameters[source.parameter], count = check_item_range(source, parameters[source.parameter])
+        counts.append(count)
+    check_task_count(counts)
     bundle_dir, workflow_path = create_job_bundle(
         template,
         prepared.workflow,

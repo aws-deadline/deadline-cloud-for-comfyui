@@ -295,6 +295,18 @@ def test_bool_parameters_are_read_as_openjd_reads_them(run_scenario):
     assert run_scenario("parse-bool")["values"] == [True] * 6 + [False] * 6 + [None] * 5
 
 
+def test_the_panel_has_the_submitters_task_limit(run_scenario):
+    from deadline.comfyui_submitter import submit
+
+    result = run_scenario("task-limit")
+    assert result == {
+        "maxTasks": submit.MAX_TASKS,
+        # 100 × 101 tasks is over the limit, and 100 × 100 is the limit.
+        "canSubmitOverLimit": False,
+        "canSubmitAtLimit": True,
+    }
+
+
 def test_the_dialog_lists_the_attachments_before_submit(run_scenario):
     # The Deadline button opens the dialog, which must show every file the job uploads.
     sections = run_scenario("dialog-sections")["sections"]

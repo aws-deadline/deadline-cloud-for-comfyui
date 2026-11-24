@@ -2710,7 +2710,8 @@ def test_jobs_runs_list_items_as_tasks(comfy, monkeypatch):
         },
     }
     requests = fake_tools(monkeypatch, comfy.tmp_path)
-    _, body = run(post(comfy, {"workflow": workflow, "splitTasks": True}))
+    split = {"workflow": workflow, "splitTasks": True, "parameters": {"List10Items": "1-2"}}
+    _, body = run(post(comfy, split))
     assert _task_parameters(Path(body["job_bundle"])) == ["List10"]
     assert "List10" not in sent_parameters(requests)
 
@@ -2727,7 +2728,8 @@ def test_jobs_runs_lists_of_different_lengths_as_separate_task_parameters(comfy,
         "11": {"class_type": "CreateList", "inputs": {"input0": ["1", 0], "input1": ["2", 0]}},
     }
     fake_tools(monkeypatch, comfy.tmp_path)
-    _, body = run(post(comfy, {"workflow": workflow, "splitTasks": True}))
+    ranges = {"List10Items": "1-3", "List11Items": "1-2"}
+    _, body = run(post(comfy, {"workflow": workflow, "splitTasks": True, "parameters": ranges}))
     assert _task_parameters(Path(body["job_bundle"])) == ["List10", "List11"]
     assert not any("different numbers of items" in warning for warning in body["warnings"])
 
@@ -2761,7 +2763,8 @@ def test_jobs_run_as_one_task_unless_the_lists_are_split(comfy, monkeypatch):
         _, response = run(post(comfy, body))
         template = Path(response["job_bundle"]) / "template.yaml"
         assert template.read_text() == submit.JOB_TEMPLATE.read_text()
-    _, body = run(post(comfy, {"workflow": workflow, "splitTasks": True}))
+    split = {"workflow": workflow, "splitTasks": True, "parameters": {"List10Items": "1-2"}}
+    _, body = run(post(comfy, split))
     assert _task_parameters(Path(body["job_bundle"])) == ["List10"]
     status, body = run(post(comfy, {"workflow": workflow, "splitTasks": "no"}))
     assert (status, body["error"]) == (400, "splitTasks must be true or false.")
@@ -2781,7 +2784,10 @@ def test_task_warnings_only_apply_to_multiple_tasks(comfy, monkeypatch):
     assert task_warning not in plan["warnings"]
     _, one = run(post(comfy, {"workflow": workflow}))
     assert task_warning not in one["warnings"]
-    _, split = run(post(comfy, {"workflow": workflow, "splitTasks": True}))
+    # The panel sends a range for each list it splits: one item each keeps the job small.
+    ranges = {f"List{100 + i}Items": "1" for i in range(submit.MAX_ITEM_SOURCES)}
+    body = {"workflow": workflow, "splitTasks": True, "parameters": ranges}
+    _, split = run(post(comfy, body))
     assert task_warning in split["warnings"]
 
 
@@ -2865,6 +2871,76 @@ def test_templates_with_their_own_task_parameters_run_lists_whole(comfy, monkeyp
     space = template["steps"][0]["parameterSpace"]
     assert [parameter["name"] for parameter in space["taskParameterDefinitions"]] == ["Frame"]
     assert "List10Items" not in sent_parameters(requests)
+
+
+def test_templates_with_their_own_task_parameters_drop_the_workflows_submitter_keys(
+    comfy, monkeypatch
+):
+    """A studio task script can follow the keys, so a shared workflow's own are removed."""
+    _studio_step_with_task_parameters(comfy, monkeypatch)
+    fake_tools(monkeypatch, comfy.tmp_path)
+    workflow = {
+        **WORKFLOW,
+        "10": {
+            "class_type": "LoadImageDataSetFromFolder",
+            "inputs": {"folder": "cats"},
+            "_meta": {"title": "Cats", "deadline_files": ["/etc/passwd"], "deadline_item": "X"},
+        },
+    }
+    status, body = run(post(comfy, {"workflow": workflow}))
+    assert status == 202, body
+    sent = json.loads(Path(body["workflow_file"]).read_text())
+    assert sent["10"]["_meta"] == {"title": "Cats"}
+
+
+def _two_lists(first: int, second: int) -> dict:
+    return {
+        **WORKFLOW,
+        "10": {"class_type": "CreateList", "inputs": {f"input{i}": i for i in range(first)}},
+        "11": {"class_type": "CreateList", "inputs": {f"input{i}": i for i in range(second)}},
+    }
+
+
+def test_jobs_refuse_more_tasks_than_the_limit(comfy, monkeypatch):
+    """Every combination of the lists is a task, so the ranges multiply."""
+    monkeypatch.setattr(submit, "MAX_TASKS", 10)
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    ranges = {"List10Items": "1-3", "List11Items": "1-4"}
+    body = {"workflow": _two_lists(3, 4), "splitTasks": True, "parameters": ranges}
+    status, response = run(post(comfy, body))
+    assert status == 400
+    assert response["error"].startswith("The job would run 12 tasks")
+    assert not requests.exists()
+    # Running a list whole counts as one item.
+    body["parameters"] = {"List10Items": "1-3", "List11Items": "0"}
+    status, _ = run(post(comfy, body))
+    assert status == 202
+
+
+def test_jobs_refuse_a_list_the_panel_didnt_show(comfy, monkeypatch):
+    """A list without a range, such as a folder that gained an image, would run every item."""
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    body = {
+        "workflow": _two_lists(2, 3),
+        "splitTasks": True,
+        "parameters": {"List10Items": "1-2"},
+    }
+    status, response = run(post(comfy, body))
+    assert status == 400
+    assert response["error"].startswith(
+        "The workflow's lists changed since it was read (List11Items)."
+    )
+    assert not requests.exists()
+
+
+def test_jobs_submit_the_checked_range(comfy, monkeypatch):
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    ranges = {"List10Items": " 1 - 2 ", "List11Items": "3, 1"}
+    body = {"workflow": _two_lists(2, 3), "splitTasks": True, "parameters": ranges}
+    status, _ = run(post(comfy, body))
+    assert status == 202
+    sent = sent_parameters(requests)
+    assert (sent["List10Items"], sent["List11Items"]) == ("1-2", "3,1")
 
 
 def test_templates_with_their_own_task_parameters_dont_warn_without_lists(comfy, monkeypatch):

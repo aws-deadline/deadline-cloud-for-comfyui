@@ -11,7 +11,7 @@ import os
 import re
 import shutil
 import sys
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -321,6 +321,14 @@ ITEM_META = "deadline_item"
 FILES_META = "deadline_files"
 # OpenJD allows 16 task parameters in a step.
 MAX_ITEM_SOURCES = 16
+# The most lists and folders a workflow's plan considers. Later ones run whole in each task. It
+# keeps planning a workflow with thousands of list nodes quick.
+MAX_PLANNED_SOURCES = 256
+# The most tasks a job can run: every combination of its lists' items. The panel has the same
+# limit.
+MAX_TASKS = 10_000
+# The longest range of a list's items, which is also the job parameter's maxLength.
+MAX_ITEM_RANGE_LENGTH = 1024
 # The line that marks the task script that selects each task's items, which it reads from its
 # NAME=NUMBER arguments. A job template without it runs whole lists.
 ITEMS_PLACEHOLDER = "ITEMS = {}"
@@ -427,16 +435,24 @@ MAX_SOURCE_NAME = 64 - len("Items")
 _ITEM_RANGE_PART = re.compile(r"(\d{1,9})(?:\s*-\s*(\d{1,9})(?:\s*:\s*(\d{1,9}))?)?", re.ASCII)
 
 
-def check_item_range(source: ItemSource, value: Any) -> None:
+def check_item_range(source: ItemSource, value: Any) -> tuple[str, int]:
     """
     Checks the range of a list's items to run, as OpenJD and the task script take it: "0" on its
     own, or item numbers from 1 to the list's count, in parts that don't overlap. The panel checks
-    it against the plan it made, so this catches a list that changed since. Raises SubmitError.
+    it against the plan it made, so this catches a list that changed since. Returns the range as
+    it's submitted, without spaces, and how many items it runs, which is 1 for "0". Raises
+    SubmitError.
     """
     text = str(value).strip()
     if text == "0":
-        return
+        return "0", 1
+    if len(text) > MAX_ITEM_RANGE_LENGTH:
+        raise SubmitError(
+            f"{source.title}: a range of items can be at most {MAX_ITEM_RANGE_LENGTH} characters."
+        )
     spans: list[tuple[int, int]] = []
+    parts: list[str] = []
+    count = 0
     for part in text.split(","):
         match = _ITEM_RANGE_PART.fullmatch(part.strip())
         if match:
@@ -446,6 +462,10 @@ def check_item_range(source: ItemSource, value: Any) -> None:
                 f"{source.title}: use item numbers such as 1-{source.count} or 2,3, not {text!r}."
             )
         spans.append((start, start + (end - start) // step * step))
+        count += (end - start) // step + 1
+        parts.append(
+            str(start) if end == start else f"{start}-{end}" + (f":{step}" if step > 1 else "")
+        )
     spans.sort()
     if any(spans[i][1] >= spans[i + 1][0] for i in range(len(spans) - 1)):
         raise SubmitError(f"{source.title}: {text!r} lists an item more than once.")
@@ -454,6 +474,36 @@ def check_item_range(source: ItemSource, value: Any) -> None:
             f"{source.title} has {source.count} items, so it can't run {text!r}. Read the "
             "workflow again, then choose its items."
         )
+    return ",".join(parts), count
+
+
+def check_task_count(counts: Iterable[int]) -> int:
+    """
+    The number of tasks that the lists' item counts make, since tasks run every combination of
+    them. Raises SubmitError when it's over MAX_TASKS.
+    """
+    total = math.prod(counts)
+    if total > MAX_TASKS:
+        raise SubmitError(
+            f"The job would run {total:,} tasks, every combination of its lists' items, which is "
+            f"over the limit of {MAX_TASKS:,}. Choose fewer items, or run a list whole with 0."
+        )
+    return total
+
+
+def without_submitter_meta(workflow: dict[str, Any]) -> dict[str, Any]:
+    """
+    A copy of an API workflow without the _meta keys that the submitter writes for the task
+    script. A shared workflow's own could make the task script follow a list, or load files, that
+    the panel never showed.
+    """
+    workflow = copy.deepcopy(workflow)
+    for node in workflow.values():
+        meta = node.get("_meta") if isinstance(node, dict) else None
+        if isinstance(meta, dict):
+            for key in [key for key in meta if str(key).startswith(_SUBMITTER_META_PREFIX)]:
+                del meta[key]
+    return workflow
 
 
 @dataclass
@@ -503,17 +553,24 @@ def _source_name(kind: str, node_id: str, node: dict[str, Any]) -> str:
     return name or (kind.capitalize() + re.sub(r"[^A-Za-z0-9_]", "_", node_id))[:MAX_SOURCE_NAME]
 
 
-def _connection_title(node_id: str, workflow: dict[str, Any]) -> str | None:
+def _consumers(workflow: dict[str, Any]) -> dict[str, list[tuple[dict[str, Any], str]]]:
+    """
+    Each node's consumers: the (node, input name) pairs that its outputs connect to. It's built
+    once for the workflow, so naming every list doesn't read the whole workflow again for each.
+    """
+    consumers: dict[str, list[tuple[dict[str, Any], str]]] = {}
+    for other in workflow.values():
+        for key, value in (other.get("inputs") or {}).items():
+            if isinstance(value, list) and len(value) == 2 and isinstance(value[1], int):
+                consumers.setdefault(str(value[0]), []).append((other, key))
+    return consumers
+
+
+def _connection_title(
+    node_id: str, consumers: Mapping[str, list[tuple[dict[str, Any], str]]]
+) -> str | None:
     """What a node's output connects to, such as "Image Scale · width" or "Image Scale · width +1"."""
-    connections = [
-        (other, key)
-        for other in workflow.values()
-        for key, value in (other.get("inputs") or {}).items()
-        if isinstance(value, list)
-        and len(value) == 2
-        and isinstance(value[1], int)
-        and str(value[0]) == str(node_id)
-    ]
+    connections = consumers.get(str(node_id), [])
     if not connections:
         return None
     other, key = connections[0]
@@ -548,7 +605,11 @@ def _list_items(inputs: dict[str, Any], workflow: dict[str, Any]) -> list[str]:
     return items
 
 
-def _source_title(source: ItemSource, workflow: dict[str, Any]) -> str:
+def _source_title(
+    source: ItemSource,
+    workflow: dict[str, Any],
+    consumers: Mapping[str, list[tuple[dict[str, Any], str]]],
+) -> str:
     """
     Names a source for the panel by what it changes: its node's given title or what its output
     connects to, and otherwise its label. A folder's label names the folder.
@@ -557,7 +618,13 @@ def _source_title(source: ItemSource, workflow: dict[str, Any]) -> str:
     renamed = _renamed_title(node)
     if renamed or source.kind == "folder":
         return renamed or source.label
-    return _connection_title(source.node_id, workflow) or source.label
+    return _connection_title(source.node_id, consumers) or source.label
+
+
+def _some(labels: list[str], shown: int = 5) -> str:
+    """The first few labels, and how many more there are."""
+    more = f", and {len(labels) - shown} more" if len(labels) > shown else ""
+    return ", ".join(labels[:shown]) + more
 
 
 def plan_task_lists(
@@ -569,20 +636,25 @@ def plan_task_lists(
     items, and tasks run every combination of them. reserved lists the job template's parameter
     names, which the lists' job parameters steer clear of.
     """
-    workflow = copy.deepcopy(api_workflow)
+    # The task script follows the submitter's _meta keys, so a shared workflow's own could make a
+    # node follow another list's items, or load files the panel never showed.
+    workflow = without_submitter_meta(api_workflow)
     plan = TaskLists(workflow)
+    consumers = _consumers(workflow)
+    base = Path(os.path.abspath(input_dir)) if input_dir else None
+    unplanned = 0
     for node_id, node in workflow.items():
         class_type = node.get("class_type")
         inputs = node.get("inputs", {})
         meta = node.get("_meta")
         if not isinstance(meta, dict):
             meta = node["_meta"] = {}
-        # The task script follows these keys, so a shared workflow's own could make a node follow
-        # another list's items, or load files the panel never showed.
-        for key in [key for key in meta if str(key).startswith(_SUBMITTER_META_PREFIX)]:
-            del meta[key]
         source: ItemSource | None = None
-        if class_type == "CreateList":
+        if class_type in ("CreateList", *FOLDER_LOADERS) and (
+            len(plan.sources) >= MAX_PLANNED_SOURCES
+        ):
+            unplanned += 1
+        elif class_type == "CreateList":
             values = _list_items(inputs, workflow)
             if len(values) > 1:
                 source = ItemSource(
@@ -590,10 +662,13 @@ def plan_task_lists(
                 )
         elif class_type in FOLDER_LOADERS:
             folder = inputs.get("folder")
-            directory = input_path(input_dir, folder) if input_dir else None
+            directory = input_path(base, folder) if base else None
             files = image_files(directory) if directory else []
-            if len(files) > 1:
-                meta[FILES_META] = [f"{folder}/{name}" for name in files]
+            if directory and base and len(files) > 1:
+                # Relative to the input directory, which the job maps, whatever the workflow's
+                # folder says, such as an absolute path on this machine or one with "..".
+                relative = directory.relative_to(base).as_posix()
+                meta[FILES_META] = [f"{relative}/{name}" for name in files]
                 source = ItemSource(
                     "",
                     f"Folder {folder} (#{node_id})",
@@ -604,8 +679,13 @@ def plan_task_lists(
                 )
         if source:
             source.name = _source_name(source.kind, node_id, node)
-            source.title = _source_title(source, workflow)
+            source.title = _source_title(source, workflow, consumers)
             plan.sources.append(source)
+    if unplanned:
+        plan.warnings.append(
+            f"Deadline Cloud reads up to {MAX_PLANNED_SOURCES} lists and folders in a workflow, so "
+            f"{unplanned} more run whole in each task."
+        )
     # Two lists the artist gave the same title keep it, with their node IDs, and a number when that's
     # taken too.
     names: set[str] = set()
@@ -627,7 +707,7 @@ def plan_task_lists(
     if len(active) > MAX_ITEM_SOURCES:
         plan.warnings.append(
             f"Deadline Cloud splits up to {MAX_ITEM_SOURCES} fields into tasks, so these run "
-            f"whole in each task: {', '.join(s.label for s in active[MAX_ITEM_SOURCES:])}."
+            f"whole in each task: {_some([s.label for s in active[MAX_ITEM_SOURCES:]])}."
         )
     # Mark the nodes of the sources that run as separate tasks. The task script runs others whole.
     for source in plan.active:
@@ -662,6 +742,7 @@ def _item_parameters(source: ItemSource) -> dict[str, Any]:
     return {
         "name": source.parameter,
         "type": "STRING",
+        "maxLength": MAX_ITEM_RANGE_LENGTH,
         "userInterface": {
             "control": "LINE_EDIT",
             "label": _LABEL_CONTROL_CHARACTERS.sub(" ", source.label)[:64],

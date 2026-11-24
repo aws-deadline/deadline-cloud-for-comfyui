@@ -739,9 +739,27 @@ export function taskCount(
   return total;
 }
 
-function currentTaskCount() {
+// The most tasks a job can run, as the submitter's MAX_TASKS allows.
+export const MAX_TASKS = 10000;
+
+// The number of tasks, or null when a field has an error. It can be over MAX_TASKS.
+function uncheckedTaskCount() {
   const sources = state.plan?.sources ?? [];
   return sources.length ? taskCount(sources, itemsValue) : 1;
+}
+
+// The number of tasks, or null when a field has an error or there are more than MAX_TASKS.
+function currentTaskCount() {
+  const total = uncheckedTaskCount();
+  return total !== null && total > MAX_TASKS ? null : total;
+}
+
+// Why the job can't be submitted with this many tasks, if it can't.
+function taskLimitError() {
+  const total = splitsTasks() ? uncheckedTaskCount() : null;
+  return total !== null && total > MAX_TASKS
+    ? `The job would run ${total.toLocaleString()} tasks, over the limit of ${MAX_TASKS.toLocaleString()}. Choose fewer items, or 0 to run a list whole.`
+    : null;
 }
 
 // How the fields multiply into tasks, such as "3 × 2 = 6 tasks", leaving out fields of one item.
@@ -1408,6 +1426,10 @@ function renderStatus() {
   const children: Children[] = [];
   if (state.planError) {
     children.push(h("div", { className: "dl-notice dl-error" }, state.planError));
+  }
+  const limitError = plan ? taskLimitError() : null;
+  if (limitError) {
+    children.push(h("div", { className: "dl-notice dl-error" }, limitError));
   }
   if (plan) {
     // A workflow split into tasks says how many it runs.

@@ -745,7 +745,14 @@ steps:
                 files = meta["deadline_files"]
                 index = item(name, len(files), f"The folder of node {node_id}")
                 if index:
-                    node.update(class_type="LoadImage", inputs={"image": files[index - 1]})
+                    # A path in the input directory, which the job maps. Load Image would read an
+                    # absolute path, or one with "..", from elsewhere on the worker.
+                    image = files[index - 1]
+                    parts = re.split(r"[\\/]", image) if isinstance(image, str) else []
+                    # An empty part is a leading, trailing or doubled separator: "/x", "x/" or "//x".
+                    if not parts or not all(parts) or ".." in parts or re.match(r"[A-Za-z]:", image):
+                        fail(f"The folder of node {node_id} names a file outside the input directory.")
+                    node.update(class_type="LoadImage", inputs={"image": image})
             elif class_type == "CreateList" and name:
                 # The node takes its items from inputs named input0, input1 and so on, in order.
                 # ASCII digits alone, as the submitter counts them: \d also matches other scripts'.

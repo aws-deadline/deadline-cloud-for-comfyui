@@ -1168,6 +1168,28 @@ def test_folders_load_the_tasks_image(tmp_path):
     assert ran["3"]["inputs"] == {"image": "cats/a.png"}
 
 
+@pytest.mark.parametrize(
+    "image",
+    [
+        "/home/artist/ComfyUI/input/cats/a.png",
+        "\\\\server\\share\\a.png",
+        "C:/input/cats/a.png",
+        "cats/../../secret.png",
+        "cats//a.png",
+        "",
+        7,
+    ],
+)
+def test_folders_refuse_files_outside_the_input_directory(tmp_path, image):
+    """Load Image would read an absolute path, or one with "..", from elsewhere on the worker."""
+    workflow = _images()
+    workflow["3"]["_meta"][submit.FILES_META] = [image, "cats/b.png"]
+    code, output, ran = run_task(tmp_path, workflow, {"Cats": 1})
+    assert code == 1
+    assert "openjd_fail: The folder of node 3 names a file outside the input directory." in output
+    assert ran == {}
+
+
 def test_folder_loaders_that_arent_split_load_the_whole_folder(tmp_path):
     _, _, ran = run_task(tmp_path, _images(), {"Cats": 0})
     assert ran["3"]["class_type"] == "LoadImageDataSetFromFolder"

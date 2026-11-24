@@ -485,6 +485,31 @@ if (scenario === "answer-confirmation") {
 if (scenario === "dialog-sections") {
   result.sections = ui.__dialogSections;
 }
+if (scenario === "task-limit") {
+  // Two lists whose items multiply past the most tasks a job can run, as the submitter allows.
+  const source = (name, count) => ({
+    name,
+    parameter: `${name}Items`,
+    label: name,
+    title: name,
+    kind: "list",
+    values: [],
+    count,
+    range: `1-${count}`,
+  });
+  ui.setSplit(true);
+  state.plan.sources = [source("List1", 100), source("List2", 101)];
+  state.plan.parameters = state.plan.sources.map(({ parameter, range }) => ({
+    name: parameter,
+    type: "STRING",
+    default: range,
+    userInterface: { groupLabel: "Tasks" },
+  }));
+  result.maxTasks = ui.MAX_TASKS;
+  result.canSubmitOverLimit = Boolean(ui.canSubmit());
+  state.edits.List2Items = "1-100";
+  result.canSubmitAtLimit = Boolean(ui.canSubmit());
+}
 if (scenario === "parse-bool") {
   // The panel reads a BOOL parameter as OpenJD and the submitter do.
   result.values = [

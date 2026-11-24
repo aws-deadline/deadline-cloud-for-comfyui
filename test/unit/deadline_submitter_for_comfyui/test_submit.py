@@ -1036,12 +1036,101 @@ def test_check_item_range(value, valid):
         ("4", "Create List #5 has 3 items, so it can't run '4'. Read the workflow again"),
         ("1-3,2", "Create List #5: '1-3,2' lists an item more than once."),
         ("x", "Create List #5: use item numbers such as 1-3 or 2,3, not 'x'."),
-        ("9" * 5000, "Create List #5: use item numbers such as 1-3 or 2,3"),
+        ("9" * 5000, "Create List #5: a range of items can be at most 1024 characters."),
     ],
 )
 def test_check_item_range_says_what_is_wrong(value, message):
     with pytest.raises(SubmitError, match=re.escape(message)):
         submit.check_item_range(submit.ItemSource("List5", "Create List #5", 3), value)
+
+
+@pytest.mark.parametrize(
+    ("value", "checked"),
+    [
+        ("0", ("0", 1)),
+        (" 0 ", ("0", 1)),
+        ("1-3", ("1-3", 3)),
+        (" 1 - 3 ", ("1-3", 3)),
+        ("3, 1", ("3,1", 2)),
+        ("1-5:2", ("1-5:2", 3)),
+        ("1 - 6 : 2", ("1-6:2", 3)),
+        ("2-2", ("2", 1)),
+        ("1-1:3", ("1", 1)),
+    ],
+)
+def test_check_item_range_returns_the_range_to_submit_and_its_items(value, checked):
+    """What's submitted is the checked range, without the spaces or controls strip() removes."""
+    assert (
+        submit.check_item_range(submit.ItemSource("List5", "Create List #5", 6), value) == checked
+    )
+
+
+def test_check_task_count_refuses_more_tasks_than_the_limit():
+    assert submit.check_task_count([]) == 1
+    assert submit.check_task_count([100, 100]) == submit.MAX_TASKS
+    with pytest.raises(SubmitError, match="10,001 tasks.*over the limit of 10,000"):
+        submit.check_task_count([10_001])
+    with pytest.raises(SubmitError, match="over the limit"):
+        submit.check_task_count([1000] * 16)
+
+
+def test_list_ranges_have_a_maximum_length():
+    [parameter] = submit.add_task_lists(
+        {"parameterDefinitions": []}, [submit.ItemSource("List5", "Create List #5", 3)]
+    )["parameterDefinitions"]
+    assert parameter["maxLength"] == submit.MAX_ITEM_RANGE_LENGTH
+
+
+def test_without_submitter_meta_leaves_the_workflows_own_keys():
+    workflow = {
+        "1": {"class_type": "X", "inputs": {}, "_meta": {"title": "Fox", "deadline_files": []}},
+        "2": {"class_type": "Y", "inputs": {}, "_meta": {"deadline_item": "List2"}},
+    }
+    cleaned = submit.without_submitter_meta(workflow)
+    assert cleaned == {
+        "1": {"class_type": "X", "inputs": {}, "_meta": {"title": "Fox"}},
+        "2": {"class_type": "Y", "inputs": {}, "_meta": {}},
+    }
+    # The workflow itself is left as it was.
+    assert workflow["2"]["_meta"] == {"deadline_item": "List2"}
+
+
+@pytest.mark.parametrize("folder", ["absolute", "elsewhere/../cats", "cats/", "./cats"])
+def test_folder_items_are_paths_in_the_input_directory(tmp_path, folder):
+    """The worker loads each image from the mapped input directory, not a path on this machine."""
+    input_dir = _input_dir(tmp_path)
+    folder = str(input_dir / "cats") if folder == "absolute" else folder
+    workflow = {"3": {"class_type": "LoadImageDataSetFromFolder", "inputs": {"folder": folder}}}
+    plan = plan_task_lists(workflow, input_dir)
+    assert _marked(plan, "3")[submit.FILES_META] == ["cats/a.png", "cats/b.jpg"]
+
+
+def test_plan_task_lists_reads_the_workflow_once_however_many_lists_it_has(monkeypatch):
+    """Naming each list used to read the whole workflow again, which slowed down large ones."""
+    workflow = {str(n): _create_list("a", "b") for n in range(1, 2001)}
+    calls = []
+    consumers = submit._consumers
+
+    def counted(workflow):
+        calls.append(1)
+        return consumers(workflow)
+
+    monkeypatch.setattr(submit, "_consumers", counted)
+    plan = plan_task_lists(workflow)
+    assert calls == [1]
+    assert len(plan.sources) == submit.MAX_PLANNED_SOURCES
+    assert len(plan.active) == submit.MAX_ITEM_SOURCES
+    # The warnings stay short, however many lists there are.
+    assert all(len(warning) < 500 for warning in plan.warnings)
+    assert plan.warnings[0] == (
+        f"Deadline Cloud reads up to {submit.MAX_PLANNED_SOURCES} lists and folders in a "
+        f"workflow, so {2000 - submit.MAX_PLANNED_SOURCES} more run whole in each task."
+    )
+    assert plan.warnings[1].endswith(
+        f"Create List #21, and {submit.MAX_PLANNED_SOURCES - submit.MAX_ITEM_SOURCES - 5} more."
+    )
+    # Lists past the ones read aren't marked, so they run whole.
+    assert "_meta" not in plan.workflow["2000"]
 
 
 def test_list_names_fit_openjd_even_with_a_node_id_added():
