@@ -522,24 +522,43 @@ def result(data):
     return {"event": "result", "data": data}
 
 
-def test_plan_lists_parameters_and_attachments(comfy, monkeypatch):
+def test_plan_lists_parameters_task_lists_and_attachments(comfy, monkeypatch):
     input_dir = comfy.tmp_path / "input"
     input_dir.mkdir()
     (input_dir / "fox.png").write_text("png")
     workflow = {
         **WORKFLOW,
         "2": {"class_type": "LoadImage", "inputs": {"image": "fox.png"}},
+        "10": {"class_type": "CreateList", "inputs": {f"input{i}": i for i in range(4)}},
     }
     status, body = run(call(comfy, "/deadline/plan", {"workflow": workflow, "name": "fox.json"}))
     assert status == 200
     assert body["name"] == "fox"
     assert body["template"] == "comfy_cli_job_template.yaml"
     names = [parameter["name"] for parameter in body["parameters"]]
-    assert {"WorkflowFile", "OutputDir", "InputDir", "ExtraModelPathsConfig"} <= set(names)
+    assert {
+        "WorkflowFile",
+        "OutputDir",
+        "InputDir",
+        "ExtraModelPathsConfig",
+        "List10Items",
+    } <= set(names)
     assert body["values"]["OutputDir"] == str(comfy.tmp_path / "output")
     assert body["values"]["InputDir"] == str(input_dir)
     assert body["queueValues"] == {"CondaChannels": "s3://bucket/Conda/Default conda-forge"}
-    assert "sources" not in body and "tasks" not in body
+    assert body["sources"] == [
+        {
+            "name": "List10",
+            "parameter": "List10Items",
+            "label": "Create List #10",
+            "title": "Create List #10",
+            "kind": "list",
+            # The panel previews a Create List's typed values.
+            "values": ["0", "1", "2", "3"],
+            "count": 4,
+            "range": "1-4",
+        }
+    ]
     assert body["attachments"] == {"filenames": [str(input_dir / "fox.png")], "directories": []}
     # Planning doesn't create a job bundle.
     assert not (comfy.tmp_path / "user" / "deadline_submissions").exists()
@@ -570,6 +589,58 @@ def test_malformed_workflows_get_a_400(comfy, monkeypatch, path, node, error):
     status, body = run(call(comfy, path, request))
     assert status == 400
     assert body["error"].startswith(error)
+
+
+def _list_into(meta: object) -> dict:
+    """A Create List feeding a later node whose _meta is as given."""
+    return {
+        "1": {"class_type": "CreateList", "inputs": {"input0": "a", "input1": "b"}},
+        "2": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}, "_meta": meta},
+    }
+
+
+@pytest.mark.parametrize(
+    ("workflow", "error"),
+    [
+        (_list_into("Save Image"), "Node 2 has a _meta that isn't an object."),
+        (_list_into(["Save Image"]), "Node 2 has a _meta that isn't an object."),
+        (
+            {
+                "1": {
+                    "class_type": "CreateList",
+                    "inputs": {"input0": "a", "input" + "9" * 5000: "b"},
+                }
+            },
+            "Create List 1 has an input numbered past 9 digits, which ComfyUI doesn't make.",
+        ),
+        (
+            # An Arabic-Indic zero. The worker would have counted it as an item the panel didn't.
+            {"1": {"class_type": "CreateList", "inputs": {"input0": "a", "input\u0660": "b"}}},
+            (
+                "Create List 1 has an input named input\u0660, numbered with digits that ComfyUI "
+                "doesn't use."
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("split", [True, False])
+@pytest.mark.parametrize("path", ["/deadline/plan", "/deadline/bundle", "/deadline/jobs"])
+def test_malformed_lists_get_a_400_before_planning(
+    comfy, monkeypatch, path, split, workflow, error
+):
+    """Planning reads every node's _meta and each Create List input's number."""
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    body = {**JOB, "workflow": workflow, "splitTasks": split}
+    status, response = run(call(comfy, path, body))
+    assert (status, response["error"]) == (400, error)
+    assert not requests.exists()
+
+
+def test_lists_with_a_null_meta_still_plan(comfy, monkeypatch):
+    fake_tools(monkeypatch, comfy.tmp_path)
+    status, body = run(call(comfy, "/deadline/plan", {"workflow": _list_into(None), "name": "x"}))
+    assert status == 200, body
+    assert [source["name"] for source in body["sources"]] == ["List1"]
 
 
 def test_cloud_runs_the_bridge_with_the_cli_python(comfy, monkeypatch):
@@ -2554,3 +2625,183 @@ def test_bad_parameter_values_are_refused_before_anything_is_staged(
     assert staged == []
     assert not requests.exists()
     assert not (comfy.tmp_path / "user" / "deadline_submissions").exists()
+
+
+def _task_parameters(bundle_dir: Path) -> list[str]:
+    template = yaml.safe_load((bundle_dir / "template.yaml").read_text())
+    space = template["steps"][0]["parameterSpace"]["taskParameterDefinitions"]
+    return [parameter["name"] for parameter in space]
+
+
+def test_jobs_runs_list_items_as_tasks(comfy, monkeypatch):
+    workflow = {
+        **WORKFLOW,
+        "10": {
+            "class_type": "CreateList",
+            "inputs": {"inputs.input0": ["11", 0], "inputs.input1": ["12", 0]},
+        },
+    }
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    _, body = run(post(comfy, {"workflow": workflow, "splitTasks": True}))
+    assert _task_parameters(Path(body["job_bundle"])) == ["List10"]
+    assert "List10" not in sent_parameters(requests)
+
+    studio_template = use_basic_template(comfy, monkeypatch)
+    _, body = run(post(comfy, {"workflow": workflow, "splitTasks": True}))
+    template = Path(body["job_bundle"]) / "template.yaml"
+    assert template.read_text() == studio_template.read_text()
+
+
+def test_jobs_runs_lists_of_different_lengths_as_separate_task_parameters(comfy, monkeypatch):
+    workflow = {
+        **WORKFLOW,
+        "10": {"class_type": "CreateList", "inputs": {"input0": 1, "input1": 2, "input2": 3}},
+        "11": {"class_type": "CreateList", "inputs": {"input0": ["1", 0], "input1": ["2", 0]}},
+    }
+    fake_tools(monkeypatch, comfy.tmp_path)
+    _, body = run(post(comfy, {"workflow": workflow, "splitTasks": True}))
+    assert _task_parameters(Path(body["job_bundle"])) == ["List10", "List11"]
+    assert not any("different numbers of items" in warning for warning in body["warnings"])
+
+
+def test_plan_lists_the_lists_only_for_templates_that_run_them(comfy, monkeypatch):
+    workflow = {
+        **WORKFLOW,
+        "10": {"class_type": "CreateList", "inputs": {f"input{i}": i for i in range(4)}},
+        "11": {"class_type": "CreateList", "inputs": {"input0": 1, "input1": 2, "input2": 3}},
+    }
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    _, body = run(call(comfy, "/deadline/plan", {"workflow": workflow}))
+    assert [(source["name"], source["count"]) for source in body["sources"]] == [
+        ("List10", 4),
+        ("List11", 3),
+    ]
+
+    use_basic_template(comfy, monkeypatch)
+    _, body = run(call(comfy, "/deadline/plan", {"workflow": workflow}))
+    assert body["sources"] == []
+
+
+def test_jobs_run_as_one_task_unless_the_lists_are_split(comfy, monkeypatch):
+    """The panel splits lists only when the artist chooses to, and one task has no task parameters."""
+    workflow = {
+        **WORKFLOW,
+        "10": {"class_type": "CreateList", "inputs": {"input0": 1, "input1": 2}},
+    }
+    fake_tools(monkeypatch, comfy.tmp_path)
+    for body in ({"workflow": workflow}, {"workflow": workflow, "splitTasks": False}):
+        _, response = run(post(comfy, body))
+        template = Path(response["job_bundle"]) / "template.yaml"
+        assert template.read_text() == submit.JOB_TEMPLATE.read_text()
+    _, body = run(post(comfy, {"workflow": workflow, "splitTasks": True}))
+    assert _task_parameters(Path(body["job_bundle"])) == ["List10"]
+    status, body = run(post(comfy, {"workflow": workflow, "splitTasks": "no"}))
+    assert (status, body["error"]) == (400, "splitTasks must be true or false.")
+
+
+def test_task_warnings_only_apply_to_multiple_tasks(comfy, monkeypatch):
+    """Lists past the 16 a step takes are only a concern when the lists split into tasks."""
+    lists = {
+        str(100 + i): {"class_type": "CreateList", "inputs": {"input0": 1, "input1": 2}}
+        for i in range(submit.MAX_ITEM_SOURCES + 1)
+    }
+    workflow = {**WORKFLOW, **lists}
+    fake_tools(monkeypatch, comfy.tmp_path)
+    _, plan = run(call(comfy, "/deadline/plan", {"workflow": workflow}))
+    [task_warning] = plan["taskWarnings"]
+    assert "Create List #116" in task_warning
+    assert task_warning not in plan["warnings"]
+    _, one = run(post(comfy, {"workflow": workflow}))
+    assert task_warning not in one["warnings"]
+    _, split = run(post(comfy, {"workflow": workflow, "splitTasks": True}))
+    assert task_warning in split["warnings"]
+
+
+def test_jobs_check_each_lists_range_against_the_list_as_it_is_now(comfy, monkeypatch):
+    """The panel's plan can be older than the list, such as a folder that lost an image."""
+    workflow = {
+        **WORKFLOW,
+        "10": {"class_type": "CreateList", "inputs": {"input0": 1, "input1": 2}},
+    }
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    body = {"workflow": workflow, "splitTasks": True, "parameters": {"List10Items": "1-3"}}
+    status, response = run(post(comfy, body))
+    assert status == 400
+    assert response["error"].startswith("Create List #10 has 2 items, so it can't run '1-3'.")
+    assert not requests.exists()
+
+
+def test_one_task_jobs_leave_out_list_parameters(comfy, monkeypatch):
+    """A panel from before One task was the default sends list parameters without splitTasks."""
+    workflow = {
+        **WORKFLOW,
+        "10": {"class_type": "CreateList", "inputs": {"input0": 1, "input1": 2}},
+    }
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    status, response = run(
+        post(comfy, {"workflow": workflow, "parameters": {"List10Items": "1-2"}})
+    )
+    assert status == 202, response
+    assert "List10Items" not in sent_parameters(requests)
+
+
+def test_jobs_refuse_a_lists_field_from_an_older_plan(comfy, monkeypatch):
+    """A list renamed after the panel's plan sends a field the job no longer has."""
+    workflow = {
+        **WORKFLOW,
+        "10": {"class_type": "CreateList", "inputs": {"input0": 1, "input1": 2}},
+    }
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    body = {
+        "workflow": workflow,
+        "splitTasks": True,
+        "parameters": {"OldNameItems": "1-2", "CondaChannels": "deadline-cloud"},
+    }
+    status, response = run(post(comfy, body))
+    assert status == 400
+    assert response["error"].startswith(
+        "The workflow's lists changed since it was read (OldNameItems)."
+    )
+    assert not requests.exists()
+
+
+def _studio_step_with_task_parameters(comfy, monkeypatch) -> Path:
+    template = yaml.safe_load(submit.JOB_TEMPLATE.read_text())
+    template["steps"][0]["parameterSpace"] = {
+        "taskParameterDefinitions": [{"name": "Frame", "type": "INT", "range": "1-3"}],
+        "combination": "Frame",
+    }
+    studio = comfy.tmp_path / "studio.yaml"
+    studio.write_text(yaml.safe_dump(template, sort_keys=False))
+    monkeypatch.setenv(submit.TEMPLATE_ENV_VAR, str(studio))
+    return studio
+
+
+@pytest.mark.parametrize("split", [True, False])
+def test_templates_with_their_own_task_parameters_run_lists_whole(comfy, monkeypatch, split):
+    """The submitter doesn't add lists to a step that has task parameters, and says so."""
+    _studio_step_with_task_parameters(comfy, monkeypatch)
+    requests = fake_tools(monkeypatch, comfy.tmp_path)
+    workflow = {
+        **WORKFLOW,
+        "10": {"class_type": "CreateList", "inputs": {"input0": 1, "input1": 2}},
+    }
+    status, plan = run(call(comfy, "/deadline/plan", {"workflow": workflow, "name": "fox"}))
+    assert status == 200
+    assert plan["sources"] == []
+    warning = "The job template studio.yaml already has task parameters, so the workflow's lists"
+    assert any(item.startswith(warning) for item in plan["warnings"])
+    status, body = run(post(comfy, {"workflow": workflow, "splitTasks": split}))
+    assert status == 202, body
+    template = yaml.safe_load((Path(body["job_bundle"]) / "template.yaml").read_text())
+    space = template["steps"][0]["parameterSpace"]
+    assert [parameter["name"] for parameter in space["taskParameterDefinitions"]] == ["Frame"]
+    assert "List10Items" not in sent_parameters(requests)
+
+
+def test_templates_with_their_own_task_parameters_dont_warn_without_lists(comfy, monkeypatch):
+    _studio_step_with_task_parameters(comfy, monkeypatch)
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    status, plan = run(call(comfy, "/deadline/plan", {"workflow": WORKFLOW, "name": "fox"}))
+    assert status == 200
+    assert not any("task parameters" in warning for warning in plan["warnings"])

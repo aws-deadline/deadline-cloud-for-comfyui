@@ -50,6 +50,7 @@ def environment_values(
 def run_task(
     tmp_path: Path,
     workflow: dict,
+    items: dict[str, int] | None = None,
     *,
     mode: str = "",
     workflow_timeout: int = 3600,
@@ -114,8 +115,17 @@ def run_task(
         f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(stand_in))} "$@"\n'
     )
     comfy.chmod(0o755)
-    script = TEMPLATE["steps"][0]["script"]["embeddedFiles"][0]["data"]
-    (tmp_path / "run.py").write_text(script, encoding="utf-8")
+    items = items or {}
+    sources = [submit.ItemSource(name, name, 1) for name in items]
+    step = submit.add_task_lists(TEMPLATE, sources)["steps"][0]
+    (tmp_path / "run.py").write_text(step["script"]["embeddedFiles"][0]["data"], encoding="utf-8")
+    # The task's items, as OpenJD resolves the step's arguments.
+    arguments = [
+        argument.replace(f"{{{{Task.Param.{name}}}}}", str(index))
+        for argument in step["script"]["actions"]["onRun"]["args"][1:]
+        for name, index in items.items()
+        if argument.startswith(f"{name}=")
+    ]
     env = {
         **os.environ,
         "PATH": f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}",
@@ -129,7 +139,7 @@ def run_task(
         ),
     }
     result = subprocess.run(
-        [sys.executable, str(tmp_path / "run.py")],
+        [sys.executable, str(tmp_path / "run.py"), *arguments],
         cwd=tmp_path / "run",
         env=env,
         capture_output=True,
@@ -900,3 +910,188 @@ def test_requirements_check_refuses_what_could_change_where_pip_installs_from(
     [message] = result.stdout.splitlines()
     assert message.startswith("Line 2, ")
     assert reason in message
+
+
+def _create_list():
+    return {
+        "1": {
+            "class_type": "CreateList",
+            "inputs": {f"inputs.input{i}": [str(i + 2), 0] for i in range(3)},
+            "_meta": {submit.ITEM_META: "List1"},
+        },
+        "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "fox"}},
+    }
+
+
+@pytest.mark.parametrize(
+    "argument", ["List1=2 or 1", "List1=", "List1=١", "=2", "List 1=2", "List1"]
+)
+def test_the_task_refuses_an_argument_that_isnt_a_list_and_an_item_number(tmp_path, argument):
+    """The task's items come in as arguments, which the script reads as data, never as code."""
+    script = tmp_path / "run.py"
+    script.write_text(TEMPLATE["steps"][0]["script"]["embeddedFiles"][0]["data"], encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, str(script), argument],
+        env={
+            **os.environ,
+            "PYTHONIOENCODING": "utf-8",
+            **environment_values(tmp_path, OutputDir=str(tmp_path)),
+            "COMFYUI_PORT": "1",
+        },
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    assert result.returncode == 1
+    assert result.stdout.startswith("openjd_fail: The task argument ")
+    assert result.stdout.rstrip("\n").endswith("isn't a list name and an item number.")
+
+
+def test_runs_whole_lists_for_item_0(tmp_path):
+    code, output, ran = run_task(tmp_path, _create_list(), {"List1": 0})
+    assert code == 0, output
+    assert ran["1"]["inputs"] == _create_list()["1"]["inputs"]
+    assert ran["9"]["inputs"]["filename_prefix"] == "fox"
+    assert "Running the workflow with the workflow" in output
+
+
+def test_create_list_keeps_the_tasks_item(tmp_path):
+    code, output, ran = run_task(tmp_path, _create_list(), {"List1": 3})
+    assert code == 0, output
+    assert ran["1"]["inputs"] == {"inputs.input0": ["4", 0]}
+    assert ran["9"]["inputs"]["filename_prefix"] == "fox_List1-3"
+    assert "Running the workflow with List1 3" in output
+
+
+def test_create_list_counts_inputs_numbered_with_ascii_digits_alone(tmp_path):
+    """The panel counts them that way, so an input numbered with other digits isn't an item."""
+    workflow = _create_list()
+    workflow["1"]["inputs"]["inputs.input\u0660"] = ["hidden", 0]
+    code, output, ran = run_task(tmp_path, workflow, {"List1": 3})
+    assert code == 0, output
+    assert ran["1"]["inputs"] == {"inputs.input0": ["4", 0], "inputs.input\u0660": ["hidden", 0]}
+
+
+def test_lists_without_a_task_parameter_run_whole(tmp_path):
+    # The submitter leaves out the task parameters of sources that are turned off.
+    code, output, ran = run_task(tmp_path, _create_list(), {})
+    assert code == 0, output
+    assert len(ran["1"]["inputs"]) == 3
+
+
+def test_fails_for_an_item_past_the_end(tmp_path):
+    code, output, _ = run_task(tmp_path, _create_list(), {"List1": 4})
+    assert code == 1
+    assert "openjd_fail: Item 4 of List1 doesn't exist. A Create List has 3 items." in output
+
+
+def test_fails_for_a_negative_item(tmp_path):
+    """Python would otherwise count back from the end of the list."""
+    code, output, ran = run_task(tmp_path, _create_list(), {"List1": -1})
+    assert code == 1
+    assert "openjd_fail: Item -1 of List1 doesn't exist. A Create List has 3 items." in output
+    assert ran == {}
+
+
+def test_fails_when_a_tasks_list_has_no_node(tmp_path):
+    """Without the node's marker, every task would run the whole list."""
+    workflow = _create_list()
+    del workflow["1"]["_meta"]
+    code, output, ran = run_task(tmp_path, workflow, {"List1": 2})
+    assert code == 1
+    assert "openjd_fail: The workflow has no node for List1" in output
+    assert ran == {}
+
+
+def _images(name="Cats"):
+    meta: dict[str, Any] = {submit.FILES_META: ["cats/a.png", "cats/b.png"]}
+    if name:
+        meta[submit.ITEM_META] = name
+    return {
+        "3": {
+            "class_type": "LoadImageDataSetFromFolder",
+            "inputs": {"folder": "cats"},
+            "_meta": meta,
+        }
+    }
+
+
+def test_folders_load_the_tasks_image(tmp_path):
+    _, _, ran = run_task(tmp_path, _images(), {"Cats": 1})
+    assert ran["3"]["class_type"] == "LoadImage"
+    assert ran["3"]["inputs"] == {"image": "cats/a.png"}
+
+
+def test_folder_loaders_that_arent_split_load_the_whole_folder(tmp_path):
+    _, _, ran = run_task(tmp_path, _images(), {"Cats": 0})
+    assert ran["3"]["class_type"] == "LoadImageDataSetFromFolder"
+
+
+def test_each_source_selects_its_own_item(tmp_path):
+    workflow = {**_create_list(), **_images()}
+    code, output, ran = run_task(tmp_path, workflow, {"List1": 2, "Cats": 1})
+    assert code == 0, output
+    assert ran["1"]["inputs"] == {"inputs.input0": ["3", 0]}
+    assert ran["3"]["inputs"] == {"image": "cats/a.png"}
+    assert ran["9"]["inputs"]["filename_prefix"] == "fox_List1-2_Cats-1"
+
+
+def test_a_wired_prefix_gets_the_tasks_items_through_concatenate_text(tmp_path):
+    """The task can't add its items to a prefix wired from another node, so ComfyUI adds them."""
+    workflow = _create_list()
+    workflow["9"]["inputs"]["filename_prefix"] = ["20", 0]
+    workflow["20"] = {"class_type": "PrimitiveString", "inputs": {"value": "fox"}}
+    code, output, prompt = run_task(tmp_path, workflow, {"List1": 2})
+    assert code == 0, output
+    assert prompt["9"]["inputs"]["filename_prefix"] == ["deadline_prefix_9", 0]
+    assert prompt["deadline_prefix_9"] == {
+        "class_type": "StringConcatenate",
+        "inputs": {"string_a": ["20", 0], "string_b": "_List1-2", "delimiter": ""},
+    }
+
+
+def test_a_wired_prefix_needs_concatenate_text_on_the_worker(tmp_path):
+    """A worker whose ComfyUI is older than Concatenate Text fails the task with a clear message."""
+    requests = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *args):
+            pass
+
+    workflow = _create_list()
+    workflow["9"]["inputs"]["filename_prefix"] = ["20", 0]
+    workflow["20"] = {"class_type": "PrimitiveString", "inputs": {"value": "fox"}}
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        code, output, _ = run_task(tmp_path, workflow, {"List1": 2}, port=server.server_port)
+    finally:
+        server.shutdown()
+    assert code == 1
+    assert requests == ["/object_info/StringConcatenate"]
+    assert "needs ComfyUI 0.3.35 or later on the worker" in output
+
+
+def test_long_list_names_give_way_to_item_numbers_in_file_names(tmp_path):
+    """Five long list names would make output file names too long for the file system."""
+    names = [f"List{i}_" + "x" * 40 for i in range(5)]
+    workflow = {"9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "fox"}}}
+    for i, name in enumerate(names):
+        workflow[str(i + 1)] = {
+            "class_type": "CreateList",
+            "inputs": {"inputs.input0": "a", "inputs.input1": "b"},
+            "_meta": {submit.ITEM_META: name},
+        }
+    code, output, ran = run_task(tmp_path, workflow, {name: 2 for name in names})
+    assert code == 0, output
+    assert ran["9"]["inputs"]["filename_prefix"] == "fox_items-2-2-2-2-2"
+    assert f"Output files end in _items-2-2-2-2-2, for {', '.join(names)}." in output

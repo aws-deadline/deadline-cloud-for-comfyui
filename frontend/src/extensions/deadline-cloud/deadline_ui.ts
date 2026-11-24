@@ -71,6 +71,19 @@ interface HostRequirements {
   amounts?: AmountRequirement[];
 }
 
+// A list in the workflow that runs as tasks, such as a Create List node, as the plan gives it.
+interface TaskList {
+  name: string;
+  // The job parameter that holds the range of items to run.
+  parameter: string;
+  label: string;
+  title: string;
+  kind: string;
+  values: string[];
+  count: number;
+  range: string;
+}
+
 // What /deadline/plan returns for the workflow.
 // A custom node pack the job attaches, and its size and file count. counted is false when the
 // pack had more files than the server counts.
@@ -96,6 +109,9 @@ interface Plan {
   localNodes?: LocalNode[];
   warnings?: string[];
   nodeWarnings?: string[];
+  // Warnings about splitting the lists into tasks, which only apply to Multiple tasks.
+  taskWarnings?: string[];
+  sources?: TaskList[];
 }
 
 interface Submission {
@@ -195,6 +211,8 @@ const DEFAULT_SETTINGS: Settings = {
   jobAttachmentsFileSystem: "",
 };
 const DONE_STATUSES = new Set(["SUCCEEDED", "FAILED", "CANCELED"]);
+// How many of a field's chosen items it previews.
+const PREVIEW_ITEMS = 3;
 
 function readStorage<T>(key: string, fallback: T): T {
   try {
@@ -239,6 +257,11 @@ interface State {
   planning: boolean;
   // The artist's values, which win over the ones the submitter fills in.
   edits: Record<string, ParameterValue>;
+  // What each edited list field's node held when the artist edited the field.
+  itemEditBases: Record<string, string>;
+  // The workflows whose lists the artist split into tasks, by name. Any other workflow runs as one
+  // task, with each list's items in it, as in ComfyUI.
+  splitWorkflows: Set<string>;
   queueEdits: Record<string, ParameterValue>;
   jobName: string | null;
   jobDescription: string;
@@ -268,6 +291,8 @@ const state: State = {
   planError: null,
   planning: false,
   edits: {},
+  itemEditBases: {},
+  splitWorkflows: new Set(),
   queueEdits: {},
   jobName: null,
   jobDescription: "",
@@ -284,6 +309,7 @@ type SectionName =
   | "account"
   | "target"
   | "status"
+  | "tasks"
   | "jobSettings"
   | "parameters"
   | "queueParameters"
@@ -519,8 +545,25 @@ export async function loadPlan(force = false) {
   if (plan) {
     state.plan = plan;
     state.planKey = key;
+    dropStaleItemEdits(plan.sources ?? []);
   }
   refresh();
+}
+
+// What a list field's node holds: an edit made to the field only applies while it's unchanged.
+function itemEditBase(source: TaskList) {
+  return JSON.stringify([state.plan?.name, source.count, source.range, source.values]);
+}
+
+// A list field follows its node again once the node's values change, or the node is gone.
+function dropStaleItemEdits(sources: TaskList[]) {
+  const current = new Map(sources.map((source) => [source.parameter, itemEditBase(source)]));
+  for (const [parameter, base] of Object.entries(state.itemEditBases)) {
+    if (current.get(parameter) !== base) {
+      delete state.edits[parameter];
+      delete state.itemEditBases[parameter];
+    }
+  }
 }
 
 let planTimer: ReturnType<typeof setTimeout> | undefined;
@@ -575,6 +618,168 @@ export function workflowLoaded() {
     refresh();
     planTimer = setTimeout(() => loadPlan());
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Task lists
+
+const RANGE_PART = /^(-?\d+)(?:\s*-\s*(-?\d+)(?:\s*:\s*(\d+))?)?$/;
+// One part of a list's item range, as the submitter's _ITEM_RANGE_PART reads it.
+const ITEM_RANGE_PART = /^\d{1,9}(?:\s*-\s*\d{1,9}(?:\s*:\s*\d{1,9})?)?$/;
+
+interface RangePart {
+  start: number;
+  end: number;
+  step: number;
+  // The last number the part reaches, which can be less than end.
+  last: number;
+}
+
+// The parts of an OpenJD integer range expression, such as "1-4,7,10-20:2", or null when it isn't
+// one. Like OpenJD, it refuses empty parts and parts that overlap, such as "1-3,2".
+function parseRange(expression: ParameterValue): RangePart[] | null {
+  const parts: RangePart[] = [];
+  for (const part of String(expression).split(",")) {
+    const text = part.trim();
+    if (!text) {
+      return null;
+    }
+    const match = RANGE_PART.exec(text);
+    if (!match) {
+      return null;
+    }
+    const start = Number(match[1]);
+    const end = Number(match[2] ?? match[1]);
+    const step = Number(match[3] ?? 1);
+    if (end < start || step < 1) {
+      return null;
+    }
+    parts.push({ start, end, step, last: start + Math.floor((end - start) / step) * step });
+  }
+  const sorted = [...parts].sort((a, b) => a.start - b.start);
+  for (let index = 1; index < sorted.length; index++) {
+    if (sorted[index - 1].last >= sorted[index].start) {
+      return null;
+    }
+  }
+  return parts.length ? parts : null;
+}
+
+// Counts the values of an OpenJD integer range expression, or returns null when it isn't one.
+export function countRange(expression: ParameterValue): number | null {
+  const parts = parseRange(expression);
+  return parts
+    ? parts.reduce((sum, { start, end, step }) => sum + Math.floor((end - start) / step) + 1, 0)
+    : null;
+}
+
+// A list's range of items to split into tasks.
+function itemsValue(source: TaskList): string {
+  return String(state.edits[source.parameter] ?? source.range);
+}
+
+// Whether the open workflow's lists split into tasks. Each workflow keeps its own choice, so
+// switching tabs keeps it and a newly opened workflow starts as one task.
+export function splitsTasks(): boolean {
+  return state.plan !== null && state.splitWorkflows.has(state.plan.name);
+}
+
+// Splits the open workflow's lists into tasks, or runs it as one task.
+export function setSplit(split: boolean) {
+  if (!state.plan) {
+    return;
+  }
+  if (split) {
+    state.splitWorkflows.add(state.plan.name);
+  } else {
+    state.splitWorkflows.delete(state.plan.name);
+  }
+  refresh("tasks", "status", "submit");
+}
+
+function plural(count: number, noun: string) {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+// A field's number of tasks, or null with an error. A field holds item numbers from 1 to the list's
+// count, so the farm never gets an item that doesn't exist. Unsplit, every list counts as one.
+function fieldCount(source: TaskList, value: string): { count: number | null; error: string | null } {
+  // "0" keeps the list whole in each task, as the submitter's check_item_range takes it.
+  if (!splitsTasks() || String(value).trim() === "0") {
+    return { count: 1, error: null };
+  }
+  const parts = parseRange(value);
+  // Item numbers have at most 9 digits, as the submitter reads them.
+  const short = String(value)
+    .split(",")
+    .every((part) => ITEM_RANGE_PART.test(part.trim()));
+  const valid =
+    short && (parts?.every(({ start, last }) => start >= 1 && last <= source.count) ?? false);
+  return valid
+    ? { count: countRange(value), error: null }
+    : {
+        count: null,
+        error: `${source.title}: use item numbers from 1 to ${source.count}, such as 1-${source.count} or 2,3, or 0 for all of them in each task.`,
+      };
+}
+
+// The number of tasks, from every combination of the sources, or null when a field has an error.
+export function taskCount(
+  sources: TaskList[],
+  valueOf: (source: TaskList) => string
+): number | null {
+  let total = 1;
+  for (const source of sources) {
+    const { count } = fieldCount(source, valueOf(source));
+    if (count === null) {
+      return null;
+    }
+    total *= count;
+  }
+  return total;
+}
+
+function currentTaskCount() {
+  const sources = state.plan?.sources ?? [];
+  return sources.length ? taskCount(sources, itemsValue) : 1;
+}
+
+// How the fields multiply into tasks, such as "3 × 2 = 6 tasks", leaving out fields of one item.
+function taskMath() {
+  const total = currentTaskCount();
+  if (total === null) {
+    return "";
+  }
+  const factors = (state.plan?.sources ?? [])
+    .map((source) => fieldCount(source, itemsValue(source)).count ?? 1)
+    .filter((count) => count > 1);
+  return factors.length > 1 ? `${factors.join(" × ")} = ${plural(total, "task")}` : plural(total, "task");
+}
+
+// The first item numbers a range selects, in the order the tasks run them.
+function selectedItems(expression: string) {
+  const numbers: number[] = [];
+  for (const { start, last, step } of parseRange(expression) ?? []) {
+    for (let number = start, taken = 0; number <= last && taken <= PREVIEW_ITEMS; number += step, taken++) {
+      numbers.push(number);
+    }
+  }
+  return numbers.sort((a, b) => a - b).slice(0, PREVIEW_ITEMS + 1);
+}
+
+// What a field's items are, such as the first prompts of a Create List or images of a folder.
+export function itemsPreview(source: TaskList, value: string): string {
+  if (!source.values?.length || fieldCount(source, value).error) {
+    return "";
+  }
+  if (String(value).trim() === "0") {
+    return "All of them, in each task";
+  }
+  const numbers = selectedItems(value);
+  const shown = numbers
+    .slice(0, PREVIEW_ITEMS)
+    .map((number) => source.values[number - 1] ?? `item ${number}`);
+  return numbers.length > PREVIEW_ITEMS ? `${shown.join(", ")}, …` : shown.join(", ");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -662,7 +867,8 @@ export function canSubmit(): boolean {
     !state.planning &&
     !state.planError &&
     !state.submission &&
-    !hostFormError()
+    !hostFormError() &&
+    currentTaskCount() !== null
   );
 }
 
@@ -686,6 +892,15 @@ function bundleRequest() {
       parameters[parameter.name] = queueParameterValue(parameter);
     }
   }
+  // The lists' ranges, when the artist splits them into tasks. Otherwise the job has no task
+  // parameters to send them to.
+  for (const source of plan?.sources ?? []) {
+    if (splitsTasks()) {
+      parameters[source.parameter] = itemsValue(source);
+    } else {
+      delete parameters[source.parameter];
+    }
+  }
   const settings: Record<string, ParameterValue> = { name: jobName() };
   for (const [key, value] of Object.entries(state.settings)) {
     if (value !== "" && value !== null) {
@@ -705,6 +920,7 @@ function bundleRequest() {
     attachments: attachments(),
     excludedModels: excludedModels(),
     excludedNodes: excludedNodes(),
+    splitTasks: splitsTasks(),
   };
 }
 
@@ -1077,7 +1293,7 @@ function select(
   );
 }
 
-function section(title: string, open: boolean, ...children: Children[]) {
+function section(title: Children, open: boolean, ...children: Children[]) {
   return h(
     "details",
     { className: "dl-section", open },
@@ -1194,17 +1410,24 @@ function renderStatus() {
     children.push(h("div", { className: "dl-notice dl-error" }, state.planError));
   }
   if (plan) {
+    // A workflow split into tasks says how many it runs.
+    const count = currentTaskCount();
+    const tasks =
+      plan.sources?.length && splitsTasks()
+        ? ` · ${count === null ? "check the tasks below" : plural(count, "task")}`
+        : "";
     children.push(
       h(
         "div",
         { className: "dl-summary" },
         h("strong", null, plan.name),
-        h("span", { className: "dl-muted" }, ` · ${plan.template}`)
+        h("span", { className: "dl-muted" }, `${tasks} · ${plan.template}`)
       )
     );
     // With Attach Custom Nodes off, the workers provide the custom nodes.
     const ignored = attachesNodes() ? [] : plan.nodeWarnings ?? [];
-    for (const warning of plan.warnings ?? []) {
+    const warnings = [...(plan.warnings ?? []), ...(splitsTasks() ? plan.taskWarnings ?? [] : [])];
+    for (const warning of warnings) {
       if (!ignored.includes(warning)) {
         children.push(h("div", { className: "dl-notice dl-warn-box" }, warning));
       }
@@ -1254,6 +1477,103 @@ function renderStatus() {
   return h("div", { className: "dl-status" }, children);
 }
 
+// Updates what depends on the list fields without re-rendering them, so they keep focus.
+function updateCounts() {
+  for (const view of views) {
+    view.render(["status", "submit"]);
+  }
+  for (const element of document.querySelectorAll<HTMLElement>("[data-role='task-math']")) {
+    element.textContent = taskMath();
+  }
+  for (const source of state.plan?.sources ?? []) {
+    const value = itemsValue(source);
+    // The sidebar and the dialog can both show the field.
+    for (const element of document.querySelectorAll<HTMLInputElement>(`[data-items="${source.parameter}"]`)) {
+      if (element !== document.activeElement) {
+        element.value = value;
+      }
+    }
+    for (const element of document.querySelectorAll<HTMLElement>(`[data-preview="${source.parameter}"]`)) {
+      element.textContent = itemsPreview(source, value);
+    }
+    for (const element of document.querySelectorAll<HTMLElement>(`[data-item-error="${source.parameter}"]`)) {
+      const { error } = fieldCount(source, value);
+      element.textContent = error ?? "";
+      element.hidden = !error;
+    }
+  }
+}
+
+function taskListField(source: TaskList) {
+  const value = itemsValue(source);
+  const { error } = fieldCount(source, value);
+  return h(
+    "div",
+    { className: "dl-field" },
+    h(
+      "span",
+      { className: "dl-label dl-path", "data-dl-tip": `${source.label}: ${source.count} items` },
+      source.title
+    ),
+    h("input", {
+      className: "dl-input",
+      value: itemsValue(source),
+      placeholder: source.range,
+      "data-items": source.parameter,
+      onInput: (event: Event) => {
+        state.edits[source.parameter] = inputValue(event);
+        state.itemEditBases[source.parameter] = itemEditBase(source);
+        updateCounts();
+      },
+    }),
+    h("span", { className: "dl-preview dl-path", "data-preview": source.parameter }, itemsPreview(source, value)),
+    h(
+      "div",
+      { className: "dl-notice dl-error", "data-item-error": source.parameter, hidden: !error },
+      error ?? ""
+    )
+  );
+}
+
+function renderTasks() {
+  const sources = state.plan?.sources ?? [];
+  if (!sources.length) {
+    return null;
+  }
+  const mode = select(
+    [
+      ["one", "One task"],
+      ["split", "Multiple tasks"],
+    ],
+    splitsTasks() ? "split" : "one",
+    (value: string) => setSplit(value === "split")
+  );
+  const title = ["Tasks", h("span", { className: "dl-task-math", "data-role": "task-math" }, taskMath())];
+  if (!splitsTasks()) {
+    return section(
+      title,
+      true,
+      mode,
+      h(
+        "p",
+        { className: "dl-help" },
+        "The workflow runs as one task, as in ComfyUI. Choose Multiple tasks to run each item as its own task."
+      )
+    );
+  }
+  return section(
+    title,
+    true,
+    mode,
+    h(
+      "p",
+      { className: "dl-help" },
+      "Each field below runs its items as separate tasks, and fields multiply. Narrow a field to the items to run by number, such as 1-2 or 2,3, or set it to 0 to run that list whole in each task."
+    ),
+    sources.map(taskListField)
+  );
+}
+
 function parameterControl(
   parameter: Parameter,
   value: ParameterValue,
@@ -1300,11 +1620,14 @@ function renderParameters() {
   if (!plan) {
     return null;
   }
+  // The lists' fields are in the Tasks section.
+  const taskLists = new Set((plan.sources ?? []).map((source) => source.parameter));
   const groups = new Map<string, Parameter[]>();
   for (const parameter of plan.parameters) {
     const ui = parameter.userInterface ?? {};
     if (
       AUTOMATIC_PARAMETERS.has(parameter.name) ||
+      taskLists.has(parameter.name) ||
       ui.control === "HIDDEN"
     ) {
       continue;
@@ -2078,10 +2401,11 @@ function renderSubmit() {
         : null
     );
   }
+  const count = currentTaskCount();
   return h(
     "button",
     { className: "dl-button dl-primary dl-wide", disabled: !canSubmit(), onClick: submit },
-    "Submit"
+    state.plan?.sources?.length && splitsTasks() && count ? `Submit ${plural(count, "task")}` : "Submit"
   );
 }
 
@@ -2224,6 +2548,7 @@ const RENDERERS: Record<SectionName, () => Children> = {
   account: renderAccount,
   target: renderTarget,
   status: renderStatus,
+  tasks: renderTasks,
   jobSettings: renderJobSettings,
   parameters: renderParameters,
   queueParameters: renderQueueParameters,
@@ -2301,6 +2626,7 @@ export function renderPanel(element: HTMLElement): () => void {
     "account",
     "target",
     "status",
+    "tasks",
     "jobSettings",
     "parameters",
     "queueParameters",
@@ -2382,7 +2708,7 @@ export function openDialog() {
   document.body.append(overlay);
   document.addEventListener("keydown", onKey);
   dialog = { overlay, view: null };
-  dialog.view = createView(body, ["account", "target", "status", "submit"]);
+  dialog.view = createView(body, ["account", "target", "status", "tasks", "submit"]);
   loadAccount();
   loadPlan();
 }
@@ -2445,6 +2771,9 @@ textarea.dl-input { resize: vertical; }
 .dl-section > summary { cursor: pointer; padding: 8px 0; font-weight: 600; }
 .dl-section-body { padding-bottom: 8px; }
 .dl-help { color: var(--dl-muted); font-size: 12px; margin: 0 0 8px; }
+.dl-task-math { float: right; font-weight: 400; color: var(--dl-muted); }
+.dl-preview { color: var(--dl-muted); font-size: 11px; }
+.dl-preview:empty { display: none; }
 .dl-muted { color: var(--dl-muted); }
 .dl-row { display: flex; align-items: center; gap: 6px; }
 .dl-button { background: var(--dl-input); color: var(--dl-fg); border: 1px solid var(--dl-border);

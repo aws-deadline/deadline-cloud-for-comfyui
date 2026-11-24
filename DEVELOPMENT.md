@@ -78,6 +78,10 @@ a running ComfyUI, so test them by hand:
    have it. Check that the job log lists it under `Attached custom nodes` and that the job
    succeeds. Then remove the pack with its **✕** under **Attachments**, submit again, and check
    that the job fails on the missing node.
+8. Wire three prompts into a **Create List** that feeds a text-to-image workflow's prompt. Check
+   that the job runs as one task with all three prompts. Then choose **Multiple tasks**
+   under **Tasks**, and check that it shows 3 tasks, that the job runs 3, and that each output's
+   name ends with its item, such as `_List5-2`. Set the field to `2,3` and check that it runs 2.
 
 To exercise the routes without the frontend:
 
