@@ -322,7 +322,8 @@ class TestMacOS:
         import pwd
 
         # GIVEN
-        current_user = pwd.getpwuid(os.getuid())[0]
+        # mypy type-checks this on Windows too, where pwd and os.getuid don't exist.
+        current_user = pwd.getpwuid(os.getuid())[0]  # type: ignore[attr-defined]
 
         # WHEN
         bad_perms: defaultdict[Path, list[str]] = defaultdict(list)
@@ -334,7 +335,7 @@ class TestMacOS:
                 bad_perms[entry].append("should have user read/write permissions")
             if entry.is_dir() and not self._has_user_group_other_execute(mode):
                 bad_perms[entry].append("is a directory and should have execute permissions")
-            if entry.owner() != current_user:
+            if entry.owner() != current_user:  # type: ignore[misc]
                 bad_perms[entry].append(f"is not owned by the '{current_user}'")
 
         error_message = [f"Found {len(bad_perms)} instance(s) of incorrect permissions"]
