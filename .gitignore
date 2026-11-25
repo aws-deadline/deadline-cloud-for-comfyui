@@ -27,3 +27,6 @@ node_modules/
 # Created by install_submitter.py when the extension runs from this checkout
 .deadline-cli/
 deadline_cloud_submitter.json
+
+# Built by scripts/deps_bundle.py for the installers
+/dependency_bundle/

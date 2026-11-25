@@ -12,9 +12,11 @@ import asyncio
 import ipaddress
 import json
 import logging
+import platform
 import re
 import secrets
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -95,6 +97,12 @@ SAVED_JOB_SETTINGS = (
 _SUBMISSION_ID = re.compile(r"[0-9a-f]{32}")
 
 BRIDGE = Path(__file__).resolve().parent / "bridge.py"
+# The Deadline Cloud library and its dependencies, which the Windows and macOS installers unpack
+# next to the extension's __init__.py. A source installation doesn't have them, and runs the bridge
+# with the Deadline Cloud CLI's Python instead.
+INSTALLED_DEPENDENCIES = Path(__file__).resolve().parents[3] / "dependencies"
+# Which Pythons and CPU their compiled modules are for, written by scripts/deps_bundle.py.
+DEPENDENCIES_DESCRIPTION = INSTALLED_DEPENDENCIES / "bundle.json"
 # The bridge commands the panel can run directly.
 CLOUD_COMMANDS = ("status", "login", "farms", "queues", "queue", "set-defaults", "jobs")
 BRIDGE_TIMEOUT = 120
@@ -279,18 +287,59 @@ async def _cli_version_output(cli: str) -> str:
     return _cli_versions[cli]
 
 
+def _dependencies_mismatch() -> str | None:
+    """
+    Why ComfyUI's Python can't run the installer's dependencies, or None when it can. Their
+    compiled modules only load in the Python versions and on the CPU they were built for.
+    """
+    try:
+        description = json.loads(DEPENDENCIES_DESCRIPTION.read_text(encoding="utf-8"))
+        versions = [str(version) for version in description["python_versions"]]
+        system, machine = str(description["platform"]), str(description["machine"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return f"{DEPENDENCIES_DESCRIPTION} is missing or invalid. Run the installer again."
+    python = f"{sys.version_info.major}.{sys.version_info.minor}"
+    if python in versions and system == sys.platform and machine == platform.machine():
+        return None
+    return (
+        f"The Deadline Cloud dependencies that the installer added are for Python "
+        f"{' and '.join(versions)} on {machine}, but ComfyUI runs Python {python} on "
+        f"{platform.machine()}."
+    )
+
+
+def _uses_installed_dependencies() -> bool:
+    return INSTALLED_DEPENDENCIES.is_dir() and _dependencies_mismatch() is None
+
+
+def _without_installed_dependencies(message: str) -> str:
+    """Says why the installer's dependencies aren't used, before an error about the CLI."""
+    mismatch = _dependencies_mismatch() if INSTALLED_DEPENDENCIES.is_dir() else None
+    return f"{mismatch} {message}" if mismatch else message
+
+
+async def _bridge_cli(config: dict[str, Any]) -> str | None | web.Response:
+    """
+    The Deadline Cloud CLI whose Python runs the bridge, or None when ComfyUI's Python runs it with
+    the installer's dependencies. An error response when neither can.
+    """
+    if _uses_installed_dependencies():
+        return None
+    return await _checked_cli(config)
+
+
 async def _checked_cli(config: dict[str, Any]) -> str | web.Response:
     """Returns the Deadline Cloud CLI, once it's a version the submitter supports."""
     try:
         cli = resolve_deadline_cli(config)
     except SubmitError as e:
-        return _error(400, str(e))
+        return _error(400, _without_installed_dependencies(str(e)))
     try:
         check_cli_version(cli, await _cli_version_output(cli))
     except SubmitError as e:
         # Check again next time, so upgrading the CLI doesn't need a ComfyUI restart.
         _cli_versions.pop(cli, None)
-        return _error(400, str(e))
+        return _error(400, _without_installed_dependencies(str(e)))
     except (TimeoutError, OSError) as e:
         return _error(500, f"Couldn't run the Deadline Cloud CLI: {e}")
     return cli
@@ -889,23 +938,32 @@ async def plan_submission(request: web.Request) -> web.Response:
 
 async def _bridge_process(command: str, cli: str | None = None) -> asyncio.subprocess.Process:
     """
-    Starts bridge.py with the Python of the Deadline Cloud CLI, or of the configured one when cli
-    isn't given. Raises SubmitError.
+    Starts bridge.py with ComfyUI's Python and the installer's dependencies when they're for this
+    Python, or otherwise with the Python of the Deadline Cloud CLI, or of the configured one when
+    cli isn't given. Raises SubmitError.
     """
-    python = resolve_cli_python(cli or resolve_deadline_cli(load_config()))
+    # -I keeps this extension's modules and PYTHONPATH out of the bridge's environment.
+    if _uses_installed_dependencies():
+        # -S leaves ComfyUI's own packages out, so the bridge imports only the installed ones.
+        python = sys.executable
+        arguments = ["-I", "-S", str(BRIDGE), "--dependencies", str(INSTALLED_DEPENDENCIES)]
+    else:
+        try:
+            python = resolve_cli_python(cli or resolve_deadline_cli(load_config()))
+        except SubmitError as e:
+            raise SubmitError(_without_installed_dependencies(str(e)))
+        arguments = ["-I", str(BRIDGE)]
     try:
         return await asyncio.create_subprocess_exec(
-            # -I keeps this extension's modules and PYTHONPATH out of the CLI's environment.
             python,
-            "-I",
-            str(BRIDGE),
+            *arguments,
             command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
     except OSError as e:
-        raise SubmitError(f"Couldn't run the Deadline Cloud CLI's Python {python}: {e}")
+        raise SubmitError(f"Couldn't run the Deadline Cloud bridge with {python}: {e}")
 
 
 def _parse_event(line: bytes) -> dict[str, Any] | None:
@@ -1257,7 +1315,8 @@ async def submit_job(request: web.Request) -> web.Response:
         settings = _string_map(body.get("settings"), "settings")
     except SubmitError as e:
         return _error(400, str(e))
-    cli = await _checked_cli(config)
+    # The installer's dependencies submit without the Deadline Cloud CLI.
+    cli = await _bridge_cli(config)
     if isinstance(cli, web.Response):
         return cli
     try:
@@ -1588,7 +1647,8 @@ async def download_outputs(request: web.Request) -> web.Response:
         config = load_config()
     except SubmitError as e:
         return _error(400, str(e))
-    cli = await _checked_cli(config)
+    # The installer's dependencies download without the Deadline Cloud CLI.
+    cli = await _bridge_cli(config)
     if isinstance(cli, web.Response):
         return cli
     # The bridge downloads with the library, so it can check every file's destination against
@@ -1599,7 +1659,7 @@ async def download_outputs(request: web.Request) -> web.Response:
         return _error(500, str(e))
     if not await _write_line(process, {"farmId": farm_id, "queueId": queue_id, "jobId": job_id}):
         await _stop(process)
-        return _error(500, "The Deadline Cloud CLI's Python exited before it could download.")
+        return _error(500, "The Deadline Cloud bridge exited before it could download.")
     _start(_watch_download(process, job_id, client_id))
     return web.json_response({"jobId": job_id}, status=202)
 

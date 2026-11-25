@@ -32,6 +32,14 @@ classifiers = [
 # separately. See the README.
 dependencies = []
 
+# The Deadline Cloud library and its dependencies that the Windows and macOS installers bundle.
+# The installer unpacks them next to the extension, outside ComfyUI's environment, and the bridge
+# runs them with ComfyUI's Python. See scripts/deps_bundle.py.
+[dependency-groups]
+installer = [
+  "deadline >= 0.60.8, < 0.61",
+]
+
 [project.urls]
 Homepage = "https://github.com/aws-deadline/deadline-cloud-for-comfyui"
 Source = "https://github.com/aws-deadline/deadline-cloud-for-comfyui"

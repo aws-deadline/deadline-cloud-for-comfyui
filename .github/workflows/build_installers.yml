@@ -1,0 +1,47 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+name: "Build Installers"
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        required: true
+        default: Windows
+        type: choice
+        options:
+        - MacOS
+        - Windows
+      ref_type:
+        required: true
+        default: heads
+        type: choice
+        options:
+        - tags
+        - heads
+      ref:
+        required: true
+        type: string
+        default: main
+      environment:
+        required: true
+        type: choice
+        options:
+        - mainline
+
+permissions: {}
+
+jobs:
+  BuildInstaller:
+    if: (github.repository == 'aws-deadline/deadline-cloud-for-comfyui')
+    name: Build Installer
+    uses: aws-deadline/.github/.github/workflows/reusable_build_installers.yml@mainline
+    permissions:
+      contents: read
+      id-token: write
+    secrets: inherit
+    with:
+      environment: ${{inputs.environment}}
+      ref_type: ${{inputs.ref_type}}
+      ref: ${{inputs.ref}}
+      oses: "['${{inputs.os}}']"
+      project_name: "deadline-cloud-for-comfyui"

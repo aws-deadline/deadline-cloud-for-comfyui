@@ -2,10 +2,12 @@
 """
 Calls the Deadline Cloud client library for ComfyUI's submitter panel. ComfyUI runs this script with
 the Deadline Cloud CLI's own Python, `python -I bridge.py <command>`, so ComfyUI's environment
-doesn't need the library or boto3. It reads the request as a JSON object on the first line of
-stdin, and writes one JSON object per line to stdout: progress events while it works, then a
-"result" or an "error" event. While submitting, it reads each confirmation's answer as a further
-line of stdin.
+doesn't need the library or boto3. When the installer has unpacked the library next to the
+extension, ComfyUI's Python runs it instead, `python -I -S bridge.py --dependencies <folder>
+<command>`, where -S leaves ComfyUI's packages out. It reads the request as a JSON object on the
+first line of stdin, and writes one JSON object per line to stdout: progress events while it works,
+then a "result" or an "error" event. While submitting, it reads each confirmation's answer as a
+further line of stdin.
 
 It only imports the standard library and the `deadline` package, never the rest of this extension.
 """
@@ -16,6 +18,7 @@ import contextlib
 import json
 import os
 import re
+import site
 import sys
 import time
 from collections.abc import Callable
@@ -427,17 +430,39 @@ COMMANDS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
 }
 
 
+def _use_dependencies(folder: str, site_ran: bool = not sys.flags.no_site) -> None:
+    """
+    Adds the installer's dependencies to sys.path. routes.py starts the bridge with -S, so that
+    ComfyUI's packages stay out, but the embedded Python of ComfyUI's Windows portable build has a
+    ._pth file with `import site`, which turns site processing back on. Then ComfyUI's
+    site-packages, and the folders its .pth files added, are dropped from sys.path here instead.
+    """
+    if site_ran:
+        sys.path[:] = [path for path in sys.path if not _in_site_packages(path)]
+    # addsitedir also runs the folder's .pth files, as an installed site-packages would.
+    site.addsitedir(folder)
+
+
+def _in_site_packages(path: str) -> bool:
+    parts = Path(os.path.normcase(os.path.abspath(path))).parts
+    return any(part in ("site-packages", "dist-packages") for part in parts)
+
+
 def main(argv: list[str]) -> int:
     global _protocol
     _protocol = sys.stdout
-    if len(argv) != 2 or argv[1] not in COMMANDS:
-        emit("error", message=f"Usage: bridge.py {{{','.join(COMMANDS)}}}")
+    args = argv[1:]
+    if len(args) == 3 and args[0] == "--dependencies":
+        _use_dependencies(args[1])
+        args = args[2:]
+    if len(args) != 1 or args[0] not in COMMANDS:
+        emit("error", message=f"Usage: bridge.py [--dependencies FOLDER] {{{','.join(COMMANDS)}}}")
         return 2
     try:
         request = json.loads(sys.stdin.readline() or "{}")
         if not isinstance(request, dict):
             raise TypeError("The request isn't a JSON object.")
-        emit("result", data=COMMANDS[argv[1]](request))
+        emit("result", data=COMMANDS[args[0]](request))
     except Exception as e:  # noqa: BLE001 - every failure goes back to ComfyUI as an event.
         emit("error", message=str(e) or type(e).__name__, type=type(e).__name__)
         return 1

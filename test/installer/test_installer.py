@@ -1,0 +1,575 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+"""
+Runs a built installer against a stand-in ComfyUI folder. Run `hatch run test-installer` from the
+folder that contains the installer, or set COMFYUI_INSTALLER_PATH to it.
+"""
+
+import glob
+import json
+import os
+import platform
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    sys.platform not in ("darwin", "win32"), reason="The installers are for macOS and Windows"
+)
+
+EXTENSION_NAME = "deadline-cloud-for-comfyui"
+COMPONENT_NAME = "deadline_cloud_for_comfyui"
+# Mirrors scripts/deps_bundle.py's SUPPORTED_PYTHON_VERSIONS; not imported since
+# test/installer does not otherwise reach into scripts/.
+SUPPORTED_PYTHON_VERSIONS = ["3.13", "3.14"]
+
+
+@dataclass
+class Installation:
+    prefix: Path
+    comfyui: Path
+
+    @property
+    def extension(self) -> Path:
+        return self.comfyui / "custom_nodes" / EXTENSION_NAME
+
+
+@pytest.fixture(scope="session")
+def installer_path() -> Path:
+    path = "DeadlineCloudForComfyUISubmitter-{platform}-installer.{ext}"
+    if platform.system() == "Darwin":
+        path = path.format(platform="osx", ext="app")
+    else:
+        path = path.format(platform="windows-x64", ext="exe")
+
+    installer = Path(os.environ.get("COMFYUI_INSTALLER_PATH") or path)
+    if installer.suffix == ".app":
+        installer = installer / "Contents" / "MacOS" / "installbuilder.sh"
+
+    if not installer.is_file():
+        message = f"Installer not found at '{installer}'"
+        # In the shared build, a missing installer is a failed build rather than a test to skip.
+        if os.getenv("CODEBUILD_SRC_DIR") is not None:
+            raise FileNotFoundError(message)
+        pytest.skip(message)
+
+    if not os.access(installer, os.X_OK) and not platform.system() == "Darwin":
+        raise PermissionError(f"Installer at '{installer}' is not executable")
+
+    return installer.absolute()
+
+
+def _make_comfyui(path: Path) -> Path:
+    """A stand-in ComfyUI folder, with another extension that the installer must leave alone."""
+    comfyui = path / "ComfyUI"
+    (comfyui / "custom_nodes" / "other-node").mkdir(parents=True)
+    (comfyui / "main.py").write_text("")
+    (comfyui / "custom_nodes" / "other-node" / "__init__.py").write_text("")
+    return comfyui
+
+
+def _installer_args(installer_path: Path, prefix: Path, comfyui: Path) -> list[str]:
+    return [
+        str(installer_path),
+        # The Deadline Cloud submitter installer runs this installer with these options.
+        "--mode",
+        "unattended",
+        "--unattendedmodeui",
+        "none",
+        "--installscope",
+        "user",
+        "--prefix",
+        str(prefix),
+        "--comfyui-directory",
+        str(comfyui),
+        "--enable-components",
+        COMPONENT_NAME,
+    ]
+
+
+def _run_installer(installer_path: Path, tmp_path: Path) -> Installation:
+    # use a path that does not exist
+    installation = Installation(prefix=tmp_path / "dne", comfyui=_make_comfyui(tmp_path))
+    subprocess.run(
+        _installer_args(installer_path, installation.prefix, installation.comfyui), check=True
+    )
+    return installation
+
+
+def _validate_files(installation: Installation) -> None:
+    if platform.system() == "Darwin":
+        uninstaller = "uninstall.app"
+    else:
+        uninstaller = "uninstall.exe"
+
+    # THEN
+    top_level_dir = [f.name for f in installation.prefix.iterdir()]
+    assert "installer_version.txt" in top_level_dir
+    assert uninstaller in top_level_dir
+
+    for name in (
+        "__init__.py",
+        "LICENSE",
+        "NOTICE",
+        "src/deadline/comfyui_submitter/routes.py",
+        "src/deadline/comfyui_submitter/bridge.py",
+        "src/deadline/comfyui_submitter/web/deadline_submit.js",
+    ):
+        assert (installation.extension / name).is_file(), f"the extension is missing {name}"
+
+    # Just check that we have dependencies in this folder
+    dependencies = installation.extension / "dependencies"
+    dependency_names = [f.name for f in dependencies.iterdir()]
+    for package in ("deadline", "boto3", "psutil", "yaml"):
+        assert package in dependency_names
+    # awscrt reaches the bundle via deadline's console extra, requested by deps_bundle.py.
+    # Without it botocore reports CRT as unavailable and AWS Console sign-in fails.
+    assert "awscrt" in dependency_names
+    # The panel is a web page, so the bundle doesn't need Qt.
+    assert "PySide6" not in dependency_names
+    # Every bundled package's license ships with the extension.
+    licenses = (installation.extension / "THIRD_PARTY_LICENSES").read_text(encoding="utf-8")
+    for dist_info in dependencies.glob("*.dist-info"):
+        fields = dict(
+            line.split(": ", 1)
+            for line in (dist_info / "METADATA").read_text(encoding="utf-8").splitlines()
+            if line.startswith(("Name: ", "Version: "))
+        )
+        assert f"{fields['Name']} {fields['Version']}" in licenses, f"{dist_info.name} isn't listed"
+    # routes.py runs the bridge with ComfyUI's Python only when it's one the bundle is for.
+    description = json.loads((dependencies / "bundle.json").read_text())
+    assert description == {
+        "python_versions": SUPPORTED_PYTHON_VERSIONS,
+        "platform": sys.platform,
+        "machine": platform.machine(),
+    }
+
+    # A compiled module built for one Python version only imports under that version, and
+    # pyyaml hides a missing one by falling back to its pure-Python parser. So every module named
+    # for a version must be there for each supported version. That includes compiled packages
+    # that deps_bundle.py's NATIVE_DEPENDENCIES doesn't list yet. POSIX wheels name the module
+    # <module>.cpython-<tag>-<platform>.so, and Windows wheels <module>.cp<tag>-<platform>.pyd.
+    version_tagged = re.compile(r"(?P<module>[^.]+)\.(?:cpython-|cp)(?P<tag>3\d+)-")
+    tags: defaultdict[str, set[str]] = defaultdict(set)
+    for path in dependencies.rglob("*"):
+        if match := version_tagged.match(path.name):
+            module = (path.parent / match["module"]).relative_to(dependencies).as_posix()
+            tags[module].add(match["tag"])
+    # xxhash and pyyaml ship these today, so the check has something to check.
+    assert {"xxhash/_xxhash", "yaml/_yaml"} <= tags.keys()
+    expected = {version.replace(".", "") for version in SUPPORTED_PYTHON_VERSIONS}
+    missing = {
+        module: sorted(expected - found) for module, found in tags.items() if expected - found
+    }
+    assert not missing, f"compiled modules missing for some supported Pythons: {missing}"
+
+
+@pytest.fixture(scope="session")
+def user_installation(installer_path: Path, tmp_path_factory) -> Installation:
+    """Used for tests that just want to assert some facts around the install but do not modify"""
+    return _run_installer(installer_path, tmp_path_factory.mktemp("install"))
+
+
+@pytest.fixture(scope="function")
+def per_test_user_installation(installer_path: Path, tmp_path: Path) -> Installation:
+    """Used for tests that modify the installation"""
+    return _run_installer(installer_path, tmp_path)
+
+
+@pytest.fixture(scope="function")
+def uninstaller_path() -> Path:
+    if platform.system() == "Darwin":
+        return Path("uninstall.app", "Contents", "MacOS", "installbuilder.sh")
+    return Path("uninstall.exe")
+
+
+def test_default_location(installer_path: Path):
+    """Ensures that the default output location reported by the installer is accurate.
+       Example help output:
+
+    --prefix <prefix>                           Installation Directory
+                                                Default: /Users/<user>/DeadlineCloudForComfyUISubmitter
+    """
+    # GIVEN
+    default_install_location = Path("~/DeadlineCloudForComfyUISubmitter").expanduser()
+    default_pattern = r"Default: (.*)"
+    location = None
+
+    # WHEN
+    text_mode = [] if sys.platform == "win32" else ["--mode", "text"]
+    # Since windows doesn't have text mode, it'll pop-up a gui. We use the timeout to ensure it stops
+    try:
+        help_result = subprocess.run(
+            [installer_path, *text_mode, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        assert (
+            help_result.returncode == 0
+        ), f"Installer exited with non-zero code: {help_result.returncode}"
+        assert help_result.stdout is not None, "No stdout from --help"
+        help_text = help_result.stdout
+    except subprocess.TimeoutExpired as e:
+        assert e.stdout is not None, "No stdout from --help"
+        # mypy/docs say this should be bytes, but was str?
+        assert isinstance(e.stdout, str)
+        help_text = e.stdout
+
+    # THEN
+    help_output = iter(help_text.splitlines())
+    while (line := next(help_output, None)) is not None:
+        if line.strip().startswith("--prefix"):
+            location = re.match(default_pattern, next(help_output, "").strip(), flags=re.IGNORECASE)
+            break
+
+    assert (
+        location is not None
+    ), f"Could not find default install location in help output:\n{help_text}"
+    if platform.system() != "Windows":
+        assert location.group(1) == default_install_location.as_posix()
+    else:
+        assert str(Path(location.group(1))) == str(default_install_location)
+
+
+@pytest.mark.skipif(
+    os.getenv("CODEBUILD_SRC_DIR") is None or os.getenv("IS_DEV_BUILD", "false").lower() == "true",
+    reason="Only installers built with a license will not be evaluation mode",
+)
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="CLI usage for Windows does not make the eval text available"
+)
+def test_did_not_build_with_evaluation_mode(installer_path: Path, tmp_path: Path):
+    """Tests to see if there's an evaluation version header from installbuilder.
+
+    This is done by launching the installer, exiting before it completes, and checking the output
+    does NOT contain a specific line entry. Unfortunately this is makes the test pretty fragile, but
+    the behaviour has existed for years. If it exists it's expected to be the second line, but we check
+    the top few lines that we're guaranteed to have in case it shifts a tiny bit.
+
+    note: tmp_path is leveraged to ensure that the user's install is not messed with if the test does not
+    behave correctly."""
+    # GIVEN
+    eval_text = r"Created with an evaluation version of InstallBuilder"
+    output = []
+
+    # WHEN
+    proc = subprocess.Popen(
+        [installer_path, "--mode", "text", "--prefix", tmp_path],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    try:
+        # We want to fail the installer fast so that it doesn't proceed to install with the defaults
+        proc.wait(0.5)
+    except subprocess.TimeoutExpired:
+        # expected behaviour due to the above wait happening before the installer finishes
+        pass
+    finally:
+        proc.terminate()
+        proc.kill()
+
+    # THEN
+    assert proc.stdout is not None
+    # Example header from installbuilder
+    """----------------------------------------------------------------------------
+    Created with an evaluation version of InstallBuilder
+
+    Welcome to the AWS Deadline Cloud for ... Submitter Setup Wizard.
+
+    ----------------------------------------------------------------------------
+    """
+    output = [proc.stdout.readline().strip() for _ in range(6)]
+    assert output
+
+    for line in output:
+        assert (
+            eval_text not in line
+        ), "Installer was detected to have been built with Evaluation mode"
+
+
+@pytest.mark.skipif(platform.system() != "Darwin", reason="Only run on MacOS")
+class TestMacOS:
+    def test_user_permissions(self, user_installation: Installation):
+        # GIVEN / WHEN / THEN
+        self._validate_posix_permissions(user_installation.prefix)
+        self._validate_posix_permissions(user_installation.extension)
+
+    def _has_group_other_write(self, mode: int) -> bool:
+        return bool(mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+    def _has_user_read_write(self, mode: int) -> bool:
+        return bool(mode & (stat.S_IRUSR | stat.S_IWUSR))
+
+    def _has_user_group_other_execute(self, mode: int) -> bool:
+        return bool(mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+
+    def _validate_posix_permissions(self, installation_path: Path):
+        # assists mypy type checking to ignore this on Windows
+        assert sys.platform != "win32"
+        # pwd is not available on Windows
+        import pwd
+
+        # GIVEN
+        # mypy type-checks this on Windows too, where pwd and os.getuid don't exist.
+        current_user = pwd.getpwuid(os.getuid())[0]  # type: ignore[attr-defined]
+
+        # WHEN
+        bad_perms: defaultdict[Path, list[str]] = defaultdict(list)
+        for entry in [installation_path, *installation_path.rglob("*")]:
+            mode = stat.S_IMODE(entry.stat().st_mode)
+            if self._has_group_other_write(mode):
+                bad_perms[entry].append("should not have group/other write permissions")
+            if not self._has_user_read_write(mode):
+                bad_perms[entry].append("should have user read/write permissions")
+            if entry.is_dir() and not self._has_user_group_other_execute(mode):
+                bad_perms[entry].append("is a directory and should have execute permissions")
+            if entry.owner() != current_user:  # type: ignore[misc]
+                bad_perms[entry].append(f"is not owned by the '{current_user}'")
+
+        error_message = [f"Found {len(bad_perms)} instance(s) of incorrect permissions"]
+        for i, entry in enumerate(bad_perms):
+            fmted_reasons = "\n  - ".join(reason for reason in bad_perms[entry])
+            error_message.append(
+                f"{i+1}. ({stat.S_IMODE(entry.stat().st_mode):o}) '{Path(*entry.parts[len(installation_path.parts):])!s:>3}'\n"
+                f"  - {fmted_reasons}"
+            )
+
+        # THEN
+        assert len(bad_perms) == 0, "\n".join(error_message)
+
+
+class TestUserInstall:
+    def test_install(self, user_installation: Installation):
+        # GIVEN / WHEN / THEN
+        _validate_files(user_installation)
+
+    @pytest.mark.skipif(
+        f"{sys.version_info.major}.{sys.version_info.minor}" not in SUPPORTED_PYTHON_VERSIONS,
+        reason="The dependencies are built for the Pythons that ComfyUI runs on",
+    )
+    def test_dependencies_load(self, user_installation: Installation):
+        """The bridge loads the dependencies like this, with ComfyUI's packages left out by -S."""
+        # GIVEN
+        load = (
+            "import site, sys; site.addsitedir(sys.argv[1]); "
+            "import deadline.client.api, xxhash, yaml._yaml, awscrt"
+        )
+
+        # WHEN
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                load,
+                str(user_installation.extension / "dependencies"),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        # THEN
+        assert result.returncode == 0, result.stderr
+
+    def test_uninstall(self, per_test_user_installation: Installation, uninstaller_path: Path):
+        # GIVEN
+        installation = per_test_user_installation
+
+        # WHEN
+        result = subprocess.run(
+            [installation.prefix / uninstaller_path, "--mode", "unattended"],
+            check=False,
+        )
+
+        # THEN
+        assert result.returncode == 0
+
+        # On Windows, the uninstall process will return before the uninstallation is complete.
+        # If necessary, wait for up to 1 minute 40 seconds before timing out.
+        if platform.system() == "Windows":
+            for _ in range(10):
+                if not installation.prefix.exists() and not installation.extension.exists():
+                    break
+                time.sleep(10)
+        assert not installation.prefix.exists()
+        assert not installation.extension.exists()
+        # The rest of ComfyUI, including other extensions, is left alone.
+        assert (installation.comfyui / "main.py").is_file()
+        assert (installation.comfyui / "custom_nodes" / "other-node" / "__init__.py").is_file()
+
+
+@pytest.mark.parametrize("problem", ["no custom_nodes", "a clone of the extension"])
+def test_invalid_comfyui_folders_are_rejected(installer_path: Path, tmp_path: Path, problem: str):
+    # GIVEN
+    prefix = tmp_path / "dne"
+    comfyui = _make_comfyui(tmp_path)
+    extension = comfyui / "custom_nodes" / EXTENSION_NAME
+    if problem == "no custom_nodes":
+        shutil.rmtree(comfyui / "custom_nodes")
+    else:
+        # Uninstalling removes the extension folder, so the installer mustn't take over a clone.
+        extension.mkdir()
+        (extension / "__init__.py").write_text("# a clone\n")
+
+    # WHEN
+    result = subprocess.run(
+        _installer_args(installer_path, prefix, comfyui),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    # THEN
+    assert result.returncode != 0
+    assert not (prefix / "installer_version.txt").exists()
+    if problem == "no custom_nodes":
+        assert not extension.exists()
+    else:
+        assert [f.name for f in extension.iterdir()] == ["__init__.py"]
+        assert (extension / "__init__.py").read_text() == "# a clone\n"
+
+
+def test_a_base_directory_without_main_py_is_accepted(installer_path: Path, tmp_path: Path):
+    """ComfyUI started with --base-directory, or legacy Comfy Desktop, loads custom_nodes from a
+    folder without main.py."""
+    # GIVEN
+    prefix = tmp_path / "dne"
+    comfyui = _make_comfyui(tmp_path)
+    (comfyui / "main.py").unlink()
+
+    # WHEN
+    subprocess.run(_installer_args(installer_path, prefix, comfyui), check=True)
+
+    # THEN
+    _validate_files(Installation(prefix=prefix, comfyui=comfyui))
+
+
+@pytest.mark.skipif(
+    platform.system() != "Darwin", reason="Comfy Desktop's build list is faked on macOS"
+)
+def test_defaults_to_the_first_comfy_desktop_build(installer_path: Path, tmp_path: Path):
+    """Without --comfyui-directory, and with no ComfyUI in ~/ComfyUI, the installer uses the first
+    build in Comfy Desktop's installations.json."""
+    # GIVEN a home folder of its own, so the real Comfy Desktop builds are never touched
+    home = tmp_path / "home"
+    builds = [home / "ComfyUI-Installs" / name for name in ("First build", "Second build")]
+    for build in builds:
+        _make_comfyui(build)
+    builds_file = home / "Library" / "Application Support" / "Comfy Desktop" / "installations.json"
+    builds_file.parent.mkdir(parents=True)
+    builds_file.write_text(
+        json.dumps(
+            [{"id": f"inst-{i}", "installPath": str(b)} for i, b in enumerate(builds)], indent=2
+        )
+    )
+    prefix = tmp_path / "dne"
+    args = _installer_args(installer_path, prefix, builds[1] / "ComfyUI")
+    index = args.index("--comfyui-directory")
+    del args[index : index + 2]
+
+    # WHEN
+    subprocess.run(args, check=True, env={**os.environ, "HOME": str(home)})
+
+    # THEN
+    _validate_files(Installation(prefix=prefix, comfyui=builds[0] / "ComfyUI"))
+    assert not (builds[1] / "ComfyUI" / "custom_nodes" / EXTENSION_NAME).exists()
+
+
+@pytest.mark.skipif(
+    os.getenv("CODEBUILD_SRC_DIR") is None or os.getenv("IS_DEV_BUILD", "false").lower() == "true",
+    reason="Only installers built internally will be signed",
+)
+class TestVerifySigning:
+    @pytest.mark.skipif(platform.system() != "Windows", reason="Only run on Windows")
+    def test_windows_signing(self, installer_path: Path):
+        r"""Assumes that the Windows SDK is installed so we can find signtool:
+            C:/Program Files*/Windows Kits/*/bin/*/x64/signtool.exe
+        Example success:
+
+            Index  Algorithm  Timestamp
+            ========================================
+            0      sha256     Authenticode
+
+            Successfully verified: C:\*.exe
+
+        Example failure:
+
+            Index  Algorithm  Timestamp
+            ========================================
+            SignTool Error: No signature found.
+
+            Number of errors: 1
+        """
+        # GIVEN
+        # Check PATH, then SDK installation location
+        signtool = shutil.which("signtool")
+        if not signtool:
+            signtool = next(
+                glob.iglob("C:/Program Files*/Windows Kits/*/bin/*/x64/signtool.exe"), None
+            )
+        assert signtool, "signtool not found in expected location"
+
+        # WHEN
+        result = subprocess.run(
+            [signtool, "verify", "/pa", installer_path],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        # THEN
+        assert "SignTool Error:" not in result.stderr, "signtool did not succeed"
+        assert result.returncode == 0
+        assert "Successfully verified:" in result.stdout
+
+    @pytest.mark.skipif(platform.system() != "Darwin", reason="Only run on MacOS")
+    def test_macos_signing(self, installer_path: Path):
+        """Tests that the relevant files are signed on MacOS. Assumes codesign and spectl are on the PATH
+
+        Leverages codesign to check signing, and spctl to verify that MacOS does not complain about running it
+        """
+        # GIVEN
+        codesign = shutil.which("codesign")
+        spctl = shutil.which("spctl")
+        assert codesign, "codesign not found in PATH"
+        assert spctl, "spctl not found in PATH"
+
+        # WHEN / THEN
+        codesign_result = subprocess.run(
+            [codesign, "--verify", "--deep", "--verbose", installer_path],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert (
+            "code object is not signed at all" not in codesign_result.stdout
+        ), "The file is not signed"
+        assert codesign_result.returncode == 0
+
+        # WHEN / THEN
+        spctl_result = subprocess.run(
+            [spctl, "--verbose", "--assess", "--type", "execute", installer_path],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert (
+            "rejected" not in spctl_result.stderr
+        ), "MacOS will not allow this file to be executed"
+        assert spctl_result.returncode == 0
+        # success message is sent to stderr
+        assert "accepted" in spctl_result.stderr, "File was not accepted by MacOS"

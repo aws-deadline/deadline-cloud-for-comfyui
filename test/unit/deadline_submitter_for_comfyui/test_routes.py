@@ -8,6 +8,7 @@ import asyncio
 import importlib
 import json
 import os
+import platform
 import re
 import shlex
 import sys
@@ -736,6 +737,60 @@ def test_cloud_runs_the_bridge_with_the_cli_python(comfy, monkeypatch):
     assert request["request"] == {"region": "eu-west-2"}
 
 
+def write_dependencies(comfy, monkeypatch, python_versions: list[str] | None = None) -> Path:
+    """The installer's dependencies folder, for this Python unless python_versions says otherwise."""
+    dependencies = comfy.tmp_path / "dependencies"
+    dependencies.mkdir()
+    this_python = f"{sys.version_info.major}.{sys.version_info.minor}"
+    description = {
+        "python_versions": python_versions or [this_python],
+        "platform": sys.platform,
+        "machine": platform.machine(),
+    }
+    (dependencies / "bundle.json").write_text(json.dumps(description))
+    monkeypatch.setattr(comfy.routes, "INSTALLED_DEPENDENCIES", dependencies)
+    monkeypatch.setattr(comfy.routes, "DEPENDENCIES_DESCRIPTION", dependencies / "bundle.json")
+    return dependencies
+
+
+def installed_dependencies(comfy, monkeypatch, responses: dict) -> tuple[Path, Path]:
+    """
+    An installer's installation: the dependencies next to the extension, ComfyUI's Python running
+    the fake bridge, and no Deadline Cloud CLI. Returns the dependencies and the bridge's requests.
+    """
+    dependencies = write_dependencies(comfy, monkeypatch)
+    monkeypatch.setenv(submit.CLI_ENV_VAR, str(comfy.tmp_path / "missing-deadline"))
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, responses)
+    monkeypatch.setattr(sys, "executable", os.environ[submit.PYTHON_ENV_VAR])
+    return dependencies, requests
+
+
+def test_cloud_runs_the_bridge_with_the_installed_dependencies(comfy, monkeypatch):
+    farms = {"farms": [{"farmId": "farm-1", "displayName": "Render"}]}
+    dependencies, requests = installed_dependencies(comfy, monkeypatch, {"farms": [result(farms)]})
+    status, body = run(call(comfy, "/deadline/cloud/farms", {}))
+    assert (status, body) == (200, farms)
+    [request] = bridge_requests(requests)
+    assert request["argv"] == [
+        "-I",
+        "-S",
+        str(comfy.routes.BRIDGE),
+        "--dependencies",
+        str(dependencies),
+        "farms",
+    ]
+
+
+def test_jobs_submits_with_the_installed_dependencies_without_the_cli(comfy, monkeypatch):
+    dependencies, requests = installed_dependencies(
+        comfy, monkeypatch, {"submit": [result({"jobId": "job-1"})]}
+    )
+    status, _ = run(call(comfy, "/deadline/jobs", JOB))
+    assert status == 202
+    [request] = bridge_requests(requests)
+    assert request["argv"][-3:] == ["--dependencies", str(dependencies), "submit"]
+
+
 def test_cloud_reports_library_errors(comfy, monkeypatch):
     fake_cli(monkeypatch, comfy.tmp_path, "")
     error = {"event": "error", "message": "The security token included in the request is expired"}
@@ -797,6 +852,42 @@ def test_set_defaults_saves_only_checked_ids_and_empty_resets(comfy, monkeypatch
     assert status == 200
     [request] = bridge_requests(requests)
     assert request["request"] == {**DEFAULTS, "storageProfileId": ""}
+
+
+def test_dependencies_for_another_python_fall_back_to_the_cli(comfy, monkeypatch):
+    """ComfyUI's Python can't load compiled modules built for other versions, so the CLI's runs."""
+    write_dependencies(comfy, monkeypatch, python_versions=["2.7"])
+    fake_cli(monkeypatch, comfy.tmp_path, "")
+    farms: dict[str, list] = {"farms": []}
+    requests = fake_bridge(monkeypatch, comfy.tmp_path, {"farms": [result(farms)]})
+    status, body = run(call(comfy, "/deadline/cloud/farms", {}))
+    assert (status, body) == (200, farms)
+    [request] = bridge_requests(requests)
+    assert request["argv"] == ["-I", str(comfy.routes.BRIDGE), "farms"]
+
+
+def test_dependencies_for_another_python_without_a_cli_say_why(comfy, monkeypatch):
+    write_dependencies(comfy, monkeypatch, python_versions=["2.7", "2.8"])
+    monkeypatch.delenv(submit.CLI_ENV_VAR, raising=False)
+    monkeypatch.setenv("PATH", str(comfy.tmp_path))
+    this_python = f"{sys.version_info.major}.{sys.version_info.minor}"
+    status, body = run(call(comfy, "/deadline/cloud/farms", {}))
+    assert status == 502
+    assert f"are for Python 2.7 and 2.8 on {platform.machine()}" in body["error"]
+    assert f"ComfyUI runs Python {this_python}" in body["error"]
+    assert "CLI wasn't found" in body["error"]
+    status, body = run(post(comfy, {"workflow": WORKFLOW}))
+    assert status == 400
+    assert "are for Python 2.7 and 2.8" in body["error"]
+
+
+def test_dependencies_without_a_description_say_to_reinstall(comfy, monkeypatch):
+    dependencies = write_dependencies(comfy, monkeypatch)
+    (dependencies / "bundle.json").unlink()
+    monkeypatch.setenv(submit.CLI_ENV_VAR, str(comfy.tmp_path / "missing-deadline"))
+    status, body = run(call(comfy, "/deadline/cloud/farms", {}))
+    assert status == 502
+    assert "bundle.json is missing or invalid. Run the installer again." in body["error"]
 
 
 def test_cloud_needs_the_cli_python(comfy, monkeypatch):
@@ -2236,6 +2327,18 @@ def test_download_runs_the_bridge_and_reports_progress(comfy, monkeypatch):
             },
         ),
     ]
+
+
+def test_download_runs_the_bridge_with_the_installed_dependencies(comfy, monkeypatch):
+    """An installer's installation downloads without the Deadline Cloud CLI, like it submits."""
+    dependencies, requests = installed_dependencies(
+        comfy, monkeypatch, {"download": [DOWNLOAD_PROGRESS, DOWNLOADED]}
+    )
+    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
+    status, response = run(call(comfy, "/deadline/jobs/download", body))
+    assert (status, response) == (202, {"jobId": JOB_ID})
+    [request] = bridge_requests(requests)
+    assert request["argv"][-3:] == ["--dependencies", str(dependencies), "download"]
 
 
 @pytest.mark.parametrize("directory", [None, 5, ["/comfy/output"]])
