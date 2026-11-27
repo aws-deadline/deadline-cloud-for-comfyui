@@ -1060,7 +1060,8 @@ if (scenario === "prototype-names") {
     { name: "__proto__", type: "STRING", default: "p" },
   ];
   state.plan.values = {};
-  ui.__workflowEdits().edits.__proto__ = "q";
+  // A computed key sets the __proto__ parameter's value, not the prototype.
+  Object.assign(ui.__workflowEdits().edits, { ["__proto__"]: "q" });
   const sent = await submitAgain();
   result.parameters = sent.parameters;
 }
