@@ -22,7 +22,17 @@ declare module "*/scripts/app.js" {
   export interface ExtensionManager {
     registerSidebarTab(tab: SidebarTab): void;
     toast: { add(message: ToastMessage): void };
-    workflow?: { activeWorkflow?: { filename?: string; path?: string } | null };
+    workflow?: {
+      activeWorkflow?: {
+        filename?: string;
+        path?: string;
+        // Unsaved changes, and whether the workflow was ever saved to a file.
+        isModified?: boolean;
+        isTemporary?: boolean;
+      } | null;
+      // The workflows open in tabs.
+      openWorkflows?: { path?: string }[];
+    };
     sidebarTab?: { activeSidebarTabId?: string | null };
     command: { execute(id: string): void };
   }
@@ -38,7 +48,14 @@ declare module "*/scripts/app.js" {
     name: string;
     commands?: Command[];
     menuCommands?: { path: string[]; commands: string[] }[];
-    actionBarButtons?: { icon: string; label: string; tooltip: string; onClick: () => void }[];
+    actionBarButtons?: {
+      icon: string;
+      label: string;
+      tooltip: string;
+      // Classes for the button, which frontend 1.55 and later apply.
+      class?: string;
+      onClick: () => void;
+    }[];
     setup?(): void;
     afterConfigureGraph?(): void;
   }
@@ -51,6 +68,8 @@ declare module "*/scripts/app.js" {
 
   export interface ComfyApp {
     extensionManager: ExtensionManager;
+    // The open workflow. ComfyUI saves its extra with it.
+    graph: { extra: Record<string, unknown> };
     registerExtension(extension: ComfyExtension): void;
     graphToPrompt(): Promise<GraphPrompt>;
   }

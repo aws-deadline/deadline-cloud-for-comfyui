@@ -313,7 +313,6 @@ def test_routes_check_origin_even_without_fetch_metadata(
         "/deadline/jobs",
         "/deadline/jobs/confirm",
         "/deadline/jobs/cancel",
-        "/deadline/jobs/download",
         "/deadline/cloud/farms",
         "/deadline/choose",
     ],
@@ -966,6 +965,7 @@ def test_jobs_submits_with_the_library(comfy, monkeypatch):
         "priority": 70,
         "targetTaskRunStatus": "SUSPENDED",
         "name": "ComfyUI - fox",
+        "requirePathsExist": True,
     }
 
     events = comfy.server.events
@@ -988,16 +988,7 @@ def test_jobs_submits_with_the_library(comfy, monkeypatch):
         "deadline.confirm",
         {**submission, "message": "Upload?", "default": True, "promptId": prompt_id},
     )
-    # The panel shows each job's output directory, where Download puts its outputs.
-    assert events[2] == (
-        "deadline.submitted",
-        {
-            **submission,
-            **submitted,
-            "status": "SUBMITTED",
-            "outputDir": str(comfy.tmp_path / "output"),
-        },
-    )
+    assert events[2] == ("deadline.submitted", {**submission, **submitted, "status": "SUBMITTED"})
     assert comfy.routes._submissions == {}
 
 
@@ -1034,10 +1025,11 @@ def test_jobs_keeps_the_templates_host_requirements_by_default(comfy, monkeypatc
     assert (bundle / "template.yaml").read_text() == submit.JOB_TEMPLATE.read_text()
 
 
-def test_jobs_passes_require_paths_exist_to_the_library(comfy, monkeypatch):
+@pytest.mark.parametrize("settings", [{}, {"requirePathsExist": False}])
+def test_jobs_always_require_the_input_paths_to_exist(comfy, monkeypatch, settings):
+    """A missing input file stops the submission, rather than the job running without it."""
     requests = fake_tools(monkeypatch, comfy.tmp_path)
-    body = {**JOB, "settings": {"requirePathsExist": True}}
-    status, _ = run(call(comfy, "/deadline/jobs", body))
+    status, _ = run(call(comfy, "/deadline/jobs", {**JOB, "settings": settings}))
     assert status == 202
     assert bridge_requests(requests)[0]["request"]["settings"]["requirePathsExist"] is True
 
@@ -1091,6 +1083,31 @@ def test_jobs_attaches_the_artists_files(comfy, monkeypatch):
         ({"farmId": ""}, "Choose a farm and a queue."),
         ({"parameters": {"a": [1]}}, "parameters must be an object of strings and numbers."),
         ({"settings": "fast"}, "settings must be an object of strings and numbers."),
+        ({"settings": {"priority": 101}}, "priority must be a whole number from 0 to 100."),
+        ({"settings": {"priority": 2.5}}, "priority must be a whole number from 0 to 100."),
+        (
+            {"settings": {"maxFailedTasksCount": True}},
+            "maxFailedTasksCount must be a whole number from 0 to 2147483647.",
+        ),
+        (
+            {"settings": {"maxWorkerCount": 0}},
+            "maxWorkerCount must be a whole number from 1 to 2147483647.",
+        ),
+        (
+            {"settings": {"targetTaskRunStatus": "PAUSED"}},
+            "targetTaskRunStatus must be READY or SUSPENDED.",
+        ),
+        *[
+            (
+                {"settings": {"name": name}},
+                "The job name must be 1 to 128 characters, without {{, }} or control characters.",
+            )
+            for name in ("", "x" * 129, "fox {{Param.X}}", "fox\x07")
+        ],
+        (
+            {"description": "one\x00two"},
+            "The job description can't have control characters other than tabs and line breaks.",
+        ),
         ({"attachments": []}, "attachments must be an object."),
         ({"attachments": {"filenames": "/a"}}, "attachments.filenames must be a list of paths."),
     ],
@@ -1984,14 +2001,21 @@ def test_jobs_ignore_hidden_paths_from_the_request(comfy, monkeypatch):
     """The panel doesn't show them, and a custom nodes folder of any path would load as code."""
     fake_cli(monkeypatch, comfy.tmp_path, "")
     requests = fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [result({"jobId": "job-1"})]})
-    parameters = {"CustomNodesDirectory": "/tmp", "ModelDirectory": "/", "ComfyUIArgs": "--lowvram"}
+    parameters = {
+        "CustomNodesDirectory": "/tmp",
+        "ModelDirectory": "/",
+        "InputDir": "/elsewhere",
+        "OutputDir": "/renders",
+    }
     status, _ = run(call(comfy, "/deadline/jobs", {**JOB, "parameters": parameters}))
     assert status == 202
     sent = bridge_requests(requests)[0]["request"]["parameters"]
     assert "CustomNodesDirectory" not in sent
     assert "ModelDirectory" not in sent
-    # Parameters the panel shows are still the artist's.
-    assert sent["ComfyUIArgs"] == "--lowvram"
+    # The inputs come from ComfyUI's input directory.
+    assert sent["InputDir"] == str(comfy.tmp_path / "input")
+    # Paths the panel shows are still the artist's.
+    assert sent["OutputDir"] == "/renders"
 
 
 def test_jobs_warns_when_a_planned_local_model_cant_be_staged(comfy, monkeypatch):
@@ -2170,36 +2194,60 @@ REQUIREMENTS = {
 }
 
 
+# A studio template's host requirements, on each of its two steps.
+STUDIO_REQUIREMENTS = {
+    "attributes": [{"name": "attr.worker.os.family", "anyOf": ["linux"]}],
+    "amounts": [{"name": "amount.worker.gpu", "min": 1}],
+}
+
+
 def _template_steps(bundle_dir: Path) -> list[dict]:
     return yaml.safe_load((bundle_dir / "template.yaml").read_text())["steps"]
+
+
+def _use_studio_template(comfy, monkeypatch) -> None:
+    """Submits with our job template run in two steps, each with STUDIO_REQUIREMENTS."""
+    template = yaml.safe_load(submit.JOB_TEMPLATE.read_text())
+    [step] = template["steps"]
+    template["steps"] = [
+        {**step, "hostRequirements": STUDIO_REQUIREMENTS},
+        {**step, "name": "Again", "hostRequirements": STUDIO_REQUIREMENTS},
+    ]
+    studio = comfy.tmp_path / "studio.yaml"
+    studio.write_text(yaml.safe_dump(template, sort_keys=False))
+    monkeypatch.setenv(submit.TEMPLATE_ENV_VAR, str(studio))
 
 
 def test_plan_starts_host_requirements_from_the_job_template(comfy, monkeypatch):
     fake_cli(monkeypatch, comfy.tmp_path, "")
     status, body = run(call(comfy, "/deadline/plan", {"workflow": WORKFLOW, "name": "fox"}))
-    assert status == 200
-    assert body["hostRequirements"] == {
-        "attributes": [{"name": "attr.worker.os.family", "anyOf": ["linux"]}],
-        "amounts": [{"name": "amount.worker.gpu", "min": 1}],
-    }
+    # Ours has none, so the form starts empty.
+    assert (status, body["hostRequirements"]) == (200, {})
+    _use_studio_template(comfy, monkeypatch)
+    status, body = run(call(comfy, "/deadline/plan", {"workflow": WORKFLOW, "name": "fox"}))
+    assert (status, body["hostRequirements"]) == (200, STUDIO_REQUIREMENTS)
 
 
 def test_jobs_replaces_the_host_requirements_and_description(comfy, monkeypatch):
     fake_tools(monkeypatch, comfy.tmp_path)
+    _use_studio_template(comfy, monkeypatch)
     body = {**JOB, "hostRequirements": REQUIREMENTS, "description": "Fox lookdev"}
     status, response = run(call(comfy, "/deadline/jobs", body))
     assert status == 202
     template = yaml.safe_load((Path(response["job_bundle"]) / "template.yaml").read_text())
     assert template["description"] == "Fox lookdev"
-    assert [step["hostRequirements"] for step in template["steps"]] == [REQUIREMENTS]
+    assert [step["hostRequirements"] for step in template["steps"]] == [REQUIREMENTS] * 2
 
 
 def test_jobs_runs_on_any_worker_when_the_requirements_are_cleared(comfy, monkeypatch):
     fake_tools(monkeypatch, comfy.tmp_path)
+    _use_studio_template(comfy, monkeypatch)
     body = {**JOB, "hostRequirements": {"attributes": [], "amounts": []}}
     status, response = run(call(comfy, "/deadline/jobs", body))
     assert status == 202
-    assert "hostRequirements" not in _template_steps(Path(response["job_bundle"]))[0]
+    steps = _template_steps(Path(response["job_bundle"]))
+    assert [step["name"] for step in steps if "hostRequirements" in step] == []
+    assert len(steps) == 2
 
 
 def test_jobs_rejects_bad_host_requirements_before_submitting(comfy, monkeypatch):
@@ -2248,131 +2296,21 @@ def test_bundle_saves_the_values_without_submitting(comfy, monkeypatch):
     assert not (bundle / comfy.routes.SUBMISSION_MARKER).exists()
 
 
+def test_bundle_rejects_bad_job_settings(comfy, monkeypatch):
+    body = {"workflow": WORKFLOW, "settings": {"maxRetriesPerTask": -1}}
+    status, response = run(call(comfy, "/deadline/bundle", body))
+    assert (status, response) == (
+        400,
+        {"error": "maxRetriesPerTask must be a whole number from 0 to 2147483647."},
+    )
+
+
 def test_bundle_rejects_bad_host_requirements(comfy, monkeypatch):
     status, response = run(
         call(comfy, "/deadline/bundle", {"workflow": WORKFLOW, "hostRequirements": "linux"})
     )
     assert status == 400
     assert "hostRequirements" in response["error"]
-
-
-@pytest.mark.parametrize(
-    "client",
-    [
-        {},
-        {"clientId": None},
-        {"clientId": ""},
-        {"clientId": "../tab"},
-        {"clientId": "tab 1"},
-        {"clientId": "tab-1\n"},
-        {"clientId": "a" * 129},
-        {"clientId": 123},
-        {"clientId": True},
-        {"clientId": ["tab-1"]},
-        {"clientId": {"tab": "1"}},
-    ],
-)
-def test_download_requires_a_valid_client_before_starting_tools(comfy, monkeypatch, client):
-    def unexpected_tool_call(*args, **kwargs):
-        pytest.fail("An invalid client must not start download tools.")
-
-    monkeypatch.setattr(comfy.routes, "load_config", unexpected_tool_call)
-    monkeypatch.setattr(comfy.routes.asyncio, "create_subprocess_exec", unexpected_tool_call)
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, **client}
-    status, response = run(call(comfy, "/deadline/jobs/download", body))
-    assert status == 400
-    assert "valid browser clientId" in response["error"]
-    assert comfy.routes._watchers == set()
-    assert comfy.server.events == []
-    assert comfy.server.sids == []
-
-
-DOWNLOAD_PROGRESS = {"event": "progress", "stage": "downloading", "progress": 50.0, "message": ""}
-DOWNLOADED = result({"fileCount": 2, "directory": "/comfy/output", "message": "Downloaded 2 files"})
-
-
-@pytest.mark.parametrize("client_id", ["tab-1", "tab_A-9", "a" * 128])
-def test_download_sends_events_only_to_the_tab_that_asked(comfy, monkeypatch, client_id):
-    fake_cli(monkeypatch, comfy.tmp_path, "")
-    fake_bridge(monkeypatch, comfy.tmp_path, {"download": [DOWNLOAD_PROGRESS, DOWNLOADED]})
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": client_id}
-    status, _ = run(call(comfy, "/deadline/jobs/download", body))
-    assert status == 202
-    assert comfy.server.sids == [client_id, client_id]
-
-
-def test_download_runs_the_bridge_and_reports_progress(comfy, monkeypatch):
-    args_file = fake_cli(monkeypatch, comfy.tmp_path, "")
-    requests = fake_bridge(
-        monkeypatch, comfy.tmp_path, {"download": [DOWNLOAD_PROGRESS, DOWNLOADED]}
-    )
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
-    status, response = run(call(comfy, "/deadline/jobs/download", body))
-    assert (status, response) == (202, {"jobId": JOB_ID})
-    [request] = bridge_requests(requests)
-    assert request["argv"][-1] == "download"
-    assert request["request"] == {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID}
-    # The bridge downloads, rather than the CLI, so it can check where each file goes.
-    assert not args_file.exists()
-    assert comfy.server.events == [
-        ("deadline.download", {"jobId": JOB_ID, "status": "DOWNLOADING", "progress": 50.0}),
-        (
-            "deadline.download",
-            {
-                "jobId": JOB_ID,
-                "status": "DOWNLOADED",
-                "message": "Downloaded 2 files",
-                "fileCount": 2,
-                "directory": "/comfy/output",
-            },
-        ),
-    ]
-
-
-def test_download_runs_the_bridge_with_the_installed_dependencies(comfy, monkeypatch):
-    """An installer's installation downloads without the Deadline Cloud CLI, like it submits."""
-    dependencies, requests = installed_dependencies(
-        comfy, monkeypatch, {"download": [DOWNLOAD_PROGRESS, DOWNLOADED]}
-    )
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
-    status, response = run(call(comfy, "/deadline/jobs/download", body))
-    assert (status, response) == (202, {"jobId": JOB_ID})
-    [request] = bridge_requests(requests)
-    assert request["argv"][-3:] == ["--dependencies", str(dependencies), "download"]
-
-
-@pytest.mark.parametrize("directory", [None, 5, ["/comfy/output"]])
-def test_download_leaves_out_a_folder_it_cant_tell(comfy, monkeypatch, directory):
-    data = {"fileCount": 1, "message": "Downloaded 1 file"}
-    if directory is not None:
-        data["directory"] = directory
-    fake_cli(monkeypatch, comfy.tmp_path, "")
-    fake_bridge(monkeypatch, comfy.tmp_path, {"download": [result(data)]})
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
-    run(call(comfy, "/deadline/jobs/download", body))
-    assert comfy.server.events[-1][1]["status"] == "DOWNLOADED"
-    assert "directory" not in comfy.server.events[-1][1]
-
-
-def test_download_reads_stderr_while_waiting_for_the_result(comfy, monkeypatch):
-    """A bridge that fills its stderr pipe before printing its result still finishes."""
-    fake_cli(monkeypatch, comfy.tmp_path, "")
-    fake_bridge(monkeypatch, comfy.tmp_path, {"download": ["noisy", DOWNLOADED]})
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
-    run(asyncio.wait_for(call(comfy, "/deadline/jobs/download", body), 30))
-    assert comfy.server.events[-1][1]["status"] == "DOWNLOADED"
-
-
-def test_download_reports_output_it_cant_read(comfy, monkeypatch):
-    """The panel stops showing the download as running, whatever went wrong reading it."""
-    fake_cli(monkeypatch, comfy.tmp_path, "")
-    long_line = {"event": "progress", "message": "x" * (1 << 17)}
-    fake_bridge(monkeypatch, comfy.tmp_path, {"download": [long_line, "hang"]})
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
-    run(asyncio.wait_for(call(comfy, "/deadline/jobs/download", body), 30))
-    [(event, data)] = comfy.server.events
-    assert (event, data["status"]) == ("deadline.download", "FAILED")
-    assert "Couldn't read the Deadline Cloud library's output" in data["error"]
 
 
 def test_a_submission_whose_output_cant_be_read_is_stopped_and_reported(comfy, monkeypatch):
@@ -2388,44 +2326,15 @@ def test_a_submission_whose_output_cant_be_read_is_stopped_and_reported(comfy, m
     assert comfy.routes._submissions == {}
 
 
-def test_download_reports_failures(comfy, monkeypatch):
-    fake_cli(monkeypatch, comfy.tmp_path, "")
-    error = {"event": "error", "message": "Credentials are expired"}
-    fake_bridge(monkeypatch, comfy.tmp_path, {"download": [error]})
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
-    run(call(comfy, "/deadline/jobs/download", body))
-    assert comfy.server.events[-1] == (
-        "deadline.download",
-        {"jobId": JOB_ID, "status": "FAILED", "error": "Credentials are expired"},
-    )
-    assert comfy.server.sids == ["tab-1"]
-
-
-def test_download_reports_a_bridge_that_crashed(comfy, monkeypatch, caplog):
-    fake_cli(monkeypatch, comfy.tmp_path, "")
-    fake_bridge(monkeypatch, comfy.tmp_path, {"download": ["crash"]})
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
-    with caplog.at_level("ERROR", logger=comfy.routes.logger.name):
-        run(call(comfy, "/deadline/jobs/download", body))
-    assert comfy.server.events[-1][1] == {
-        "jobId": JOB_ID,
-        "status": "FAILED",
-        "error": "The Deadline Cloud library failed. Traceback: boom",
-    }
-    assert f"Couldn't download the outputs of {JOB_ID}:" in caplog.text
-
-
-def test_download_failures_log_the_error_indented(comfy, monkeypatch, caplog):
+def test_submission_failures_log_the_error_indented(comfy, monkeypatch, caplog):
     fake_cli(monkeypatch, comfy.tmp_path, "")
     error = {"event": "error", "message": "Credentials are expired\nERROR forged entry"}
-    fake_bridge(monkeypatch, comfy.tmp_path, {"download": [error]})
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
+    fake_bridge(monkeypatch, comfy.tmp_path, {"submit": [error]})
     with caplog.at_level("ERROR", logger=comfy.routes.logger.name):
-        run(call(comfy, "/deadline/jobs/download", body))
+        run(call(comfy, "/deadline/jobs", JOB))
     message = caplog.records[-1].getMessage()
     assert message.splitlines() == [
-        f"Couldn't download the outputs of {JOB_ID}:",
-        "    Credentials are expired",
+        "Couldn't submit ComfyUI - fox to Deadline Cloud: Credentials are expired",
         "    ERROR forged entry",
     ]
 
@@ -2441,25 +2350,8 @@ ACCESS_DENIED = (
 )
 
 
-def test_download_failures_log_aws_errors_without_account_details(comfy, monkeypatch, caplog):
-    """ComfyUI serves its log from a route that doesn't check the Host header."""
-    fake_cli(monkeypatch, comfy.tmp_path, "")
-    fake_bridge(
-        monkeypatch, comfy.tmp_path, {"download": [{"event": "error", "message": ACCESS_DENIED}]}
-    )
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": JOB_ID, "clientId": "tab-1"}
-    with caplog.at_level("ERROR", logger=comfy.routes.logger.name):
-        run(call(comfy, "/deadline/jobs/download", body))
-    message = caplog.records[-1].getMessage()
-    for detail in ("123456789012", "artist@example.com", "Artist", "ASIAABCDEFGHIJKLMNOP"):
-        assert detail not in message
-    assert "arn:aws:sts::<account>:<redacted>" in message
-    assert "arn:aws:deadline:us-west-2:<account>:<redacted>" in message
-    # The tab that asked still gets the whole error, to fix its permissions.
-    assert comfy.server.events[-1][1]["error"] == ACCESS_DENIED
-
-
 def test_submission_failures_log_aws_errors_without_account_details(comfy, monkeypatch, caplog):
+    """ComfyUI serves its log from a route that doesn't check the Host header."""
     fake_cli(monkeypatch, comfy.tmp_path, "")
     fake_bridge(
         monkeypatch, comfy.tmp_path, {"submit": [{"event": "error", "message": ACCESS_DENIED}]}
@@ -2468,8 +2360,12 @@ def test_submission_failures_log_aws_errors_without_account_details(comfy, monke
         status, _ = run(call(comfy, "/deadline/jobs", JOB))
     assert status == 202
     [record] = [r for r in caplog.records if "Couldn't submit" in r.getMessage()]
-    assert "123456789012" not in record.getMessage()
-    assert "artist@example.com" not in record.getMessage()
+    message = record.getMessage()
+    for detail in ("123456789012", "artist@example.com", "Artist", "ASIAABCDEFGHIJKLMNOP"):
+        assert detail not in message
+    assert "arn:aws:sts::<account>:<redacted>" in message
+    assert "arn:aws:deadline:us-west-2:<account>:<redacted>" in message
+    # The tab that submitted still gets the whole error, to fix its permissions.
     assert comfy.server.events[-1][1]["error"] == ACCESS_DENIED
 
 
@@ -2479,12 +2375,6 @@ def test_bridge_failures_log_stderr_without_account_details(comfy, caplog):
     assert "123456789012" not in caplog.text
     assert "artist@example.com" not in caplog.text
     assert message == f"The Deadline Cloud library failed. {ACCESS_DENIED}"
-
-
-def test_download_only_takes_deadline_ids(comfy, monkeypatch):
-    body = {"farmId": FARM, "queueId": QUEUE, "jobId": "--profile=evil", "clientId": "tab-1"}
-    status, _ = run(call(comfy, "/deadline/jobs/download", body))
-    assert status == 400
 
 
 def use_basic_template(comfy, monkeypatch) -> Path:
@@ -2764,14 +2654,25 @@ def test_plan_lists_local_custom_nodes_and_doesnt_warn_about_them(comfy, monkeyp
     assert not (comfy.tmp_path / "user" / "deadline_submissions").exists()
 
 
-def test_plan_hides_the_custom_nodes_directory_and_offers_the_switch(comfy, monkeypatch):
+def test_plan_shows_only_the_output_directory_and_the_timeouts(comfy, monkeypatch):
+    """
+    Job Properties shows Output Directory and Advanced settings the timeouts, so our template
+    leaves nothing for a Job parameters drawer. The workers still read the hidden ones, such as
+    Attach Custom Nodes, at their defaults, and the submitter fills in the folders.
+    """
     fake_cli(monkeypatch, comfy.tmp_path, "")
     status, body = run(call(comfy, "/deadline/plan", {"workflow": WORKFLOW, "name": "fox"}))
     assert status == 200
     parameters = {parameter["name"]: parameter for parameter in body["parameters"]}
-    assert parameters["CustomNodesDirectory"]["userInterface"]["control"] == "HIDDEN"
-    assert parameters["AttachCustomNodes"]["userInterface"]["control"] == "CHECK_BOX"
+    shown = [
+        name
+        for name, parameter in parameters.items()
+        if parameter["userInterface"]["control"] != "HIDDEN" and name != "WorkflowFile"
+    ]
+    assert shown == ["OutputDir", "ServerStartTimeout", "WorkflowTimeout"]
     assert parameters["AttachCustomNodes"]["default"] == "true"
+    # Six hours.
+    assert parameters["WorkflowTimeout"]["default"] == 21600
 
 
 def test_plan_warns_about_custom_nodes_it_cant_find(comfy, monkeypatch):

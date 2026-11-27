@@ -134,22 +134,27 @@ def resolve_cli_python(cli: str) -> str:
     )
 
 
-PICKER_KINDS = ("files", "folder")
+PICKER_KINDS = ("files", "folder", "file")
+# The panel opens these for attachments and for the job's path parameters, such as its output
+# directory, which isn't attached.
 _PICKER_PROMPTS = {
-    "files": "Choose files to attach to the Deadline Cloud job",
-    "folder": "Choose a folder to attach to the Deadline Cloud job",
+    "files": "Choose files for the Deadline Cloud job",
+    "folder": "Choose a folder for the Deadline Cloud job",
+    "file": "Choose a file for the Deadline Cloud job",
 }
 
 
 def picker_command(kind: str, platform: str = sys.platform) -> list[str] | None:
     """
     Returns the command for a native file or folder dialog, which prints one absolute path per line,
-    or None when there isn't one. The browser only chooses the kind.
+    or None when there isn't one. The browser only chooses the kind: files, a folder, or one file.
     """
     prompt = _PICKER_PROMPTS[kind]
     if platform == "darwin":
         if kind == "folder":
             return ["osascript", "-e", f'POSIX path of (choose folder with prompt "{prompt}")']
+        if kind == "file":
+            return ["osascript", "-e", f'POSIX path of (choose file with prompt "{prompt}")']
         return [
             "osascript",
             "-e",
@@ -177,16 +182,19 @@ def picker_command(kind: str, platform: str = sys.platform) -> list[str] | None:
                 "if($d.ShowDialog() -eq 'OK'){[Console]::Out.Write($d.SelectedPath)}"
             )
         else:
+            multiple = "$true" if kind == "files" else "$false"
             script = (
                 utf8 + "Add-Type -AssemblyName System.Windows.Forms;"
                 "$d=New-Object System.Windows.Forms.OpenFileDialog;"
-                f"$d.Title='{prompt}';$d.Multiselect=$true;"
+                f"$d.Title='{prompt}';$d.Multiselect={multiple};"
                 "if($d.ShowDialog() -eq 'OK'){[Console]::Out.Write(($d.FileNames -join \"`n\"))}"
             )
         return ["powershell", "-NoProfile", "-STA", "-Command", script]
     if shutil.which("zenity"):
         command = ["zenity", "--file-selection", f"--title={prompt}"]
-        return command + (["--directory"] if kind == "folder" else ["--multiple", "--separator=\n"])
+        if kind == "folder":
+            return [*command, "--directory"]
+        return [*command, "--multiple", "--separator=\n"] if kind == "files" else command
     return None
 
 
@@ -1172,6 +1180,18 @@ _RESERVED_CAPABILITY_NAMES = ("worker", "job", "step", "task")
 _CAPABILITY_NAME = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]{0,63}(\.[a-zA-Z_][a-zA-Z0-9_]{0,63})*")
 _ATTRIBUTE_VALUE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_-]{0,99}")
 MAX_JOB_DESCRIPTION = 2048
+MAX_JOB_NAME = 128
+# Template expressions, which OpenJD would read in a job name, and control characters. A
+# description can have tabs and line breaks.
+_NAME_FORBIDDEN = re.compile(r"\{\{|\}\}|[\x00-\x1f\x7f-\x9f]")
+_DESCRIPTION_FORBIDDEN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+# Deadline Cloud's limits for the job settings that are whole numbers.
+_SETTING_RANGES = {
+    "priority": (0, 100),
+    "maxFailedTasksCount": (0, 2147483647),
+    "maxRetriesPerTask": (0, 2147483647),
+    "maxWorkerCount": (1, 2147483647),
+}
 
 
 def _capability_name(name: Any, prefix: str, standard: tuple[str, ...]) -> str:
@@ -1351,7 +1371,35 @@ def job_description(value: Any) -> str | None:
         raise SubmitError("description must be a string.")
     if len(value) > MAX_JOB_DESCRIPTION:
         raise SubmitError(f"The job description can't be over {MAX_JOB_DESCRIPTION} characters.")
+    if _DESCRIPTION_FORBIDDEN.search(value):
+        raise SubmitError(
+            "The job description can't have control characters other than tabs and line breaks."
+        )
     return value
+
+
+def check_job_settings(settings: dict[str, Any]) -> None:
+    """Checks the panel's job settings against Deadline Cloud's limits. Raises SubmitError."""
+    name = settings.get("name")
+    if name is not None and (
+        not isinstance(name, str)
+        or not 1 <= len(name) <= MAX_JOB_NAME
+        or _NAME_FORBIDDEN.search(name)
+    ):
+        raise SubmitError(
+            f"The job name must be 1 to {MAX_JOB_NAME} characters, without {{{{, }}}} or "
+            "control characters."
+        )
+    for key, (low, high) in _SETTING_RANGES.items():
+        value = settings.get(key)
+        # Empty leaves the queue's default.
+        if value is None or value == "":
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+            raise SubmitError(f"{key} must be a whole number from {low} to {high}.")
+    status = settings.get("targetTaskRunStatus")
+    if status not in (None, "") and str(status).upper() not in ("READY", "SUSPENDED"):
+        raise SubmitError("targetTaskRunStatus must be READY or SUSPENDED.")
 
 
 def template_host_requirements(job_template: dict[str, Any]) -> dict[str, Any]:

@@ -2,6 +2,7 @@
 // Runs one scenario against the real deadline_ui.js with ComfyUI stubbed out, and prints what
 // happened as JSON. test_panel.py lays out the files and checks the result.
 import { webcrypto } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { app } from "./scripts/app.js";
 import { api } from "./scripts/api.js";
 
@@ -53,15 +54,17 @@ function emitConfirmation(message = "Upload?", defaultAnswer = true, promptId = 
       promptId,
     });
   } catch {
-    // Without a document, opening the dialog fails after the prompt has been recorded.
+    // Without a document, opening the popover fails after the prompt has been recorded.
   }
 }
 function confirmationAnswers() {
   return api.calls.filter(({ path }) => path === "/deadline/jobs/confirm").map(({ body }) => body);
 }
 // Opens another workflow tab, or goes back to one, as ComfyUI does, and reads it.
+// Each workflow opened, by file name. Selecting its tab again opens the same object, as in ComfyUI.
+const workflows = {};
 async function openWorkflow(filename) {
-  app.extensionManager.workflow.activeWorkflow = { filename, path: `workflows/${filename}` };
+  app.extensionManager.workflow.activeWorkflow = workflows[filename] ??= { filename, path: `workflows/${filename}` };
   ui.workflowLoaded();
   await ui.loadPlan(true);
 }
@@ -73,10 +76,53 @@ class NodeStub {
     this.attributes = {};
     this.listeners = {};
     this.scrollTop = 0;
-    this.open = false;
+    this.className = "";
+    this.style = {};
+  }
+  // As in the DOM, these properties are their attributes.
+  get open() {
+    return this.getAttribute("open") !== null;
+  }
+  set open(value) {
+    this.toggleAttribute("open", value);
+  }
+  get hidden() {
+    return this.getAttribute("hidden") !== null;
+  }
+  set hidden(value) {
+    this.toggleAttribute("hidden", value);
+  }
+  toggleAttribute(name, on) {
+    if (on) {
+      this.attributes[name] = "";
+    } else {
+      delete this.attributes[name];
+    }
+  }
+  get textContent() {
+    return text(this);
+  }
+  set textContent(value) {
+    this.children = [String(value)];
+  }
+  get classList() {
+    const names = () => this.className.split(" ").filter(Boolean);
+    return {
+      contains: (name) => names().includes(name),
+      add: (name) => (this.className = [...new Set([...names(), name])].join(" ")),
+      toggle: (name, on) => (this.className = [...names().filter((other) => other !== name), ...(on ? [name] : [])].join(" ")),
+    };
   }
   append(child) {
     this.children.push(child);
+    if (child instanceof NodeStub) {
+      child.parent = this;
+    }
+  }
+  remove() {
+    if (this.parent) {
+      this.parent.children = this.parent.children.filter((child) => child !== this);
+    }
   }
   setAttribute(name, value) {
     this.attributes[name] = value;
@@ -84,18 +130,41 @@ class NodeStub {
   getAttribute(name) {
     return this.attributes[name] ?? null;
   }
+  getBoundingClientRect() {
+    return { left: 0, bottom: 0, width: 0 };
+  }
   replaceChildren(...children) {
-    this.children = children;
+    this.children = [];
+    children.forEach((child) => this.append(child));
+  }
+  querySelector(selector) {
+    if (selector === ":scope > summary") {
+      return this.children.find((child) => child instanceof NodeStub && child.tag === "summary") ?? null;
+    }
+    throw new Error(`Unsupported selector: ${selector}`);
   }
   querySelectorAll(selector) {
     return descendants(this).slice(1).filter((node) => {
       if (selector === "details") return node.tag === "details";
       if (selector === "[data-dl-scroll]") return node.getAttribute("data-dl-scroll") !== null;
+      if (selector === "[name]") return node.getAttribute("name") !== null;
+      if (selector === "[data-role='host-reset']") return node.getAttribute("data-role") === "host-reset";
       throw new Error(`Unsupported selector: ${selector}`);
     });
   }
+  // Each event's listeners run in the order they were added, as one.
   addEventListener(name, handler) {
-    this.listeners[name] = handler;
+    const before = this.listeners[name];
+    this.listeners[name] = before ? (event) => (before(event), handler(event)) : handler;
+  }
+  contains(node) {
+    return descendants(this).includes(node);
+  }
+  focus() {
+    document.activeElement = this;
+  }
+  setSelectionRange(start, end) {
+    this.selection = [start, end];
   }
 }
 const descendants = (node) => [
@@ -106,12 +175,39 @@ const text = (node) =>
   node.children.map((child) => (child instanceof NodeStub ? text(child) : String(child))).join("");
 function installDom() {
   globalThis.Node = NodeStub;
-  globalThis.document = { createElement: (tag) => new NodeStub(tag) };
+  globalThis.HTMLInputElement = NodeStub;
+  globalThis.HTMLTextAreaElement = NodeStub;
+  globalThis.window = { innerWidth: 1280 };
+  // The popover is added to the body, and the host requirements' Reset is found in it.
+  const body = new NodeStub("body");
+  globalThis.document = {
+    createElement: (tag) => new NodeStub(tag),
+    body,
+    querySelector: () => null,
+    querySelectorAll: (selector) => body.querySelectorAll(selector),
+    addEventListener() {},
+    removeEventListener() {},
+  };
 }
-// What a view shows with the data-role, or null.
-function shownText(container, role) {
-  const node = descendants(container).find((child) => child.getAttribute?.("data-role") === role);
-  return node ? text(node) : null;
+// The drawers in a node, outermost first, each with the drawers inside it.
+function drawers(node) {
+  return node.children
+    .filter((child) => child instanceof NodeStub)
+    .flatMap((child) => (child.tag === "details" ? [child] : drawers(child)));
+}
+const drawerTitle = (details) => text(details.children[0]);
+function drawerTree(node) {
+  return drawers(node).map((details) => [drawerTitle(details), drawerTree(details.children[1])]);
+}
+// The drawer with the title, among every drawer in the container.
+const drawer = (container, title) => container.querySelectorAll("details").find((node) => drawerTitle(node) === title);
+const openDrawers = (container) => container.querySelectorAll("details").filter((node) => node.open).map(drawerTitle);
+const withClass = (node, className) => descendants(node).filter((child) => child.classList?.contains(className));
+const buttonsIn = (node) => descendants(node).filter((child) => child.tag === "button");
+// A new sidebar panel.
+function renderedPanel() {
+  const container = new NodeStub("div");
+  return { container, view: ui.__createView(container, ui.__panelSections) };
 }
 
 api.handlers["/deadline/cloud/status"] = async () => ({
@@ -222,25 +318,22 @@ if (scenario === "answer-confirmation") {
   result.cleared = await sent();
   result.shownAfterClearing = ui.__queueParameterValue(field);
 } else if (scenario.startsWith("queue-")) {
-  // The queue environment's Conda Channels, edited and then cleared or reset in the panel.
+  // The queue environment's Conda Channels, with the value the queue's details give the job, edited
+  // and then cleared or reset in the panel.
   state.queue = {
     parameters: [{ name: "CondaChannels", type: "STRING", default: "deadline-cloud" }],
+    values: { CondaChannels: "deadline-cloud-v2 deadline-cloud" },
     storageProfiles: [],
   };
   if (scenario === "queue-configured") {
     state.plan.queueValues = { CondaChannels: "s3://bucket/Conda/Default conda-forge" };
   }
+  const sent = async () => (await submitAgain()).parameters.CondaChannels ?? null;
+  result.unedited = await sent();
   ui.editQueueParameter("CondaChannels", "my-channel");
-  await ui.submit();
-  await settle();
-  result.edited = api.calls.at(-1).body.parameters.CondaChannels ?? null;
-  state.submission = null;
+  result.edited = await sent();
   ui.editQueueParameter("CondaChannels", "");
-  await ui.submit();
-  await settle();
-  result.cleared = "CondaChannels" in api.calls.at(-1).body.parameters
-    ? api.calls.at(-1).body.parameters.CondaChannels
-    : null;
+  result.cleared = await sent();
 } else if (scenario.startsWith("early-")) {
   // The server's event arrives before the response to the submission request.
   const response = deferred();
@@ -264,7 +357,7 @@ if (scenario === "answer-confirmation") {
       api.emit("deadline.submitted", { ...detail, status: "SUBMITTED", jobId: "job-1" });
     }
   } catch {
-    // Without a document, opening the dialog for the confirmation fails after it's recorded.
+    // Without a document, opening the popover for the confirmation fails after it's recorded.
   }
   response.resolve();
   await submitting;
@@ -286,7 +379,7 @@ if (scenario === "answer-confirmation") {
   const planned = Array.from({ length: 105 }, (_, index) => `/input/image-${index}.png`);
   state.plan.attachments = { filenames: [...planned, external], directories: ["/outside/frames"] };
   ui.__attachmentEdits().added = { filenames: [manualFile], directories: [manualFolder] };
-  const view = ui.__createView(container, ["attachments"]);
+  const view = ui.__createView(container, ["advanced"]);
   container.querySelectorAll("details")[0].open = true;
   list("inputs").scrollTop = 640;
   result.listed = rows().map((row) => row.attributes.title);
@@ -309,7 +402,7 @@ if (scenario === "answer-confirmation") {
     name: `model-${index}.safetensors`,
     directory: "checkpoints",
   }));
-  view.render(["attachments"]);
+  view.render(["advanced"]);
   result.inputScrollAfterAddingModels = list("inputs").scrollTop;
   result.newModelScroll = list("models").scrollTop;
   list("models").scrollTop = 320;
@@ -318,7 +411,7 @@ if (scenario === "answer-confirmation") {
   click("/models/model-30.safetensors");
   result.scrollAfterRestoringModel = { inputs: list("inputs").scrollTop, models: list("models").scrollTop };
   state.plan.localModels = [];
-  view.render(["attachments"]);
+  view.render(["advanced"]);
   result.inputScrollAfterModelsDisappear = list("inputs").scrollTop;
   result.attachmentsStillOpen = container.querySelectorAll("details")[0].open;
   // A custom node pack is removed and added back like a model, and the status warns about it.
@@ -326,7 +419,7 @@ if (scenario === "answer-confirmation") {
   const localNodes = [{ name: "studio-nodes", path: pack, size: 3_200_000_000, files: 12_500, counted: true }];
   api.handlers["/deadline/plan"] = async (body) => ({ ...planFor(body), localNodes });
   await ui.loadPlan(true);
-  view.render(["attachments"]);
+  view.render(["advanced"]);
   result.packRow = text(rows().find((row) => row.attributes.title === pack));
   result.largePackStatus = text(ui.__renderers.status());
   click(pack);
@@ -353,54 +446,6 @@ if (scenario === "answer-confirmation") {
   await ui.submit();
   await settle();
   result.excludedModels = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body.excludedModels;
-} else if (scenario.startsWith("poll-")) {
-  // Recent jobs' status, polled through the bridge's jobs command.
-  const job = { jobId: "job-1", name: "fox", farmId: "farm-1", queueId: "queue-1", submittedAt: "" };
-  state.jobs = [job];
-  let running = 0;
-  result.mostAtOnce = 0;
-  const answer = deferred();
-  let calls = 0;
-  api.handlers["/deadline/cloud/jobs"] = async (body) => {
-    calls += 1;
-    running += 1;
-    result.mostAtOnce = Math.max(result.mostAtOnce, running);
-    if (scenario === "poll-overlapping") {
-      await answer.promise;
-    }
-    running -= 1;
-    const runningJob = { jobId: "job-1", taskRunStatus: "RUNNING", taskRunStatusCounts: { SUCCEEDED: 1 } };
-    const status =
-      scenario === "poll-error"
-        ? { jobId: "job-1", error: "Not found", notFound: true }
-        : scenario === "poll-transient" && calls === 2
-          ? { jobId: "job-1", error: "Rate exceeded" }
-          : runningJob;
-    return { jobs: [status] };
-  };
-  if (scenario === "poll-overlapping") {
-    // A job is submitted while the panel's first poll is still waiting for the bridge.
-    const first = ui.__pollJobs();
-    const second = ui.__pollJobs();
-    const third = ui.__pollJobs();
-    await settle();
-    answer.resolve();
-    await Promise.all([first, second, third]);
-  } else if (scenario === "poll-transient") {
-    // The second poll fails for a moment, such as when throttled.
-    await ui.__pollJobs();
-    await ui.__pollJobs();
-    result.statusAfterError = state.jobStatus["job-1"].taskRunStatus ?? null;
-    await ui.__pollJobs();
-  } else if (scenario === "poll-after-account") {
-    // Opening the panel loads the account, then polls straight away, not at the next timer.
-    await ui.loadAccount(true);
-    await settle();
-  } else {
-    await ui.__pollJobs();
-    await ui.__pollJobs();
-  }
-  result.polls = api.calls.filter(({ path }) => path === "/deadline/cloud/jobs").length;
 } else if (scenario === "host-round-trip") {
   // Editing the form rebuilds the requirements from it, so it has to hold every template value.
   const requirements = {
@@ -411,117 +456,6 @@ if (scenario === "answer-confirmation") {
     amounts: [{ name: "amount.worker.gpu", min: 1 }],
   };
   result.requirements = ui.__requirementsFromForm(ui.__formFromRequirements(requirements));
-} else if (scenario === "download-nothing") {
-  state.jobs = [{ jobId: "job-1", name: "fox", farmId: "farm-1", queueId: "queue-1", submittedAt: "" }];
-  const message = "There are no output files available for download at this moment.";
-  api.emit("deadline.download", { jobId: "job-1", status: "DOWNLOADED", message, fileCount: 0 });
-  result.toasts = app.toasts.map(({ severity, detail }) => ({ severity, detail }));
-} else if (scenario === "submitted-output-dir") {
-  api.emit("deadline.submitted", {
-    submissionId: "s-1",
-    status: "SUBMITTED",
-    name: "fox",
-    jobId: "job-1",
-    farmId: "farm-1",
-    queueId: "queue-1",
-    outputDir: "/comfy/output",
-  });
-  result.outputDir = state.jobs[0].outputDir;
-} else if (scenario.startsWith("downloaded-to-")) {
-  // The CLI's folder wins. Without one, the folder the job was submitted with is named.
-  const job = { jobId: "job-1", name: "fox", farmId: "farm-1", queueId: "queue-1", submittedAt: "" };
-  state.jobs = [scenario === "downloaded-to-unknown" ? job : { ...job, outputDir: "/comfy/output" }];
-  const directory = scenario === "downloaded-to-cli-folder" ? "/comfy/output/fox" : undefined;
-  const message = "Downloaded 2 files";
-  api.emit("deadline.download", { jobId: "job-1", status: "DOWNLOADED", message, fileCount: 2, directory });
-  result.toasts = app.toasts.map(({ detail }) => detail);
-} else if (scenario.startsWith("task-lists")) {
-  // A Create List and a folder of images, which run in every combination.
-  const source = (name, kind, values) => ({
-    name,
-    parameter: `${name}Items`,
-    label: name,
-    title: name,
-    kind,
-    values,
-    count: values.length,
-    range: `1-${values.length}`,
-  });
-  const sources = [
-    source("List1", "list", ["fox", "cat", "owl"]),
-    source("Folder2", "folder", ["a.png", "b.png", "c.png", "d.png", "e.png"]),
-  ];
-  // A workflow runs as one task until the artist chooses to split its lists into tasks.
-  result.splitByDefault = ui.splitsTasks();
-  ui.setSplit(true);
-  result.counts = ["1-4", "1-20:2", "7, 42, 99", "4-1", "x", "0", ""].map(ui.countRange);
-  // OpenJD refuses overlapping parts and empty parts, so the panel does too.
-  result.openjdCounts = ["1-3,2", "2,2", "1-5:2,2", "1,,2", "1,", "3,1", "1-5:2,6"].map(ui.countRange);
-  result.tasks = ui.taskCount(sources, (item) => item.range);
-  result.previews = ["2-5", "0", "x", "3,1"].map((value) => ui.itemsPreview(sources[1], value));
-  // A field holds item numbers from 1 to the list's count, or 0 to run that list whole in each task.
-  result.listCounts = ["1-3", "2,3", "0", "2-5", "-1", "0,1", "1-3:2", "1-4:3"].map((value) =>
-    ui.taskCount([sources[0]], () => value)
-  );
-  // The panel sends each field's range as its job parameter, and won't submit a bad one.
-  state.plan.sources = sources;
-  state.plan.parameters = sources.map(({ parameter, range }) => ({
-    name: parameter,
-    type: "STRING",
-    default: range,
-    userInterface: { groupLabel: "Tasks" },
-  }));
-  state.edits.Folder2Items = "x";
-  result.canSubmitBadRange = Boolean(ui.canSubmit());
-  state.edits.Folder2Items = "1-2";
-  result.canSubmit = Boolean(ui.canSubmit());
-  await ui.submit();
-  await settle();
-  result.parameters = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body.parameters;
-  result.splitRequest = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body.splitTasks;
-  // One task: the job gets no list parameters, and the panel says not to split.
-  state.submission = null;
-  ui.setSplit(false);
-  result.wholeTasks = ui.taskCount(sources, (item) => state.edits[item.parameter] ?? item.range);
-  await ui.submit();
-  await settle();
-  const whole = api.calls.filter(({ path }) => path === "/deadline/jobs").at(-1).body;
-  result.wholeParameters = whole.parameters;
-  result.wholeRequest = whole.splitTasks;
-  ui.setSplit(true);
-  result.splitAgain = ui.taskCount(sources, (item) => state.edits[item.parameter] ?? item.range);
-  // An edit follows its list until the list's items change.
-  state.submission = null;
-  const replan = async (values) => {
-    api.handlers["/deadline/plan"] = async (body) => ({
-      ...planFor(body),
-      sources: [source("List1", "list", values)],
-    });
-    await ui.loadPlan(true);
-    return state.edits.List1Items ?? null;
-  };
-  await replan(["fox", "cat", "owl"]);
-  state.edits.List1Items = "2";
-  state.itemEditBases.List1Items = ui.__itemEditBase(state.plan.sources[0]);
-  result.editKept = await replan(["fox", "cat", "owl"]);
-  result.editAfterChange = await replan(["fox", "cat", "hare"]);
-  // Each workflow keeps its own choice: switching back to one keeps Multiple tasks, and another
-  // workflow starts as one task.
-  ui.setSplit(true);
-  ui.workflowLoaded();
-  result.splitWhileLoading = ui.splitsTasks();
-  await ui.loadPlan(true);
-  result.splitAfterSwitch = ui.splitsTasks();
-  api.handlers["/deadline/plan"] = async (body) => ({ ...planFor(body), name: "hare" });
-  ui.workflowLoaded();
-  await ui.loadPlan(true);
-  result.splitOtherWorkflow = ui.splitsTasks();
-}
-if (scenario === "dialog-sections") {
-  result.sections = ui.__dialogSections;
-}
-if (scenario === "panel-sections") {
-  result.sections = ui.__panelSections;
 }
 if (scenario === "switch-queue") {
   // Queue 1's details are loaded and its parameters edited. Then the artist chooses queue 2, whose
@@ -553,7 +487,7 @@ if (scenario === "switch-queue") {
   const switching = ui.selectQueue("queue-2");
   await settle();
   result.queueWhileLoading = state.queue;
-  result.queueParametersWhileLoading = ui.__renderers.queueParameters() ?? null;
+  result.queueParametersWhileLoading = ui.__renderQueueParameters();
   result.canSubmitWhileLoading = Boolean(ui.canSubmit());
   result.blockerWhileLoading = ui.submitBlocker();
   result.sentWhileLoading = await submitAgain();
@@ -683,49 +617,6 @@ if (scenario === "late-file-dialog") {
   result.fromA = (await submitAgain()).attachments.filenames;
   result.toasts = app.toasts.map(({ severity }) => severity);
 }
-if (scenario === "attachment-summary") {
-  // The sidebar and the dialog both show, next to Submit, what the job attaches.
-  installDom();
-  const sidebar = new NodeStub("div");
-  const dialog = new NodeStub("div");
-  const views = [ui.__createView(sidebar, ui.__panelSections), ui.__createView(dialog, ui.__dialogSections)];
-  const model = (name) => ({
-    id: `checkpoints/${name}`,
-    name,
-    directory: "checkpoints",
-    path: `/models/${name}`,
-  });
-  const pack = { name: "studio-nodes", path: "/custom_nodes/studio-nodes", size: 10, files: 1, counted: true };
-  api.handlers["/deadline/plan"] = async (body) => ({
-    ...planFor(body),
-    attachments: { filenames: ["/input/old.png", "/input/mask.png"], directories: [] },
-    localModels: [model("a.safetensors"), model("b.safetensors")],
-    localNodes: [pack],
-  });
-  await ui.loadPlan(true);
-  result.planned = ui.attachmentSummary();
-  for (const [kind, key, path] of [
-    ["files", "filenames", "/outside/clip.mov"],
-    ["folder", "directories", "/outside/frames"],
-  ]) {
-    api.handlers["/deadline/choose"] = async () => ({ paths: [path] });
-    await ui.chooseAttachments(kind, key);
-  }
-  ui.__attachmentEdits().removed.add("/input/mask.png");
-  ui.__attachmentEdits().removed.add("/models/b.safetensors");
-  for (const view of views) {
-    view.render(["submit"]);
-  }
-  result.summary = ui.attachmentSummary();
-  result.sidebar = shownText(sidebar, "attachment-summary");
-  result.dialog = shownText(dialog, "attachment-summary");
-  const sent = await submitAgain();
-  result.sent = {
-    attachments: sent.attachments,
-    excludedModels: sent.excludedModels,
-    excludedNodes: sent.excludedNodes,
-  };
-}
 if (scenario === "attachment-folders") {
   // A folder loader's folder of 5,000 files, and three files the workflow loads on their own.
   installDom();
@@ -744,18 +635,15 @@ if (scenario === "attachment-folders") {
     directories: [],
     folders: [{ path: folder, files }],
   };
-  ui.__createView(container, ["attachments", "submit"]);
+  ui.__createView(container, ["advanced"]);
   const shown = () => ({
     rows: rows().length,
     folder: text(row(folder)),
     folderClass: row(folder).className,
     expanded: buttons(folder)[0].getAttribute("aria-expanded"),
-    title: text(container.querySelectorAll("details")[0].children[0]),
-    summary: ui.attachmentSummary(),
   });
   const sent = async () => (await submitAgain()).attachments;
   result.collapsed = { ...shown(), listed: rows().map((node) => node.attributes.title) };
-  result.shownSummary = shownText(container, "attachment-summary");
   click(folder, "✕");
   result.folderRemoved = { ...shown(), sent: await sent() };
   click(folder, "Add back");
@@ -783,9 +671,6 @@ if (scenario === "attachment-folders") {
   result.restoredWhileOpen = { ...shown(), sent: await sent() };
   buttons(folder)[0].listeners.click();
   result.closed = shown();
-  // A folder the artist adds is attached whole, so the summary can't count its files.
-  ui.__attachmentEdits().added.directories.push("/outside/frames");
-  result.summaryWithAddedFolder = ui.attachmentSummary();
 }
 if (scenario === "late-queue-details") {
   // Each queue's details come from their own request. Queue 2's answer comes before queue 1's.
@@ -824,34 +709,6 @@ if (scenario === "target-not-listed") {
   await ui.__loadFarms();
   result.canSubmitWithoutFarms = Boolean(ui.canSubmit());
 }
-if (scenario === "task-limit") {
-  // Two lists whose items multiply past the most tasks a job can run, as the submitter allows.
-  const source = (name, count) => ({
-    name,
-    parameter: `${name}Items`,
-    label: name,
-    title: name,
-    kind: "list",
-    values: [],
-    count,
-    range: `1-${count}`,
-  });
-  state.plan.sources = [source("List1", 100), source("List2", 101)];
-  state.plan.parameters = state.plan.sources.map(({ parameter, range }) => ({
-    name: parameter,
-    type: "STRING",
-    default: range,
-    userInterface: { groupLabel: "Tasks" },
-  }));
-  result.maxTasks = ui.MAX_TASKS;
-  // One task, the default, runs the lists whole, so their items don't multiply.
-  ui.setSplit(false);
-  result.canSubmitOneTask = Boolean(ui.canSubmit());
-  ui.setSplit(true);
-  result.canSubmitOverLimit = Boolean(ui.canSubmit());
-  state.edits.List2Items = "1-100";
-  result.canSubmitAtLimit = Boolean(ui.canSubmit());
-}
 if (scenario === "parse-bool") {
   // The panel reads a BOOL parameter as OpenJD and the submitter do.
   result.values = [
@@ -861,15 +718,597 @@ if (scenario === "parse-bool") {
     ...["", "garbage", 2, " true", "off "],
   ].map(ui.parseBool);
 }
-if (scenario === "item-range-contract") {
-  // The cases that test_submit.py also checks against the submitter's check_item_range.
-  const { readFileSync } = await import("node:fs");
-  const cases = JSON.parse(readFileSync(new URL("./item_ranges.json", import.meta.url), "utf8"));
-  ui.setSplit(true);
-  const list = { name: "List5", parameter: "List5Items", label: "List5", title: "List5", kind: "list" };
-  result.counts = cases.map(({ value, items }) =>
-    ui.taskCount([{ ...list, values: [], count: items, range: `1-${items}` }], () => value)
+if (scenario === "popover") {
+  // The popover: its job name, then why Submit can't proceed, its buttons and the one submission's
+  // row: the submission in progress, or the job the last one created.
+  installDom();
+  const copied = [];
+  Object.defineProperty(navigator, "clipboard", { value: { writeText: (text) => copied.push(text) }, configurable: true });
+  const popover = () => {
+    const container = new NodeStub("div");
+    ui.__createView(container, ui.__popoverSections);
+    return container;
+  };
+  const parts = (container) => container.children.at(-1).children.map(text);
+  state.submission = { id: "a".repeat(32), starting: false, name: "fox", stage: "uploading", progress: 42 };
+  const container = popover();
+  result.name = text(container.children[0]);
+  result.uploading = parts(container);
+  api.emit("deadline.submitted", { submissionId: "a".repeat(32), status: "SUBMITTED", name: "fox", jobId: "job-1" });
+  result.submitted = parts(container);
+  buttonsIn(container).find((button) => button.attributes.title === "Copy job ID").listeners.click();
+  result.copied = copied;
+  // It shows each time the popover opens, until the next submit.
+  result.reopened = parts(popover());
+  const succeeded = async () => {
+    await submitAgain();
+    api.emit("deadline.submitted", { submissionId: state.submission.id, status: "SUBMITTED", name: "owl", jobId: "job-2" });
+    return parts(container);
+  };
+  result.next = await succeeded();
+  // A submit that fails, or is canceled, clears it.
+  api.handlers["/deadline/jobs"] = async () => {
+    throw new Error("Rejected");
+  };
+  await submitAgain();
+  result.afterFailure = parts(container);
+  api.handlers["/deadline/jobs"] = async (body) => ({ submissionId: body.submissionId });
+  await succeeded();
+  await submitAgain();
+  api.emit("deadline.submitted", { submissionId: state.submission.id, status: "CANCELED", name: "owl" });
+  result.afterCancel = parts(container);
+  // Without a farm and queue, the note says to choose them, above the buttons. While the account is
+  // checked, it says so.
+  state.farmId = "";
+  result.partsWithoutTarget = parts(popover());
+  state.account = null;
+  result.partsWhileChecking = parts(popover());
+}
+if (scenario === "toolbar-button") {
+  // The toolbar button opens the popover when logged in, and the panel otherwise.
+  installDom();
+  const popover = () => descendants(document.body).find((node) => node.classList.contains("dl-popover"));
+  const shown = () => ({
+    popover: popover() ? text(popover().children.at(-1).children[0]) : null,
+    panelOpened: app.commands.filter((id) => id === "Workspace.ToggleSidebarTab.deadline-cloud").length,
+  });
+  const status = (authenticationStatus) => async () => ({ authenticationStatus, farmId: "farm-1", queueId: "queue-1" });
+  ui.togglePopover();
+  result.loggedIn = shown();
+  ui.togglePopover();
+  result.toggledAgain = shown();
+  api.handlers["/deadline/cloud/status"] = status("NEEDS_LOGIN");
+  await ui.loadAccount(true);
+  ui.togglePopover();
+  result.notLoggedIn = shown();
+  // Clicked before the check ends, the popover opens and says it's checking. When the check finds
+  // the account isn't logged in, the panel opens in its place.
+  const check = deferred();
+  api.handlers["/deadline/cloud/status"] = () => check.promise;
+  state.account = null;
+  const checking = ui.loadAccount(true);
+  ui.togglePopover();
+  result.whileChecking = shown();
+  check.resolve({ authenticationStatus: "NEEDS_LOGIN" });
+  await checking;
+  result.afterChecking = shown();
+  const { container } = renderedPanel();
+  result.panelDrawers = openDrawers(container);
+  // The same when the account stops being logged in while the popover is open.
+  api.handlers["/deadline/cloud/status"] = status("AUTHENTICATED");
+  await ui.loadAccount(true);
+  ui.togglePopover();
+  result.loggedInAgain = shown();
+  api.handlers["/deadline/cloud/status"] = async () => {
+    throw new Error("The security token included in the request is expired");
+  };
+  await ui.loadAccount(true);
+  result.afterFailedCheck = shown();
+}
+if (scenario === "list-parameters") {
+  // The job runs as one task, so the lists' parameters aren't sent, and nor is splitTasks.
+  state.plan.sources = [{ parameter: "List1Items" }];
+  state.plan.parameters = [
+    { name: "List1Items", type: "STRING", default: "1-3" },
+    { name: "Seed", type: "INT", default: 5 },
+  ];
+  const sent = await submitAgain();
+  result.parameters = sent.parameters;
+  result.splitTasks = "splitTasks" in sent;
+}
+// A template's parameters: a path the submitter fills in, a path the artist can set, a number, a
+// list of choices, a checkbox, text, and one the panel hides, as ours hides Attach Custom Nodes.
+const SAVED_PARAMETERS = [
+  { name: "WorkflowFile", type: "PATH" },
+  { name: "OutputDir", type: "PATH", dataFlow: "OUT", default: "./output", userInterface: { control: "CHOOSE_DIRECTORY" } },
+  { name: "Frames", type: "PATH", objectType: "DIRECTORY" },
+  { name: "Steps", type: "INT", default: 20, minValue: 1, maxValue: 100 },
+  { name: "Mode", type: "STRING", default: "a", allowedValues: ["a", "b"] },
+  { name: "Upscale", type: "BOOL", default: "true", userInterface: { control: "CHECK_BOX" } },
+  { name: "Prompt", type: "STRING", default: "", maxLength: 20 },
+  { name: "AttachCustomNodes", type: "BOOL", default: "true", userInterface: { control: "HIDDEN" } },
+];
+if (scenario === "saved-settings-written") {
+  // What a submission saves in the workflow, and when ComfyUI saves the workflow too.
+  state.plan.parameters = SAVED_PARAMETERS;
+  state.queue = { parameters: [{ name: "CondaPackages", type: "STRING", default: "" }], storageProfiles: [] };
+  const edits = ui.__workflowEdits();
+  Object.assign(edits.edits, {
+    WorkflowFile: "/x.json",
+    OutputDir: "/Users/me/out",
+    Steps: "30",
+    Upscale: "false",
+    Prompt: "a fox",
+  });
+  edits.jobName = "My job";
+  edits.jobDescription = "For the studio";
+  state.settings.priority = "70";
+  ui.__editHostForm().hardware["amount.worker.gpu"] = { min: "1" };
+  ui.editQueueParameter("CondaPackages", "comfy my-nodes");
+  ui.__attachmentEdits().added.filenames.push("/manual/clip.mov");
+  // The same workflow, with what ComfyUI says about it.
+  const workflow = app.extensionManager.workflow.activeWorkflow;
+  const submitWith = async (flags, succeed = true) => {
+    Object.assign(workflow, { isTemporary: undefined, isModified: undefined }, flags);
+    app.graph.extra = {};
+    app.commands = [];
+    api.handlers["/deadline/jobs"] = async (body) => {
+      if (!succeed) {
+        throw new Error("Rejected");
+      }
+      return { submissionId: body.submissionId };
+    };
+    await submitAgain();
+    return { saved: app.graph.extra.deadlineCloud ?? null, commands: app.commands };
+  };
+  result.saved = await submitWith({ isTemporary: false, isModified: false });
+  result.modified = await submitWith({ isTemporary: false, isModified: true });
+  result.temporary = await submitWith({ isTemporary: true, isModified: false });
+  result.olderFrontend = await submitWith({});
+  result.failed = await submitWith({ isTemporary: false, isModified: false }, false);
+  // Writing the settings doesn't change what the panel plans from.
+  result.sameLayoutKey =
+    ui.layoutFreeKey({ nodes: [], extra: {} }) === ui.layoutFreeKey({ nodes: [], extra: { deadlineCloud: { version: 1 } } });
+}
+if (scenario === "saved-settings-loaded") {
+  // A workflow's saved settings apply after its first plan, without what no longer applies.
+  api.handlers["/deadline/plan"] = async (body) => ({ ...planFor(body), parameters: SAVED_PARAMETERS });
+  const open = async (filename, saved) => {
+    app.graph.extra = saved === undefined ? {} : { deadlineCloud: saved };
+    await openWorkflow(filename);
+    const edits = ui.__workflowEdits();
+    return {
+      jobName: edits.jobName,
+      description: edits.jobDescription,
+      settings: edits.settings,
+      edits: edits.edits,
+      hostRequirements: edits.hostForm && ui.__requirementsFromForm(edits.hostForm),
+    };
+  };
+  result.loaded = await open("saved.json", {
+    version: 1,
+    jobName: "Saved name",
+    description: "Saved description",
+    priority: 80,
+    targetTaskRunStatus: "SUSPENDED",
+    maxWorkerCount: 0,
+    maxRetriesPerTask: "3",
+    parameters: {
+      Steps: 500,
+      Mode: "b",
+      Upscale: "false",
+      Prompt: "a fox",
+      OutputDir: "/tmp/out",
+      WorkflowFile: "/x.json",
+      // Saved by an older panel, which showed it.
+      AttachCustomNodes: "false",
+      Gone: "x",
+    },
+    hostRequirements: { amounts: [{ name: "amount.worker.gpu", min: 2, max: 1 }] },
+    farmId: "farm-2",
+  });
+  const sent = await submitAgain();
+  result.sent = { priority: sent.settings.priority, status: sent.settings.targetTaskRunStatus, parameters: sent.parameters };
+  // An Output Directory the field wouldn't take from the artist isn't loaded.
+  result.relativeOutputDir = (await open("relative.json", { version: 1, parameters: { OutputDir: "out" } })).edits;
+  // The localStorage settings stay the other workflows'.
+  result.globalPriority = state.settings.priority;
+  result.hosts = await open("hosts.json", {
+    version: 1,
+    hostRequirements: {
+      attributes: [{ name: "attr.worker.os.family", anyOf: ["linux"] }],
+      amounts: [{ name: "amount.worker.gpu", min: 1 }],
+    },
+  });
+  // Too many to check, and a shape the form doesn't make.
+  const many = Array.from({ length: 51 }, (_, index) => ({ name: `amount.license.${index}`, min: 1 }));
+  result.tooMany = (await open("many.json", { version: 1, hostRequirements: { amounts: many } })).hostRequirements;
+  result.otherShape = (await open("shape.json", {
+    version: 1,
+    hostRequirements: { amounts: [{ name: "amount.worker.gpu", min: 1, extra: true }] },
+  })).hostRequirements;
+  result.templateText = (await open("text.json", { version: 1, jobName: "{{Param.X}}", description: "a\u0007b" }));
+  result.unknownVersion = await open("future.json", { version: 2, jobName: "Future" });
+  result.malformed = await open("broken.json", "not settings");
+  result.unsaved = await open("plain.json");
+  // Back in the first tab, its settings are as they were, and the file's aren't applied again.
+  ui.__workflowEdits().jobName = "Edited";
+  await open("other.json");
+  result.backAgain = (await open("plain.json", { version: 1, jobName: "From the file" })).jobName;
+  // Closed and opened again, it starts afresh with what its file saved.
+  app.extensionManager.workflow.openWorkflows = [workflows["other.json"]];
+  result.reopened = (await open("plain.json", { version: 1, jobName: "From the file" })).jobName;
+  // A name the artist types while the first plan loads stays, and the rest applies.
+  app.extensionManager.workflow.openWorkflows = undefined;
+  app.graph.extra = { deadlineCloud: { version: 1, jobName: "Saved", priority: 90 } };
+  app.extensionManager.workflow.activeWorkflow = { filename: "typed.json", path: "workflows/typed.json" };
+  ui.workflowLoaded();
+  const slowPlan = deferred();
+  api.handlers["/deadline/plan"] = async (body) => {
+    await slowPlan.promise;
+    return { ...planFor(body), parameters: SAVED_PARAMETERS };
+  };
+  const planning = ui.loadPlan(true);
+  ui.__workflowEdits().jobName = "Typed";
+  slowPlan.resolve();
+  await planning;
+  result.typed = { jobName: ui.__workflowEdits().jobName, settings: ui.__workflowEdits().settings };
+}
+if (scenario === "invalid-values") {
+  // A value a field can't submit keeps Submit off, and says why.
+  state.plan.parameters = SAVED_PARAMETERS;
+  const blocked = (change) => {
+    const edits = ui.__workflowEdits();
+    const before = { ...edits, settings: { ...state.settings }, edits: { ...edits.edits } };
+    change(edits);
+    const blocker = ui.canSubmit() ? null : ui.submitBlocker();
+    Object.assign(state.settings, before.settings);
+    Object.assign(edits, {
+      edits: before.edits,
+      jobName: before.jobName,
+      jobDescription: before.jobDescription,
+      hostForm: null,
+      badNumbers: new Set(),
+    });
+    return blocker;
+  };
+  const host = (change) => (edits) => change(ui.__editHostForm(), edits);
+  result.blockers = [
+    blocked(() => {}),
+    blocked(() => (state.settings.priority = "101")),
+    blocked(() => (state.settings.priority = "1e3")),
+    blocked(() => (state.settings.priority = "1.0")),
+    blocked(() => (state.settings.maxWorkerCount = "0")),
+    blocked(() => (state.settings.maxRetriesPerTask = "two")),
+    blocked((edits) => (edits.edits.Steps = "0")),
+    blocked((edits) => (edits.edits.OutputDir = "output")),
+    blocked((edits) => (edits.jobName = "  ")),
+    blocked((edits) => (edits.jobName = "x".repeat(129))),
+    blocked((edits) => (edits.jobName = "fox {{Param.X}}")),
+    blocked((edits) => (edits.jobDescription = "one\u0000two")),
+    blocked((edits) => (edits.edits.Mode = "c")),
+    blocked((edits) => (edits.edits.Upscale = "maybe")),
+    blocked((edits) => (edits.edits.Prompt = "a fox in the snow at dusk")),
+    blocked(host((form) => (form.hardware["amount.worker.gpu"] = { min: "-1" }))),
+    blocked(host((form) => form.amounts.push({ name: "worker.licenses", min: "1" }))),
+    blocked(host((form) => form.amounts.push({ name: "license.nuke" }))),
+    blocked(host((form) => form.attributes.push({ name: "software", mode: "anyOf", values: "nuke, 15" }))),
+    blocked(host((form, edits) => edits.badNumbers.add("host:amount.worker.vcpu:min"))),
+  ];
+  // Text the browser couldn't read as a number keeps its error, and Submit off, after the field
+  // renders again empty, until the artist edits the field.
+  installDom();
+  ui.__workflowEdits().badNumbers.add("setting:priority");
+  const container = new NodeStub("div");
+  const view = ui.__createView(container, ["properties"]);
+  view.render(["properties"]);
+  const errors = descendants(container).filter((node) => node.className === "dl-field-error");
+  result.keptError = { shown: errors.map(text).filter(Boolean), blocker: ui.submitBlocker() };
+  ui.__workflowEdits().badNumbers.delete("setting:priority");
+  // A Windows path and a share are fine, and an output path can't be empty.
+  state.settings.priority = 50;
+  result.paths = ["C:\\out", "\\\\server\\out", "  /out  ", ""].map((path) => {
+    ui.__workflowEdits().edits.OutputDir = path;
+    return ui.submitBlocker();
+  });
+  // Paths are sent trimmed, and an empty one that isn't an output is sent empty.
+  Object.assign(ui.__workflowEdits().edits, { OutputDir: "  /out  ", Frames: "  " });
+  const sent = (await submitAgain()).parameters;
+  result.sentPaths = { OutputDir: sent.OutputDir, Frames: sent.Frames };
+}
+if (scenario === "field-controls") {
+  // The controls the panel gives parameters, including ones that don't name a control.
+  installDom();
+  state.plan.parameters = [
+    { name: "Upscale", type: "BOOL", default: "false" },
+    { name: "Frames", type: "PATH", objectType: "DIRECTORY" },
+    { name: "Movie", type: "PATH", objectType: "FILE", dataFlow: "OUT" },
+    { name: "Mask", type: "PATH", objectType: "FILE", dataFlow: "IN" },
+    { name: "Sampler", type: "STRING", default: "ddim", allowedValues: ["euler", "dpmpp"] },
+    { name: "Denoise", type: "STRING", default: "no", allowedValues: ["yes", "no"], userInterface: { control: "CHECK_BOX" } },
+    { name: "InputDir", type: "PATH", userInterface: { control: "CHOOSE_DIRECTORY" } },
+  ];
+  const container = new NodeStub("div");
+  ui.__createView(container, ["advanced"]);
+  const fieldOf = (label) =>
+    descendants(container).find((node) => node.tag === "label" && text(node.children[0]) === label);
+  const controls = () =>
+    Object.fromEntries(
+      state.plan.parameters.map(({ name }) => {
+        const nodes = descendants(fieldOf(name));
+        const control = nodes.find((node) => ["input", "select"].includes(node.tag));
+        const browse = nodes.find((node) => node.tag === "button");
+        return [name, { tag: control.tag, type: control.attributes.type ?? null, browse: browse ? text(browse) : null }];
+      })
+    );
+  result.controls = controls();
+  const options = descendants(fieldOf("Sampler")).filter((node) => node.tag === "option").map(text);
+  result.samplerOptions = options;
+  // A STRING checkbox with choices sends the choice that reads as checked.
+  descendants(fieldOf("Denoise")).find((node) => node.tag === "input").listeners.change({ target: { checked: true } });
+  result.denoise = ui.__workflowEdits().edits.Denoise;
+  // Choose input file opens a dialog for one file.
+  api.handlers["/deadline/choose"] = async () => ({ paths: ["/masks/a.png"] });
+  await descendants(fieldOf("Mask")).find((node) => node.tag === "button").listeners.click();
+  result.chooseKind = api.calls.filter(({ path }) => path === "/deadline/choose").at(-1).body.kind;
+}
+if (scenario === "prototype-names") {
+  // Parameters can have any name, such as ones that plain objects already have.
+  state.plan.parameters = [
+    { name: "constructor", type: "STRING", default: "a" },
+    { name: "toString", type: "INT", default: 3 },
+    { name: "__proto__", type: "STRING", default: "p" },
+  ];
+  state.plan.values = {};
+  // A computed key sets the __proto__ parameter's value, not the prototype.
+  Object.assign(ui.__workflowEdits().edits, { ["__proto__"]: "q" });
+  const sent = await submitAgain();
+  result.parameters = sent.parameters;
+}
+if (scenario === "renamed-workflow") {
+  // Saving a workflow for the first time, or renaming it, changes its path but keeps its edits.
+  const workflow = { filename: "Unsaved Workflow.json", path: "workflows/Unsaved Workflow.json" };
+  app.extensionManager.workflow.activeWorkflow = workflow;
+  ui.__workflowEdits().jobName = "Mine";
+  Object.assign(workflow, { filename: "fox.json", path: "workflows/fox.json" });
+  result.afterSaving = ui.__workflowEdits().jobName;
+  // Another workflow at the path it had starts afresh.
+  app.extensionManager.workflow.activeWorkflow = { filename: "Unsaved Workflow.json", path: "workflows/Unsaved Workflow.json" };
+  result.atOldPath = ui.__workflowEdits().jobName;
+}
+if (scenario === "focus") {
+  // A re-render, such as when the plan loads, keeps the focus and the caret in the job name.
+  installDom();
+  const container = new NodeStub("div");
+  const view = ui.__createView(container, ui.__popoverSections);
+  const jobName = () => descendants(container).find((node) => node.getAttribute("name") === "job-name");
+  const before = jobName();
+  Object.assign(before, { selectionStart: 2, selectionEnd: 5 });
+  document.activeElement = before;
+  view.render();
+  const after = jobName();
+  result.focus = { replaced: after !== before, focused: document.activeElement === after, selection: after.selection };
+}
+if (scenario === "browse-after-switching") {
+  // A path chosen in a file dialog that closes after another workflow opened isn't set.
+  installDom();
+  state.plan.parameters = SAVED_PARAMETERS;
+  const container = new NodeStub("div");
+  ui.__createView(container, ["properties"]);
+  const browse = descendants(container).find((node) => node.tag === "button" && text(node) === "Browse…");
+  const chosen = deferred();
+  api.handlers["/deadline/choose"] = () => chosen.promise;
+  const choosing = browse.listeners.click();
+  await settle();
+  ui.workflowLoaded();
+  chosen.resolve({ paths: ["/late/out"] });
+  await choosing;
+  result.afterSwitching = ui.__workflowEdits().edits.OutputDir ?? null;
+  result.toasts = app.toasts.map(({ severity }) => severity);
+  api.handlers["/deadline/choose"] = async () => ({ paths: ["/chosen/out"] });
+  await browse.listeners.click();
+  result.chosen = ui.__workflowEdits().edits.OutputDir;
+}
+// Our job template's parameters, which test_panel.py writes next to this file, as the plan has them.
+const templateParameters = () => JSON.parse(readFileSync("template_parameters.json", "utf-8"));
+// A queue with a storage profile and two queue environments' parameters, each with the group label
+// the library gives it.
+const ENVIRONMENT_QUEUE = {
+  parameters: [
+    ["CondaPackages", "Conda Packages", "Conda", ""],
+    ["CondaChannels", "Conda Channels", "Conda", "deadline-cloud"],
+    ["RezPackages", "Rez Packages", "Rez", ""],
+  ].map(([name, label, environment, value]) => ({
+    name,
+    type: "STRING",
+    default: value,
+    userInterface: { label, groupLabel: `Queue Environment: ${environment}` },
+  })),
+  values: { CondaChannels: "deadline-cloud-v2 deadline-cloud" },
+  storageProfiles: [{ storageProfileId: "sp-1", displayName: "Studio workstations" }],
+};
+if (scenario === "drawers") {
+  // The panel with our template, logged in, with a farm and queue chosen.
+  installDom();
+  state.plan.parameters = templateParameters();
+  state.plan.hostRequirements = {};
+  api.handlers["/deadline/cloud/status"] = async () => ({
+    authenticationStatus: "AUTHENTICATED",
+    profile: "default",
+    farmId: "farm-1",
+    queueId: "queue-1",
+  });
+  api.handlers["/deadline/cloud/queue"] = async () => ENVIRONMENT_QUEUE;
+  await ui.loadAccount(true);
+  const { container } = renderedPanel();
+  result.tree = drawerTree(container);
+  result.open = openDrawers(container);
+  result.summaries = container.querySelectorAll("details").map((details) =>
+    details.children[0].children.map((child) =>
+      child.classList.contains("dl-chevron") ? "chevron" : child.classList.contains("dl-grow") ? "title" : child.className
+    )
   );
+  const labels = (title) => withClass(drawer(container, title), "dl-label").map(text);
+  const subheadings = (title) =>
+    withClass(drawer(container, title), "dl-subheading").map((node) => [text(node), node.getAttribute("data-dl-tip")]);
+  result.labels = Object.fromEntries(
+    ["Job Properties", "Job submission settings", "Attachments", "Timeouts", "Host requirements"].map((title) => [
+      title,
+      labels(title),
+    ])
+  );
+  result.subheadings = {
+    "Job submission settings": subheadings("Job submission settings"),
+    "Host requirements": subheadings("Host requirements"),
+  };
+  const placeholder = (name) => container.querySelectorAll("[name]").find((node) => node.getAttribute("name") === name).attributes.placeholder;
+  result.placeholders = ["setting:maxRetriesPerTask", "setting:maxFailedTasksCount", "setting:maxWorkerCount"].map(placeholder);
+  result.account = text(withClass(drawer(container, "Job submission settings"), "dl-meta")[0]);
+  result.queueReset = withClass(container, "dl-link")
+    .filter((node) => node.getAttribute("data-role") === "queue-reset")
+    .map(text);
+  // A custom template's other visible parameters have a drawer of their own, by group label.
+  state.plan.parameters = [
+    ...templateParameters(),
+    { name: "Seed", type: "INT", default: 1, userInterface: { label: "Seed", groupLabel: "Sampler" } },
+  ];
+  const custom = renderedPanel().container;
+  result.customTree = drawerTree(drawer(custom, "Advanced settings").children[1]);
+  result.customJobParameters = descendants(drawer(custom, "Job parameters")).filter((node) =>
+    ["dl-subheading", "dl-label"].includes(node.className)
+  ).map(text);
+}
+if (scenario === "auto-open") {
+  // Which drawers open themselves, the account line and Submit's reason, for each state the account
+  // check ends in, and for values that can't be submitted.
+  installDom();
+  state.plan.parameters = templateParameters();
+  api.handlers["/deadline/cloud/queue"] = async () => ENVIRONMENT_QUEUE;
+  const account = (authenticationStatus, ids = { farmId: "farm-1", queueId: "queue-1" }) => async () => ({
+    authenticationStatus,
+    profile: "default",
+    ...ids,
+  });
+  const shown = ({ container }) => {
+    const line = drawer(container, "Job submission settings").children[1];
+    const notice = [...withClass(line, "dl-meta"), ...withClass(line, "dl-notice")][0];
+    return {
+      open: openDrawers(container),
+      account: text(notice),
+      dot: withClass(notice, "dl-dot")[0]?.className ?? null,
+      blocker: ui.submitBlocker(),
+      canSubmit: Boolean(ui.canSubmit()),
+    };
+  };
+  const check = async (status) => {
+    api.handlers["/deadline/cloud/status"] = status;
+    await ui.loadAccount(true);
+    return shown(renderedPanel());
+  };
+  // Still checking: nothing opens, and Submit says nothing about the account yet.
+  api.handlers["/deadline/cloud/status"] = () => new Promise(() => {});
+  state.account = null;
+  ui.loadAccount(true);
+  result.checking = shown(renderedPanel());
+  result.notLoggedIn = await check(account("NEEDS_LOGIN"));
+  state.loggingIn = true;
+  result.loggingIn = shown(renderedPanel());
+  state.loggingIn = false;
+  result.badCredentials = await check(account("CONFIGURATION_ERROR"));
+  result.failedCheck = await check(async () => {
+    throw new Error("Couldn't reach Deadline Cloud.");
+  });
+  state.farmId = "";
+  state.queueId = "";
+  result.noTarget = await check(account("AUTHENTICATED", { farmId: "", queueId: "" }));
+  result.farmNeeded = withClass(renderedPanel().container, "dl-needs").map((node) => node.tag);
+  result.loggedIn = await check(account("AUTHENTICATED"));
+  // A value that can't be submitted opens its drawer, and the drawers it's in. Fixed, they stay open.
+  const edits = ui.__workflowEdits();
+  edits.edits.WorkflowTimeout = "0";
+  const panel = renderedPanel();
+  result.badTimeout = shown(panel);
+  edits.edits.WorkflowTimeout = "7200";
+  panel.view.render();
+  result.fixedTimeout = shown(panel);
+  delete edits.edits.WorkflowTimeout;
+  state.settings.priority = "101";
+  result.badPriority = shown(renderedPanel());
+  state.settings.priority = 50;
+  // A check that fails after the account was logged in.
+  result.failedRecheck = await check(async () => {
+    throw new Error("Couldn't reach Deadline Cloud.");
+  });
+  result.failedRecheckLabels = withClass(drawer(renderedPanel().container, "Job submission settings"), "dl-label").map(text);
+}
+if (scenario === "saved-output-dir") {
+  // A workflow that saved an Output Directory other than the plan's, ComfyUI's output folder, opens
+  // Job Properties when its panel shows.
+  installDom();
+  api.handlers["/deadline/plan"] = async (body) => ({
+    ...planFor(body),
+    parameters: SAVED_PARAMETERS,
+    values: { OutputDir: "/comfy/output" },
+  });
+  const opened = async (filename, saved) => {
+    app.graph.extra = saved === undefined ? {} : { deadlineCloud: { version: 1, parameters: saved } };
+    await openWorkflow(filename);
+    const element = new NodeStub("div");
+    const close = ui.renderPanel(element);
+    await settle();
+    const open = openDrawers(element);
+    close();
+    return open;
+  };
+  result.other = await opened("other.json", { OutputDir: "/renders/fox" });
+  result.same = await opened("same.json", { OutputDir: "/comfy/output" });
+  result.relative = await opened("relative.json", { OutputDir: "renders" });
+  result.unsaved = await opened("unsaved.json");
+}
+if (scenario === "drawers-across-workflows") {
+  // Drawers the artist opened stay open in another workflow, after its plan brings them back.
+  installDom();
+  api.handlers["/deadline/plan"] = async (body) => ({ ...planFor(body), parameters: templateParameters() });
+  await openWorkflow("fox.json");
+  const { container } = renderedPanel();
+  drawer(container, "Advanced settings").open = true;
+  drawer(container, "Timeouts").open = true;
+  app.extensionManager.workflow.activeWorkflow = { filename: "hare.json", path: "workflows/hare.json" };
+  ui.workflowLoaded();
+  result.timeoutsWhilePlanning = Boolean(drawer(container, "Timeouts"));
+  await ui.loadPlan(true);
+  result.open = openDrawers(container);
+}
+if (scenario === "host-form") {
+  // The host requirements form, which starts from our template's, so empty, and sends nothing until
+  // it's edited.
+  installDom();
+  state.plan.hostRequirements = {};
+  const container = new NodeStub("div");
+  document.body.append(container);
+  ui.__createView(container, ["advanced"]);
+  const form = () => drawer(container, "Host requirements").children[1];
+  const reset = () => buttonsIn(form()).find((node) => node.getAttribute("data-role") === "host-reset");
+  const inputs = () => descendants(form()).filter((node) => node.tag === "input");
+  const shown = () => ({
+    checked: inputs().filter((node) => node.checked).length,
+    values: inputs().filter((node) => node.attributes.type === "number" && node.value !== "").map((node) => node.value),
+    resetHidden: reset().hidden,
+  });
+  const sent = async () => (await submitAgain()).hostRequirements ?? null;
+  result.empty = {
+    ...shown(),
+    labels: withClass(form(), "dl-label").map(text),
+    options: descendants(form()).filter((node) => node.tag === "label").map(text),
+    buttons: buttonsIn(form()).map(text),
+    sent: await sent(),
+  };
+  const gpuMemory = inputs().find((node) => node.attributes["aria-label"] === "GPU memory (GiB) minimum");
+  gpuMemory.value = "16";
+  gpuMemory.listeners.input({ target: { value: "16", validity: { badInput: false } } });
+  result.edited = { resetHidden: reset().hidden, sent: await sent() };
+  reset().listeners.click();
+  result.reset = { ...shown(), sent: await sent() };
 }
 // Exits once the result is written. Node writes to a pipe asynchronously on macOS, so exiting
 // straight away would cut off a long result, such as a request with 5,000 files.
