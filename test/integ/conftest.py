@@ -12,10 +12,14 @@ hatch environment downloads Playwright's Chromium.
 The ComfyUI server gets fake Deadline Cloud tools, like the unit tests', so the extension's
 /deadline routes run for real: the fake bridge signs the panel in and gives it a farm and queue
 to submit to, and submitting answers with a job ID, all without the real CLI or AWS credentials.
+The queue's details come from the real bridge's queue command, with the library's answers faked.
+The server deletes a job bundle once it's submitted, so the fake bridge copies each one first,
+with the request it got, for the tests to check.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import shutil
@@ -28,10 +32,9 @@ import urllib.request
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from textwrap import dedent
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXTENSION_DIR_NAME = "deadline-cloud-for-comfyui"
@@ -42,11 +45,31 @@ PANEL_SOURCES = REPO_ROOT / "frontend" / "src" / "extensions" / "deadline-cloud"
 # How long ComfyUI can take to start, importing torch and its other requirements.
 STARTUP_TIMEOUT_SECONDS = 300
 # The fake Deadline Cloud account the tests submit to, and the environment variables of
-# src/deadline/comfyui_submitter/submit.py that point the server at the fakes.
+# src/deadline/comfyui_submitter/submit.py that point the server at the fakes. The server gets
+# none of the others from the test run, so it uses the repository's job template.
 FARM_ID = "farm-0123456789abcdef0123456789abcdef"
 QUEUE_ID = "queue-0123456789abcdef0123456789abcdef"
+# The fake queue's environment parameters, as the library lists a Conda queue environment's.
+QUEUE_PARAMETERS = [
+    {
+        "name": "CondaChannels",
+        "type": "STRING",
+        "default": "deadline-cloud",
+        "userInterface": {
+            "control": "LINE_EDIT",
+            "label": "Conda Channels",
+            "groupLabel": "Queue Environment: Conda",
+        },
+    }
+]
+ENV_VAR_PREFIX = "COMFYUI_DEADLINE_"
 CLI_ENV_VAR = "COMFYUI_DEADLINE_CLI"
 PYTHON_ENV_VAR = "COMFYUI_DEADLINE_PYTHON"
+CONFIG_ENV_VAR = "COMFYUI_DEADLINE_CONFIG"
+# Where the installers unpack the Deadline Cloud library. The server runs the bridge with it
+# instead of the fake CLI's Python when it's there, so the tests refuse to run with it.
+INSTALLED_DEPENDENCIES = REPO_ROOT / "dependencies"
+WORKFLOWS = Path(__file__).resolve().parent / "workflows"
 
 
 @dataclass
@@ -54,13 +77,13 @@ class ComfyUI:
     """A ComfyUI server that has this extension loaded, and a fake Deadline Cloud CLI."""
 
     url: str
-    log: Path
-    # Where the /deadline routes create job bundles: the user directory's deadline_submissions.
-    submissions: Path
-
-    def log_text(self) -> str:
-        """The server's log so far, to report when a test fails."""
-        return self.log.read_text(encoding="utf-8", errors="replace")
+    # ComfyUI's --base-directory, with its input, output and user directories.
+    base_directory: Path
+    # Where the fake bridge copies each submitted bundle, as <job ID>/bundle, with the request it
+    # got as <job ID>/request.json.
+    submitted: Path
+    # Whether a page has closed the templates dialog, which ComfyUI then doesn't open again.
+    closed_first_run_dialog: bool = False
 
 
 def _checkout() -> Path | None:
@@ -146,13 +169,64 @@ def _wait_for_extension(url: str, process: subprocess.Popen[bytes], log: Path) -
     )
 
 
-def _fake_tools(directory: Path) -> dict[str, str]:
+# Stands in for bridge.py, with the same protocol: the request on the first line of stdin, and a
+# "result" or "error" event on stdout. fake_bridge.json next to it has the answers and where to
+# copy submitted bundles.
+FAKE_BRIDGE = """\
+import json
+import shutil
+import sys
+import types
+import uuid
+from pathlib import Path
+
+config = json.loads(Path(__file__).with_suffix(".json").read_text(encoding="utf-8"))
+command = sys.argv[-1]
+request = json.loads(sys.stdin.readline() or "{}")
+captured = Path(config["submitted"])
+
+
+def result(data):
+    print(json.dumps({"event": "result", "data": data}), flush=True)
+
+
+if command == "submit":
+    # A job ID as Deadline Cloud makes them. The server deletes the bundle after this answer.
+    job_id = "job-" + uuid.uuid4().hex
+    shutil.copytree(request["bundleDir"], captured / job_id / "bundle")
+    (captured / job_id / "request.json").write_text(json.dumps(request), encoding="utf-8")
+    result({"jobId": job_id, "farmId": request.get("farmId"), "queueId": request.get("queueId")})
+elif command == "queue":
+    # The real bridge's answer, from the fake queue's parameters, so the job gets the values the
+    # bridge adds, such as Conda Channels with deadline-cloud-v2.
+    library = types.SimpleNamespace(
+        get_queue_parameter_definitions=lambda **kwargs: config["queueParameters"],
+        list_storage_profiles_for_queue=lambda **kwargs: {"storageProfiles": []},
+    )
+    settings = types.SimpleNamespace(read_config=dict)
+    sys.modules["deadline.client"] = types.SimpleNamespace(api=library)
+    sys.modules["deadline.client.api"] = library
+    sys.modules["deadline.client.config"] = types.SimpleNamespace(config_file=settings)
+    sys.modules["deadline.client.config.config_file"] = settings
+    from deadline.comfyui_submitter import bridge
+
+    result(bridge.queue(request))
+elif command in config["responses"]:
+    result(config["responses"][command])
+else:
+    print(json.dumps({"event": "error", "message": f"The fake bridge has no {command}."}))
+    sys.exit(1)
+"""
+
+
+def _fake_tools(directory: Path, submitted: Path) -> dict[str, str]:
     """
     Fakes of the Deadline Cloud CLI and its Python, like the unit tests', as files for the
     ComfyUI server process. The fake CLI answers --version, and the fake Python stands in for
     bridge.py: every command the routes run gets a logged-in account, a farm and queue to submit
-    to, and submitting answers with a job ID. Returns the environment variables that point the
-    server at them. The fakes are POSIX shell scripts, so the tests skip themselves on Windows.
+    to, and submitting copies the bundle into submitted and answers with a job ID. Returns the
+    environment variables that point the server at them. The fakes are POSIX shell scripts, so
+    the tests skip on Windows.
     """
     responses = {
         "status": {
@@ -163,20 +237,16 @@ def _fake_tools(directory: Path) -> dict[str, str]:
         },
         "farms": {"farms": [{"farmId": FARM_ID, "displayName": "Test Farm"}]},
         "queues": {"queues": [{"queueId": QUEUE_ID, "displayName": "Test Queue"}]},
-        "queue": {"parameters": [], "storageProfiles": []},
         "set-defaults": {},
-        "submit": {"jobId": "job-1"},
     }
     bridge = directory / "fake_bridge.py"
-    bridge.write_text(
-        dedent(f"""\
-            import json
-            import sys
-            json.loads(sys.stdin.readline())
-            print(json.dumps({{"event": "result", "data": {responses!r}[sys.argv[-1]]}}))
-            """),
-        encoding="utf-8",
-    )
+    bridge.write_text(FAKE_BRIDGE, encoding="utf-8")
+    fakes = {
+        "responses": responses,
+        "queueParameters": QUEUE_PARAMETERS,
+        "submitted": str(submitted),
+    }
+    bridge.with_suffix(".json").write_text(json.dumps(fakes), encoding="utf-8")
     # A shell wrapper rather than a shebang, which breaks when the interpreter path has spaces.
     fake_python = directory / "fake_cli_python"
     fake_python.write_text(
@@ -192,6 +262,8 @@ def _fake_tools(directory: Path) -> dict[str, str]:
 @pytest.fixture(scope="session")
 def comfy(tmp_path_factory: pytest.TempPathFactory) -> Iterator[ComfyUI]:
     """A ComfyUI server with this extension loaded, shared by the whole integration run."""
+    if os.name == "nt":
+        pytest.skip("The fake Deadline Cloud CLI and bridge are POSIX shell scripts.")
     checkout = _checkout()
     if checkout is None:
         pytest.skip("Set COMFYUI_PATH to a ComfyUI checkout to run the integration tests.")
@@ -200,6 +272,11 @@ def comfy(tmp_path_factory: pytest.TempPathFactory) -> Iterator[ComfyUI]:
         pytest.skip(
             "ComfyUI's requirements aren't installed where the integration tests can find them. Install "
             "them into a venv in the ComfyUI checkout, or set COMFYUI_PYTHON."
+        )
+    if INSTALLED_DEPENDENCIES.is_dir():
+        pytest.fail(
+            f"{INSTALLED_DEPENDENCIES} would make the server submit with the real Deadline Cloud "
+            "library rather than the fake bridge. Move it away to run the integration tests."
         )
     _build_panel()
 
@@ -225,19 +302,24 @@ def comfy(tmp_path_factory: pytest.TempPathFactory) -> Iterator[ComfyUI]:
         "--disable-auto-launch",
     ]
     log = work / "comfyui.log"
-    fake_tools = _fake_tools(work)
+    submitted = work / "submitted"
+    submitted.mkdir()
+    env = {key: value for key, value in os.environ.items() if not key.startswith(ENV_VAR_PREFIX)}
+    env.update(_fake_tools(work, submitted))
+    # A submitter config the checkout may have, from install_submitter.py, isn't read.
+    env[CONFIG_ENV_VAR] = str(work / "no_submitter_config.json")
     with log.open("w", encoding="utf-8") as log_file:
         process = subprocess.Popen(
             command,
             cwd=checkout,
             stdout=log_file,
             stderr=subprocess.STDOUT,
-            env={**os.environ, "PYTHONUNBUFFERED": "1", **fake_tools},
+            env={**env, "PYTHONUNBUFFERED": "1"},
         )
         url = f"http://127.0.0.1:{port}"
         try:
             _wait_for_extension(url, process, log)
-            yield ComfyUI(url=url, log=log, submissions=work / "user" / "deadline_submissions")
+            yield ComfyUI(url=url, base_directory=work, submitted=submitted)
         finally:
             process.terminate()
             try:
@@ -251,8 +333,17 @@ def comfy(tmp_path_factory: pytest.TempPathFactory) -> Iterator[ComfyUI]:
 def comfy_page(comfy: ComfyUI, page: Page) -> None:
     """Opens ComfyUI before each test. Resolves comfy first, so the skip happens before
     Playwright launches a browser."""
+    open_comfyui(page, comfy)
+
+
+def open_comfyui(page: Page, comfy: ComfyUI) -> None:
+    """Opens ComfyUI in a page, and waits until its app has loaded the graph."""
     page.goto(comfy.url)
-    _close_first_run_dialog(page)
+    page.wait_for_function("() => !!window.app?.graph")
+    # ComfyUI saves that the dialog was closed in the server's user settings.
+    if not comfy.closed_first_run_dialog:
+        _close_first_run_dialog(page)
+        comfy.closed_first_run_dialog = True
 
 
 def _close_first_run_dialog(page: Page) -> None:
@@ -274,10 +365,29 @@ def _close_first_run_dialog(page: Page) -> None:
 SIDEBAR_TAB_TESTID = "deadline-cloud-tab-button"
 
 
-def open_panel(page: Page) -> None:
-    """Opens the Deadline Cloud sidebar tab, and waits for the panel's root to render.
+def load_workflow(page: Page, workflow: Path) -> None:
+    """Opens a workflow file through the topbar's file input, as Workflow > Open does."""
+    page.set_input_files("#comfy-file-input", str(workflow))
+
+
+def open_panel(page: Page) -> Locator:
+    """Opens the Deadline Cloud sidebar tab, and returns the panel once its root renders.
 
     The panel root (.dl-panel) is the div that renderPanel in deadline_ui.ts builds.
     """
     page.get_by_test_id(SIDEBAR_TAB_TESTID).click()
-    expect(page.locator(".dl-panel")).to_be_visible()
+    panel = page.locator(".dl-panel")
+    expect(panel).to_be_visible()
+    return panel
+
+
+def open_popover(page: Page) -> Locator:
+    """Opens the quick submit popover from the action bar button, and returns it.
+
+    The button has the dl-action-button class that deadline_submit.ts registers, and the popover
+    (.dl-popover) is the dialog that openPopover in deadline_ui.ts appends to the page.
+    """
+    page.locator("button.dl-action-button").click()
+    popover = page.locator(".dl-popover")
+    expect(popover).to_be_visible()
+    return popover

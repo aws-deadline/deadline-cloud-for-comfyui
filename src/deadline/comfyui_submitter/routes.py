@@ -50,6 +50,7 @@ from .submit import (
     TaskLists,
     check_cli_version,
     check_item_range,
+    check_job_settings,
     check_parameter_values,
     check_task_count,
     create_job_bundle,
@@ -82,7 +83,6 @@ PROGRESS_EVENT = "deadline.progress"
 CONFIRM_EVENT = "deadline.confirm"
 # The job template's switch for loading the attached custom node packs on the worker.
 ATTACH_NODES = "AttachCustomNodes"
-DOWNLOAD_EVENT = "deadline.download"
 # A farm, queue or job ID.
 _RESOURCE_ID = re.compile(r"(farm|queue|job)-[0-9a-f]{32}")
 # The job settings that a saved bundle keeps as deadline:<name> parameter values, which `deadline
@@ -104,7 +104,7 @@ INSTALLED_DEPENDENCIES = Path(__file__).resolve().parents[3] / "dependencies"
 # Which Pythons and CPU their compiled modules are for, written by scripts/deps_bundle.py.
 DEPENDENCIES_DESCRIPTION = INSTALLED_DEPENDENCIES / "bundle.json"
 # The bridge commands the panel can run directly.
-CLOUD_COMMANDS = ("status", "login", "farms", "queues", "queue", "set-defaults", "jobs")
+CLOUD_COMMANDS = ("status", "login", "farms", "queues", "queue", "set-defaults")
 BRIDGE_TIMEOUT = 120
 # A first run of deadline --version can be slow, but it shouldn't hang.
 CLI_VERSION_TIMEOUT = 60
@@ -144,8 +144,6 @@ class _Submission:
     timers: list[asyncio.Task] = field(default_factory=list)
     # The job bundle, deleted once the job is created or the submission is canceled.
     bundle_dir: Path | None = None
-    # Where the job's outputs download to, shown with the job in the panel.
-    output_dir: str | None = None
     # Whether the library has started CreateJob, after which Cancel can't stop the job.
     creating: bool = False
     # The job CreateJob made, reported even if a later step fails: {jobId, farmId, queueId}.
@@ -778,7 +776,8 @@ def _save_asset_references(
             chosen.directories = sorted(set(chosen.directories).union(extra_directories))
         write_asset_references(chosen, bundle_dir / "asset_references.yaml")
     except Exception:
-        # The submitter still works without the references. The artist can add files in its dialog.
+        # The submitter still works without the references. The artist can add files in the
+        # panel's Attachments, under Advanced settings.
         logger.exception("Couldn't save asset_references.yaml")
 
 
@@ -887,7 +886,8 @@ def _plan(body: dict[str, Any], workflow: dict[str, Any], template: Path) -> dic
         "localNodes": [_local_node(name, path) for name, path in prepared.local_nodes.items()],
         # With the inputs the workflow names that aren't attached, such as an absolute path.
         "warnings": [*prepared.warnings, *assets.warnings],
-        # About splitting the lists into tasks, so only for Multiple tasks.
+        # About splitting the lists into tasks. The panel doesn't offer that, but the server
+        # still supports it.
         "taskWarnings": prepared.items.warnings if prepared.items else [],
         "nodeWarnings": prepared.node_warnings,
     }
@@ -1273,6 +1273,7 @@ async def save_bundle(request: web.Request) -> web.Response:
     body, workflow, template = checked
     try:
         settings = _string_map(body.get("settings"), "settings")
+        check_job_settings(settings)
         # A saved bundle is kept: it's submitted later, from this folder.
         bundle = await _build_bundle(body, workflow, template, load_config(), submission=False)
     except SubmitError as e:
@@ -1313,6 +1314,7 @@ async def submit_job(request: web.Request) -> web.Response:
     try:
         config = load_config()
         settings = _string_map(body.get("settings"), "settings")
+        check_job_settings(settings)
     except SubmitError as e:
         return _error(400, str(e))
     # The installer's dependencies submit without the Deadline Cloud CLI.
@@ -1327,6 +1329,8 @@ async def submit_job(request: web.Request) -> web.Response:
     _start(asyncio.to_thread(_remove_old_submissions, _submissions_dir()))
 
     settings.setdefault("name", f"ComfyUI - {name}")
+    # A missing input file stops the submission rather than leaving it out of the job.
+    settings["requirePathsExist"] = True
     submission = {
         "bundleDir": str(bundle.bundle_dir),
         "farmId": farm_id,
@@ -1359,7 +1363,6 @@ async def submit_job(request: web.Request) -> web.Response:
         process,
         client_id=client_id,
         bundle_dir=bundle.bundle_dir,
-        output_dir=_output_dir(bundle.values),
     )
     logger.info(
         "Submitting %s to Deadline Cloud from %s",
@@ -1449,8 +1452,6 @@ async def _watch_submission(submission_id: str) -> None:
             _log_value(result["jobId"]),
         )
         submitted = {**base, **result, "status": "SUBMITTED"}
-        if submission.output_dir:
-            submitted["outputDir"] = submission.output_dir
         _send(SUBMITTED_EVENT, submitted, submission.client_id)
         await asyncio.to_thread(_remove_bundle, submission.bundle_dir)
     elif submission.created:
@@ -1469,8 +1470,6 @@ async def _watch_submission(submission_id: str) -> None:
             "status": "SUBMITTED",
             "warning": f"The job was created, but the submission didn't finish: {error}",
         }
-        if submission.output_dir:
-            submitted["outputDir"] = submission.output_dir
         _send(SUBMITTED_EVENT, submitted, submission.client_id)
         await asyncio.to_thread(_remove_bundle, submission.bundle_dir)
     elif submission.canceled:
@@ -1492,12 +1491,6 @@ async def _watch_submission(submission_id: str) -> None:
             _log_block(_redact_aws(str(error))),
         )
         _send(SUBMITTED_EVENT, {**base, "status": "FAILED", "error": error}, submission.client_id)
-
-
-def _output_dir(values: dict[str, Any]) -> str | None:
-    """The OutputDir a job is submitted with. The CLI downloads the job's outputs there."""
-    value = values.get("OutputDir")
-    return str(value) if value else None
 
 
 async def _write_line(process: asyncio.subprocess.Process, data: dict[str, Any]) -> bool:
@@ -1628,98 +1621,6 @@ async def choose_paths(request: web.Request) -> web.Response:
     if process.returncode != 0:
         paths = []
     return web.json_response({"paths": [str(Path(path)) for path in paths if path]})
-
-
-@PromptServer.instance.routes.post("/deadline/jobs/download")
-async def download_outputs(request: web.Request) -> web.Response:
-    """Downloads a job's outputs in the background, to the paths the job was submitted with."""
-    body = await _read_body(request)
-    if isinstance(body, web.Response):
-        return body
-    client_id = _client_id(body)
-    if client_id is None:
-        return _error(400, "A valid browser clientId is required to download job outputs.")
-    ids = [str(body.get(key)) for key in ("farmId", "queueId", "jobId")]
-    if not all(_RESOURCE_ID.fullmatch(value) for value in ids):
-        return _error(400, "farmId, queueId and jobId must be Deadline Cloud IDs.")
-    farm_id, queue_id, job_id = ids
-    try:
-        config = load_config()
-    except SubmitError as e:
-        return _error(400, str(e))
-    # The installer's dependencies download without the Deadline Cloud CLI.
-    cli = await _bridge_cli(config)
-    if isinstance(cli, web.Response):
-        return cli
-    # The bridge downloads with the library, so it can check every file's destination against
-    # the job's Output Directory before writing any.
-    try:
-        process = await _bridge_process("download", cli)
-    except SubmitError as e:
-        return _error(500, str(e))
-    if not await _write_line(process, {"farmId": farm_id, "queueId": queue_id, "jobId": job_id}):
-        await _stop(process)
-        return _error(500, "The Deadline Cloud bridge exited before it could download.")
-    _start(_watch_download(process, job_id, client_id))
-    return web.json_response({"jobId": job_id}, status=202)
-
-
-async def _watch_download(process: asyncio.subprocess.Process, job_id: str, client_id: str) -> None:
-    assert process.stdout is not None and process.stderr is not None
-    events: list[dict[str, Any]] = []
-    result = None
-    # Read stderr while reading stdout, as _watch_submission does.
-    stderr_task = asyncio.create_task(process.stderr.read())
-    try:
-        async for line in process.stdout:
-            event = _parse_event(line)
-            if event is None:
-                continue
-            events.append(event)
-            if event["event"] == "progress":
-                _send(
-                    DOWNLOAD_EVENT,
-                    {"jobId": job_id, "status": "DOWNLOADING", "progress": event.get("progress")},
-                    client_id,
-                )
-            elif event["event"] == "result":
-                result = event.get("data")
-        stderr = await stderr_task
-        await process.wait()
-    except Exception as e:
-        # Any failure, such as a line over the limit, still ends the panel's download.
-        logger.exception("Couldn't read the download of %s", _log_value(job_id))
-        await _stop(process)
-        _send(
-            DOWNLOAD_EVENT,
-            {
-                "jobId": job_id,
-                "status": "FAILED",
-                "error": f"Couldn't read the Deadline Cloud library's output: {e}",
-            },
-            client_id,
-        )
-        return
-    finally:
-        stderr_task.cancel()
-    if process.returncode == 0 and isinstance(result, dict):
-        downloaded = {
-            "jobId": job_id,
-            "status": "DOWNLOADED",
-            "message": str(result.get("message", "")),
-            "fileCount": result.get("fileCount", 0),
-        }
-        if isinstance(result.get("directory"), str):
-            downloaded["directory"] = result["directory"]
-        _send(DOWNLOAD_EVENT, downloaded, client_id)
-        return
-    error = _bridge_failure(events, stderr, process.returncode)
-    logger.error(
-        "Couldn't download the outputs of %s:\n    %s",
-        _log_value(job_id),
-        _log_block(_redact_aws(error)),
-    )
-    _send(DOWNLOAD_EVENT, {"jobId": job_id, "status": "FAILED", "error": error}, client_id)
 
 
 # Deletes old bundles in the background, so ComfyUI's start doesn't wait on slow storage.

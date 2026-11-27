@@ -36,10 +36,13 @@ JOB_SETTINGS = {
     "requirePathsExist": "require_paths_exist",
 }
 SUBMITTER_NAME = "ComfyUI"
-# How many jobs one status request can ask about.
-MAX_JOBS = 50
 # The fewest seconds between progress events of a stage, so a big upload doesn't flood ComfyUI.
 PROGRESS_INTERVAL = 1.0
+# The conda channel the comfy package is published to, which the other Deadline Cloud submitters
+# add before the deadline-cloud channel (use_deadline_cloud_v2_channel in the library's dialog).
+CONDA_CHANNELS_PARAMETER = "CondaChannels"
+DEADLINE_CLOUD_CHANNEL = "deadline-cloud"
+DEADLINE_CLOUD_V2_CHANNEL = "deadline-cloud-v2"
 
 # Where events go. main() sets it to the real stdout, which the library can't print to while it
 # submits.
@@ -122,8 +125,38 @@ def queues(request: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def deadline_cloud_v2_channels(parameter: dict[str, Any]) -> str | None:
+    """
+    CondaChannels' default with deadline-cloud-v2 just before each deadline-cloud, as the library's
+    dialog makes it, or None when that changes nothing or the parameter wouldn't take it.
+    """
+    default = parameter.get("default")
+    if parameter.get("name") != CONDA_CHANNELS_PARAMETER or not isinstance(default, str):
+        return None
+    channels = default.split()
+    if DEADLINE_CLOUD_CHANNEL not in channels or DEADLINE_CLOUD_V2_CHANNEL in channels:
+        return None
+    # Before each deadline-cloud, as the library does, so it takes precedence under strict priority.
+    with_v2: list[str] = []
+    for channel in channels:
+        if channel == DEADLINE_CLOUD_CHANNEL:
+            with_v2.append(DEADLINE_CLOUD_V2_CHANNEL)
+        with_v2.append(channel)
+    value = " ".join(with_v2)
+    allowed = parameter.get("allowedValues")
+    max_length = parameter.get("maxLength")
+    if (isinstance(allowed, list) and value not in allowed) or (
+        isinstance(max_length, int) and len(value) > max_length
+    ):
+        return None
+    return value
+
+
 def queue(request: dict[str, Any]) -> dict[str, Any]:
-    """The queue's environment parameters and storage profiles."""
+    """
+    The queue's environment parameters and storage profiles, and the values the job sends for
+    parameters the artist and the config don't set, such as Conda Channels with deadline-cloud-v2.
+    """
     from deadline.client import api
 
     config = _config({})
@@ -133,8 +166,14 @@ def queue(request: dict[str, Any]) -> dict[str, Any]:
     profiles = api.list_storage_profiles_for_queue(
         config=config, farmId=request["farmId"], queueId=request["queueId"]
     )
+    values = {}
+    for parameter in parameters:
+        channels = deadline_cloud_v2_channels(dict(parameter))
+        if channels is not None:
+            values[parameter["name"]] = channels
     return {
         "parameters": [dict(parameter) for parameter in parameters],
+        "values": values,
         "storageProfiles": [
             {
                 "storageProfileId": profile["storageProfileId"],
@@ -167,41 +206,6 @@ def set_defaults(request: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"{key} isn't a Deadline Cloud ID.")
     config_file.write_config(_config({key: request[key] for key in DEFAULT_IDS if key in request}))
     return {}
-
-
-# Errors that mean the job is gone, or that these credentials can't see it, rather than a failure
-# worth trying again, such as throttling or expired credentials.
-JOB_GONE_ERRORS = {"ResourceNotFoundException", "AccessDeniedException"}
-
-
-def jobs(request: dict[str, Any]) -> dict[str, Any]:
-    from deadline.client import api
-
-    config = _config({})
-    found = []
-    for job_id in list(request.get("jobIds", []))[:MAX_JOBS]:
-        try:
-            job = api.get_job(
-                farmId=request["farmId"], queueId=request["queueId"], jobId=job_id, config=config
-            )
-        except Exception as e:  # noqa: BLE001 - one missing job mustn't hide the others.
-            response = getattr(e, "response", None)
-            code = response.get("Error", {}).get("Code") if isinstance(response, dict) else None
-            status: dict[str, Any] = {"jobId": job_id, "error": str(e)}
-            if code in JOB_GONE_ERRORS:
-                status["notFound"] = True
-            found.append(status)
-            continue
-        found.append(
-            {
-                "jobId": job_id,
-                "name": job.get("name"),
-                "lifecycleStatus": job.get("lifecycleStatus"),
-                "taskRunStatus": job.get("taskRunStatus"),
-                "taskRunStatusCounts": job.get("taskRunStatusCounts", {}),
-            }
-        )
-    return {"jobs": found}
 
 
 def _progress(stage: str) -> Callable[[Any], bool]:
@@ -336,87 +340,6 @@ def submit(request: dict[str, Any]) -> dict[str, Any]:
     return {"jobId": job_id, "farmId": request.get("farmId"), "queueId": request.get("queueId")}
 
 
-def _inside(directory: str, path: str) -> bool:
-    """Whether path is inside directory once links are resolved, compared as the OS compares."""
-    base = os.path.normcase(os.path.realpath(directory))
-    target = os.path.normcase(os.path.realpath(path))
-    try:
-        return target != base and os.path.commonpath([base, target]) == base
-    except ValueError:
-        # Paths on different Windows drives.
-        return False
-
-
-def _plural(count: int, noun: str) -> str:
-    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
-
-
-def download(request: dict[str, Any]) -> dict[str, Any]:
-    """
-    Downloads a job's outputs into the Output Directory it was submitted with, and nowhere else.
-    Output manifests come from the queue's job attachments, which every job on the queue can
-    write to, so the destination of every file is checked against the job's Output Directory
-    before any is written.
-    """
-    from deadline.client import api
-    from deadline.job_attachments.download import OutputDownloader
-    from deadline.job_attachments.models import FileConflictResolution, JobAttachmentS3Settings
-
-    farm_id, queue_id, job_id = (str(request[key]) for key in ("farmId", "queueId", "jobId"))
-    config = _config({})
-    deadline = api.get_boto3_client("deadline", config=config)
-    job = deadline.get_job(farmId=farm_id, queueId=queue_id, jobId=job_id)
-    # Set when the job is created. Workers can't change it.
-    output_dir = ((job.get("parameters") or {}).get("OutputDir") or {}).get("path")
-    if not isinstance(output_dir, str) or not os.path.isabs(output_dir):
-        raise RuntimeError("This job has no Output Directory on this machine to download into.")
-    queue = deadline.get_queue(farmId=farm_id, queueId=queue_id)
-    session = api.get_queue_user_boto3_session(
-        deadline=deadline,
-        config=config,
-        farm_id=farm_id,
-        queue_id=queue_id,
-        queue_display_name=queue["displayName"],
-    )
-    with contextlib.redirect_stdout(sys.stderr):
-        downloader = OutputDownloader(
-            s3_settings=JobAttachmentS3Settings(**queue["jobAttachmentSettings"]),
-            farm_id=farm_id,
-            queue_id=queue_id,
-            job_id=job_id,
-            session=session,
-        )
-    # download() writes the same plan that get_paths_by_root() lists.
-    planned = [
-        os.path.join(root, path)
-        for root, paths in downloader.get_paths_by_root().items()
-        for path in paths
-    ]
-    if not planned:
-        return {"fileCount": 0, "directory": output_dir, "message": "The job has no outputs yet."}
-    outside = [path for path in planned if not _inside(output_dir, path)]
-    if outside:
-        raise RuntimeError(
-            f"Nothing was downloaded: {_plural(len(outside), 'output file')} of {len(planned)} "
-            f"would be written outside the job's Output Directory {output_dir}, such as "
-            f"{outside[0][:300]!r}."
-        )
-    with contextlib.redirect_stdout(sys.stderr):
-        summary = downloader.download(
-            file_conflict_resolution=FileConflictResolution.CREATE_COPY,
-            on_downloading_files=_progress("downloading"),
-        )
-    downloaded = [str(path) for path in getattr(summary, "downloaded_files", [])]
-    if any(not _inside(output_dir, path) for path in downloaded):
-        raise RuntimeError(f"Some output files were written outside {output_dir}.")
-    count = len(downloaded) or int(getattr(summary, "processed_files", 0) or 0)
-    return {
-        "fileCount": count,
-        "directory": output_dir,
-        "message": f"Downloaded {_plural(count, 'file')}",
-    }
-
-
 COMMANDS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "status": status,
     "login": login,
@@ -424,9 +347,7 @@ COMMANDS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "queues": queues,
     "queue": queue,
     "set-defaults": set_defaults,
-    "jobs": jobs,
     "submit": submit,
-    "download": download,
 }
 
 

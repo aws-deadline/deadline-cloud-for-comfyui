@@ -449,10 +449,25 @@ def test_host_requirements_none_keeps_the_templates_and_empty_removes_them():
     assert submit.host_requirements({"attributes": [], "amounts": []}) == {}
 
 
-def test_create_job_bundle_can_remove_host_requirements(tmp_path):
-    bundle_dir, _ = create_job_bundle(submit.JOB_TEMPLATE, {}, "w", tmp_path, requirements={})
+@pytest.mark.parametrize(
+    "requirements", [{}, {"amounts": [{"name": "amount.worker.memory", "min": 8192}]}]
+)
+def test_create_job_bundle_sets_or_removes_every_steps_host_requirements(requirements, tmp_path):
+    """A studio template with requirements on each step. The panel's form replaces them all."""
+    base = yaml.safe_load(submit.JOB_TEMPLATE.read_text())
+    [step] = base["steps"]
+    linux = {"attributes": [{"name": "attr.worker.os.family", "anyOf": ["linux"]}]}
+    base["steps"] = [
+        {**step, "hostRequirements": linux},
+        {**step, "name": "Again", "hostRequirements": linux},
+    ]
+    studio = tmp_path / "studio.yaml"
+    studio.write_text(yaml.safe_dump(base))
+    bundle_dir, _ = create_job_bundle(studio, {}, "w", tmp_path / "s", requirements=requirements)
     template = yaml.safe_load((bundle_dir / "template.yaml").read_text())
-    assert "hostRequirements" not in template["steps"][0]
+    assert [step.get("hostRequirements") for step in template["steps"]] == [
+        requirements or None
+    ] * 2
     decode_job_template(template=template, supported_extensions=["EXPR"])
 
 
@@ -618,17 +633,24 @@ def test_input_folders_follow_an_input_directory_that_is_a_link(tmp_path):
     [
         ("darwin", "folder", "osascript", "choose folder"),
         ("darwin", "files", "osascript", "multiple selections allowed"),
+        # One file, for a path parameter such as Workflow File.
+        ("darwin", "file", "osascript", 'POSIX path of (choose file with prompt "Choose a file'),
         ("win32", "folder", "powershell", "FolderBrowserDialog"),
         ("win32", "files", "powershell", "Multiselect=$true"),
+        ("win32", "file", "powershell", "Multiselect=$false"),
     ],
 )
 def test_picker_command(platform, kind, program, expected):
     command = submit.picker_command(kind, platform) or []
     assert command[0] == program
-    assert expected in " ".join(command)
+    text = " ".join(command)
+    assert expected in text
+    # The panel's Browse… for a path parameter, such as Output Directory, doesn't attach it.
+    assert "for the Deadline Cloud job" in text
+    assert "attach" not in text
 
 
-@pytest.mark.parametrize("kind", ["folder", "files"])
+@pytest.mark.parametrize("kind", ["folder", "files", "file"])
 def test_windows_picker_writes_utf8(kind):
     """The server decodes the chosen paths as UTF-8, so PowerShell can't use the console code page."""
     script = (submit.picker_command(kind, "win32") or [])[-1]
@@ -639,6 +661,9 @@ def test_picker_command_on_linux(monkeypatch):
     monkeypatch.setattr(submit.shutil, "which", lambda name: "/usr/bin/zenity")
     assert "--directory" in (submit.picker_command("folder", "linux") or [])
     assert "--multiple" in (submit.picker_command("files", "linux") or [])
+    single = submit.picker_command("file", "linux") or []
+    assert "--file-selection" in single
+    assert "--multiple" not in single
     monkeypatch.setattr(submit.shutil, "which", lambda name: None)
     assert submit.picker_command("files", "linux") is None
 
@@ -1430,8 +1455,8 @@ ITEM_RANGES = json.loads(
 
 
 @pytest.mark.parametrize("case", ITEM_RANGES, ids=lambda case: repr(case["value"]))
-def test_check_item_range_takes_the_same_ranges_as_the_panel(case):
-    """item_ranges.json is shared with test_panel.py, so the submitter and the panel agree."""
+def test_check_item_range_takes_openjd_item_ranges(case):
+    """The item ranges that check_item_range takes, and the ones it refuses, in item_ranges.json."""
     source = submit.ItemSource("List5", "Create List #5", case["items"])
     if case["count"] is None:
         with pytest.raises(SubmitError):

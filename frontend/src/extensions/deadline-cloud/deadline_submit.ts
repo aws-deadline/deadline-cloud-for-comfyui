@@ -2,16 +2,19 @@
 import { app } from "../../scripts/app.js";
 import {
   SIDEBAR_TAB_ID,
+  injectStyles,
   listenForSubmissions,
-  openDialog,
   openPanel,
+  openPopover,
   renderPanel,
+  togglePopover,
   workflowLoaded,
 } from "./deadline_ui.js";
 
 const SUBMIT_COMMAND_ID = "DeadlineCloud.Submit";
 const PANEL_COMMAND_ID = "DeadlineCloud.OpenPanel";
-const ICON = "pi pi-cloud-upload";
+// The deadline-cloud library's logo, which deadline_ui.ts styles.
+const ICON = "dl-logo";
 
 let destroyPanel: (() => void) | null = null;
 let panelElement: HTMLElement | null = null;
@@ -21,9 +24,9 @@ app.registerExtension({
   commands: [
     {
       id: SUBMIT_COMMAND_ID,
-      label: "Submit to Deadline Cloud…",
+      label: "Submit to Deadline Cloud",
       icon: ICON,
-      function: openDialog,
+      function: openPopover,
     },
     {
       id: PANEL_COMMAND_ID,
@@ -38,16 +41,19 @@ app.registerExtension({
   actionBarButtons: [
     {
       icon: ICON,
-      label: "Deadline",
-      tooltip: "Submit to Deadline Cloud",
-      onClick: openDialog,
+      label: "Submit to Deadline Cloud",
+      tooltip: "Submit this workflow to Deadline Cloud",
+      class: "dl-action-button",
+      onClick: togglePopover,
     },
   ],
   setup() {
+    // The action bar button and the sidebar tab show before the panel opens.
+    injectStyles();
     app.extensionManager.registerSidebarTab({
       id: SIDEBAR_TAB_ID,
       icon: ICON,
-      title: "Deadline",
+      title: "Deadline Cloud",
       tooltip: "Deadline Cloud",
       type: "custom",
       // The frontend calls render from a Vue ref, again on each update of the tab's component.

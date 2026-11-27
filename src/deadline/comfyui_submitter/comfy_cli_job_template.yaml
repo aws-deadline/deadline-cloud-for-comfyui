@@ -32,7 +32,8 @@ parameterDefinitions:
   objectType: DIRECTORY
   dataFlow: NONE
   userInterface:
-    control: CHOOSE_DIRECTORY
+    # The submitter fills it in with ComfyUI's input directory.
+    control: HIDDEN
     label: Input Directory
     groupLabel: Workflow Parameters
   default: ""
@@ -71,7 +72,7 @@ parameterDefinitions:
 - name: ExtraModelPathsConfig
   type: STRING
   userInterface:
-    control: LINE_EDIT
+    control: HIDDEN
     label: Extra Model Paths Config
     groupLabel: Model Parameters
   default: ""
@@ -84,7 +85,7 @@ parameterDefinitions:
 - name: AttachCustomNodes
   type: BOOL
   userInterface:
-    control: CHECK_BOX
+    control: HIDDEN
     label: Attach Custom Nodes
     groupLabel: Custom Node Parameters
   default: "true"
@@ -107,7 +108,7 @@ parameterDefinitions:
 - name: ComfyUIArgs
   type: STRING
   userInterface:
-    control: LINE_EDIT
+    control: HIDDEN
     label: Extra ComfyUI Arguments
     groupLabel: Advanced Parameters
   default: ""
@@ -134,13 +135,13 @@ parameterDefinitions:
     control: SPIN_BOX
     label: Workflow Timeout (seconds)
     groupLabel: Advanced Parameters
-  default: 3600
+  default: 21600
   minValue: 60
   maxValue: 82800
   description: >
     How long each task can run the workflow, up to 23 hours. comfy run also waits this long for
-    ComfyUI to report progress, since loading a large model can take minutes without any. Video
-    workflows on smaller GPUs can need more than an hour.
+    ComfyUI to report progress, since loading a large model can take minutes without any. Long
+    video workflows can need more.
 
 # Software Environment
 - name: CondaPackages
@@ -829,11 +830,3 @@ steps:
             diagnostic(f"  {path!r}")
         if not outputs:
             fail("The workflow produced no output files. Add a Save node, such as SaveImage.")
-  hostRequirements:
-    attributes:
-    - name: attr.worker.os.family
-      anyOf:
-      - linux
-    amounts:
-    - name: amount.worker.gpu
-      min: 1
